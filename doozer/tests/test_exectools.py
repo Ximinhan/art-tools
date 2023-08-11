@@ -73,7 +73,7 @@ class RetryTestCase(IsolatedAsyncioTestCase):
 
     def test_return(self):
         """
-        Verify that the retry task return value is passed back out faithfully.test1
+        Verify that the retry task return value is passed back out faithfully.test2
         """
         obj = {}
 
