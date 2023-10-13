@@ -458,6 +458,8 @@ class PrepareReleasePipeline:
             "find-builds",
             f"--kind={kind}",
         ])
+        if kind == "rpm":
+            cmd.append("--member-only")
         if only_payload:
             cmd.append("--payload")
         if only_non_payload:
