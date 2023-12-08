@@ -19,10 +19,10 @@ async def get_alignmentprs(b: str = None):
     if not os.environ.get('GITHUB_TOKEN', None):
         return {'err':'A GITHUB_TOKEN environment variable must be defined!'}
     github_token = os.environ['GITHUB_TOKEN']
-    g = Github(github_token)
+    g = Github(github_token, per_page=200)
     res = defaultdict(list)
     query = 'org:openshift author:openshift-bot type:pr state:open ART in:title'
-    prs = g.search_issues(query=query, sort="created", order="asc", per_page=200)
+    prs = g.search_issues(query=query, per_page=200)
     print(f"Gathering {prs.totalCount} prs")
     res['totalCount'] = 0
     for pr in prs:
