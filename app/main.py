@@ -28,12 +28,12 @@ async def get_alignmentprs(b: str = None):
     for pr in prs:
       title = pr.title
       url = pr.html_url
-      branch = pr.repository.get_pull(pr.number).base.ref
-      if b and branch != b:
-          continue
-      else:
-          res[branch].append({"title": title, "url": url})
-          res['totalCount'] = res['totalCount'] + 1
+      #branch = pr.repository.get_pull(pr.number).base.ref # update title to include branch name
+      #if b and branch != b:
+      #    continue
+      #else:
+      res["prs"].append({"title": title, "url": url})
+      res['totalCount'] = res['totalCount'] + 1
     return json.dumps(dict(res))
 
 
