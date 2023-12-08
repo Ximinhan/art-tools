@@ -22,7 +22,7 @@ async def get_alignmentprs(b: str = None):
     g = Github(github_token, per_page=200)
     res = defaultdict(list)
     query = 'org:openshift author:openshift-bot type:pr state:open ART in:title'
-    prs = g.search_issues(query=query, per_page=200)
+    prs = g.search_issues(query=query)
     print(f"Gathering {prs.totalCount} prs")
     res['totalCount'] = 0
     for pr in prs:
@@ -34,7 +34,7 @@ async def get_alignmentprs(b: str = None):
       #else:
       res["prs"].append({"title": title, "url": url})
       res['totalCount'] = res['totalCount'] + 1
-    return json.dumps(dict(res))
+    return res
 
 
 @app.get("/image/{image_name}")
