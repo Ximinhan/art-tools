@@ -20,7 +20,7 @@ spec:
           value: $(params.pr_action)
       taskRef:
         kind: Task
-        name: new-validator-task
+        name: validator-task
       when:
         - input: $(params.pr_action)
           operator: in
