@@ -16,6 +16,8 @@ spec:
       params:
         - name: PR_link
           value: $(params.pr_url)
+        - name: PR_action
+          value: $(params.pr_action)
       taskRef:
         kind: Task
         name: new-validator-task
