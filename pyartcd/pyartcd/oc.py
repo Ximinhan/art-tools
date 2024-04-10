@@ -32,7 +32,7 @@ async def get_release_image_info(pullspec: str, raise_if_not_found: bool = False
 async def registry_login(runtime: Runtime):
     try:
         await exectools.cmd_gather_async(
-            f'oc --kubeconfig {os.environ["KUBECONFIG"]} registry login')
+            f'oc --kubeconfig {os.environ["KUBECONFIG"]} registry login --registry="registry.ci.openshift.org"')
 
     except KeyError:
         runtime.logger.error('KUBECONFIG env var must be defined!')
