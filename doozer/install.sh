@@ -143,8 +143,6 @@ EOF
 
 printf "${GREEN}Starting install of doozer...${NC}\n"
 
-
-python -c "$(curl -fsSL https://raw.githubusercontent.com/junaruga/rpm-py-installer/master/install.py)"
 pip install ${USER_OPT} -r <(curl https://raw.githubusercontent.com/openshift-eng/doozer/master/requirements.txt)
 
 show_cmd pip install ${USER_OPT} rh-doozer
