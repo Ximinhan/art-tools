@@ -48,7 +48,7 @@ async def get_images(image_name: str):
     # else:
     #     print(f"Error fetching branches: {response.status_code}")
     #     return {}
-    release_branches = ["openshift-4.15", "openshift-4.14", "openshift-4.13", "openshift-4.12", "openshift-4.11", "openshift-4.10"]
+    release_branches = ["openshift-4.17", "openshift-4.16", "openshift-4.15", "openshift-4.14", "openshift-4.13", "openshift-4.12", "openshift-4.11", "openshift-4.10"]
     ret = {}
     for branch in release_branches:
         response = requests.get(f"https://api.github.com/repos/openshift-eng/ocp-build-data/contents/images/{image_name}.yml?ref={branch}")
