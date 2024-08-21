@@ -588,6 +588,7 @@ class Runtime(GroupRuntime):
                     _register_name_in_bundle(short_name_without_ose, img.key)
                     short_name_with_ose = "ose-" + short_name_without_ose
                     _register_name_in_bundle(short_name_with_ose, img.key)
+            self._logger.info(f"loaded name in bundle map {self.name_in_bundle_map}")
 
             image_data = self.gitdata.load_data(path='images', keys=image_keys,
                                                 exclude=image_ex,
