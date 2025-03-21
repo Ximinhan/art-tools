@@ -652,7 +652,7 @@ class KonfluxBuildRecordInspector(BuildRecordInspector):
         return self._build_record.release
 
     def get_all_installed_package_build_dicts(self, package_rpm_finder: PackageRpmFinder):
-        return package_rpm_finder.get_brew_rpms_from_build_record(self._build_record)
+        return package_rpm_finder.get_packages_to_rpms_mapping(self._build_record)
 
     def get_rpms_in_pkg_build(self, build_id: int):
         raise NotImplementedError
