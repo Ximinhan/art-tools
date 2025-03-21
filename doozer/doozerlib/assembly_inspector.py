@@ -103,9 +103,9 @@ class AssemblyInspector:
         """
         self.runtime.logger.info("Checking installed rpms in %s", component_description)
         issues: List[AssemblyIssue] = []
-        for package_name, rpm_build in rpm_packages.items():
-            if package_name in self._rpm_deliveries:
-                rpm_delivery_config = self._rpm_deliveries[package_name]
+        for rpm_build in rpm_packages.items():
+            if rpm_build['name'] in self._rpm_deliveries:
+                rpm_delivery_config = self._rpm_deliveries[rpm_build['nvr']]
                 self.runtime.logger.info("Getting tags for rpm build %s...", rpm_build['nvr'])
                 tag_names = {tag["name"] for tag in self.brew_session.listTags(brew.KojiWrapperOpts(caching=True), build=rpm_build["id"])}
                 # If the rpm is tagged into the stop-ship tag, it is never permissible

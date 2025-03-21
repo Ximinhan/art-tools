@@ -55,12 +55,8 @@ class PackageRpmFinder:
             caching_packages = [pkg for pkg, build in zip(caching_packages, builds) if build]
             builds = [build for build in builds if build]
 
-            # Get RPM list from package build IDs using koji_api.listBuildRPMs
-            build_ids = [build['build_id'] for build in builds]
-            results: List[List[Dict]] = brew.list_build_rpms(build_ids, session)
-
             # Cache retrieved RPM builds for package
-            for package_build, rpm_builds in zip(caching_packages, results):
+            for package_build, rpm_builds in zip(caching_packages, builds):
                 self._package_to_rpms[package_build] = rpm_builds
 
     def get_brew_rpms_from_build_record(self, build_record: KonfluxBuildRecord) -> List[Dict]:
