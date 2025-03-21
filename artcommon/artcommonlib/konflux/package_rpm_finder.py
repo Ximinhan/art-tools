@@ -19,7 +19,7 @@ class PackageRpmFinder:
         self._not_found_packages = []
         self._runtime = runtime
 
-    def _cache_packages(self, packages: list):
+    def _cache_packages(self, packages: list, no_arch: bool):
         """
         For each package NVR:
         - call koji.GetBuild(nvr) to get a build info dict
@@ -55,9 +55,16 @@ class PackageRpmFinder:
             caching_packages = [pkg for pkg, build in zip(caching_packages, builds) if build]
             builds = [build for build in builds if build]
 
-            # Cache retrieved RPM builds for package
-            for package_build, rpm_builds in zip(caching_packages, builds):
+            if no_arch:
+                for package_build, rpm_builds in zip(caching_packages, builds):
                 self._package_to_rpms[package_build] = rpm_builds
+            else:
+                # Get RPM list from package build IDs using koji_api.listBuildRPMs
+                build_ids = [build['build_id'] for build in builds]
+                results: List[List[Dict]] = brew.list_build_rpms(build_ids, session)
+
+                for package_build, rpm_builds in zip(caching_packages, results):
+                    self._package_to_rpms[package_build] = rpm_builds
 
     def get_brew_rpms_from_build_record(self, build_record: KonfluxBuildRecord) -> List[Dict]:
         """
@@ -66,7 +73,7 @@ class PackageRpmFinder:
 
         installed_packages = build_record.installed_packages
         installed_packages = [pkg for pkg in installed_packages if pkg not in self._not_found_packages]
-        self._cache_packages(installed_packages)
+        self._cache_packages(installed_packages, False)
         return [rpm for package in installed_packages for rpm in self._package_to_rpms.get(package, [])]
 
     def get_packages_to_rpms_mapping(self, build_record: KonfluxBuildRecord) -> Dict[str, dict]:
@@ -75,5 +82,5 @@ class PackageRpmFinder:
         """
         installed_packages = build_record.installed_packages
         installed_packages = [pkg for pkg in installed_packages if pkg not in self._not_found_packages]
-        self._cache_packages(installed_packages)
-        return {rpm['name']: rpm for package in installed_packages for rpm in self._package_to_rpms.get(package, [])if rpm['arch'] == 'x86_64'}
+        self._cache_packages(installed_packages, True)
+        return {rpm['name']: rpm for package in installed_packages for rpm in self._package_to_rpms.get(package, [])}

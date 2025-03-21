@@ -690,7 +690,7 @@ class KonfluxBuildRecordInspector(BuildRecordInspector):
         installed_rpms = package_rpm_finder.get_brew_rpms_from_build_record(self._build_record)
         installed_rpms_for_arch = {}
 
-        for rpm in installed_rpms:
+        for rpm in installed_rpms.items():
             # Exclude RPMs exempted by scan-sources
             is_exempt, pattern = meta.is_rpm_exempt(rpm['name'])
             if is_exempt:
