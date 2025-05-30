@@ -2333,13 +2333,21 @@ class PayloadGenerator:
                 if entry.image_inspector.get_digest() != pullspec_sha:
                     # Impermissible because the artist should remove
                     # the reference nightlies from the assembly definition
-                    issues.append(
-                        AssemblyIssue(
-                            f"{nightly} contains {payload_tag_name} sha {pullspec_sha} but assembly computed archive: "
-                            f"{entry.image_inspector.get_pullspec()}",
-                            component="reference-releases",
+                    if (
+                        entry.image_inspector.get_image_labels().get('io.openshift.build.commit.id', None)
+                        == component_tag["annotations"]['io.openshift.build.commit.id']
+                    ):
+                        runtime.logger.info(
+                            f"{nightly} contains {payload_tag_name} and assembly computed another build but they come from same commit"
                         )
-                    )
+                    else:
+                        issues.append(
+                            AssemblyIssue(
+                                f"{nightly} contains {payload_tag_name} sha {pullspec_sha} but assembly computed archive: "
+                                f"{entry.image_inspector.get_pullspec()}",
+                                component="reference-releases",
+                            )
+                        )
 
             elif entry.rhcos_build:
                 actual_digest = entry.rhcos_build.get_container_digest(rhcos_container_configs[payload_tag_name])
