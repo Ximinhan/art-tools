@@ -291,17 +291,15 @@ def assembly_basis_event(
     _check_recursion(releases_config, assembly)
     target_assembly = releases_config.releases[assembly].assembly
 
-    if target_assembly.basis.brew_event:
-        return int(target_assembly.basis.brew_event)  # Integer for Brew event
-    elif target_assembly.basis.time:
-        # datetime UTC for Konflux
-        time_str = target_assembly.basis.time
+    if time_str := getattr(target_assembly.basis, 'time', None):
         if not isinstance(time_str, str):
             raise ValueError(f"Invalid time format for assembly {assembly}: {time_str}")
         dt = datetime.fromisoformat(time_str)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
+    if brew_event := getattr(target_assembly.basis, 'brew_event', None):
+        return int(brew_event)  # Integer for Brew event
     return assembly_basis_event(releases_config, target_assembly.basis.assembly, strict=strict)
 
 
