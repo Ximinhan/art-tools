@@ -359,8 +359,8 @@ class PrepareReleaseKonfluxPipeline:
                     'file_path': file_path,
                     'branch': fork_branch.name,
                     'content': output.read(),
-                    'author_email': self.gitlab_client.user.emails.list(get_all=True)[0].email,
-                    'author_name': self.gitlab_client.user.name,
+                    #'author_email': self.gitlab_client.user.emails.list(get_all=True)[0].email,
+                    #'author_name': self.gitlab_client.user.name,
                     'commit_message': f"Add shipment files for {self.assembly}",
                 }
             )
