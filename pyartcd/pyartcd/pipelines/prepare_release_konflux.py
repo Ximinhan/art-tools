@@ -96,6 +96,11 @@ class PrepareReleaseKonfluxPipeline:
         # these will be initialized later
         self.releases_config = None
         self.group_config = None
+        self.release_name = None
+        self.candidate_nightlies = None
+        self.for_fbc = False
+        self.stage_rpa = None
+        self.prod_rpa = None
         self.olm_builds = []
 
         group_param = f'--group={group}'
