@@ -278,6 +278,14 @@ class PrepareReleaseKonfluxPipeline:
         check shipment mr
         create/rebase shipment branch
         """
+        # assembly = self.assembly
+        # gitlab_client = self.gitlab_client
+        # github_client = self.github_client
+        # for_fbc = self.for_fbc
+        # stage_rpa = self.stage_rpa
+        # prod_rpa = self.prod_rpa
+        # group = self.group
+
         _LOGGER.info(f"Creating shipment mr ...")
         match = re.search(r"\d+.\d+.\d+", self.assembly)
         if match:
@@ -306,8 +314,8 @@ class PrepareReleaseKonfluxPipeline:
         _LOGGER.info(f"Created fork branch {fork_branch.name} : {fork_branch.web_url}")
 
         for shipment_item in shipment_data:
-            errata_type = "rhsa" if shipment_item.cves else "rhba"
-            advisory_boilerplate = boilerplate[shipment_item.kind][errata_type]
+            errata_type = "rhsa" if shipment_item['cves'] else "rhba"
+            advisory_boilerplate = boilerplate[shipment_item['kind']][errata_type]
             synopsis = advisory_boilerplate['synopsis'].format(MINOR=minor, PATCH=patch)
             advisory_topic = advisory_boilerplate['topic'].format(MINOR=minor, PATCH=patch)
             advisory_description = advisory_boilerplate['description'].format(MINOR=minor, PATCH=patch)
@@ -325,11 +333,11 @@ class PrepareReleaseKonfluxPipeline:
                         stage=ShipmentEnv(releasePlan=self.stage_rpa),
                         prod=ShipmentEnv(releasePlan=self.prod_rpa),
                     ),
-                    snapshot=Snapshot(name=f"ose-{self.assembly}-{time_suffix}", spec=Spec(nvrs=shipment_item.builds)),
+                    snapshot=Snapshot(name=f"ose-{self.assembly}-{time_suffix}", spec=Spec(nvrs=shipment_item['builds'])),
                     data=Data(
                         releaseNotes=ReleaseNotes(
                             type=errata_type.upper(),
-                            issues=Issues(fixed=[Issue(id=bug["id"], source=urlparse(bug['url']).hostname) for bug in shipment_item.bugs]),
+                            issues=Issues(fixed=[Issue(id=bug["id"], source=urlparse(bug['url']).hostname) for bug in shipment_item['bugs']]),
                             synopsis=synopsis,
                             topic=advisory_topic,
                             description=advisory_description,
@@ -343,7 +351,7 @@ class PrepareReleaseKonfluxPipeline:
             yaml.dump(shipment_yaml, output)
             output.seek(0)
             file_path = (
-                f"shipment/ocp/{self.group}/{application}/prod/{self.assembly}-{shipment_item.kind}.{time_suffix}.yaml"
+                f"shipment/ocp/{self.group}/{application}/prod/{self.assembly}-{shipment_item['kind']}.{time_suffix}.yaml"
             )
             # add shipment to fork repo
             f = project.files.create(
@@ -665,7 +673,7 @@ class PrepareReleaseKonfluxPipeline:
             out = json.loads(stdout)
             builds = out.get("builds", [])
             olm_builds = out.get("olm_builds", [])
-        _LOGGER.info(f"Find image builds: {builds} \n Find olm builds: {olm_builds}")
+        _LOGGER.info(f"Find {kind} builds: {builds} \n Find olm builds: {olm_builds}")
         return builds, olm_builds
 
     async def create_update_shipment_mr(
