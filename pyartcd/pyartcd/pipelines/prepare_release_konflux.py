@@ -136,8 +136,8 @@ class PrepareReleaseKonfluxPipeline:
         if self.build_repo_url:
             build_repo, build_gitref = build_repo_url.split("@", 1)
         upstream_repo = self.github_client.get_repo(f"{build_repo}/ocp-build-data")
-        group_cofnig = yaml.load(upstream_repo.get_contents("group.yaml", ref=build_gitref).decoded_content)
-        release_config = yaml.load(upstream_repo.get_contents("releases.yaml", ref=build_gitref).decoded_content)
+        group_cofnig = yaml.load(upstream_repo.get_contents("group.yml", ref=build_gitref).decoded_content)
+        release_config = yaml.load(upstream_repo.get_contents("releases.yml", ref=build_gitref).decoded_content)
         self.group_config = assembly_group_config(
             Model(releases_config), self.assembly, Model(group_config)
         ).primitive()
