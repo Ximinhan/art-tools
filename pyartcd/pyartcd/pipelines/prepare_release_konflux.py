@@ -293,7 +293,7 @@ class PrepareReleaseKonfluxPipeline:
         boilerplate = common_advisory_template.get("boilerplates", {})
 
         # get gitlab shipment config, project id is 116177
-        project = self.gitlab_client.projects.get(124362)
+        project = self.gitlab_client.projects.get(116177)
         shipment_env_config = yaml.load(project.files.get(file_path='config.yaml', ref='main').decode())
         app_env_config = shipment_env_config.get("applications", {}).get(self.application, {}).get("environments", {})
         self.stage_rpa = self.stage_rpa or app_env_config.get("stage", {}).get("releasePlan", "test-stage-rpa")
