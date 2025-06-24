@@ -142,11 +142,11 @@ async def find_bugs_sweep_cli(
     if count_advisory_attach_flags > 1:
         raise click.BadParameter("Use only one of --use-default-advisory, --add, or --into-default-advisories")
 
-    if runtime.build_system == 'konflux':
-        if count_advisory_attach_flags > 0 or advisory_id:
-            raise click.BadParameter(
-                "Options not supported with --build-system=konflux: --use-default-advisory, --into-default-advisories, --add"
-            )
+    # if runtime.build_system == 'konflux':
+    #     if count_advisory_attach_flags > 0 or advisory_id:
+    #         raise click.BadParameter(
+    #             "Options not supported with --build-system=konflux: --use-default-advisory, --into-default-advisories, --add"
+    #         )
 
     runtime.initialize(mode="both")
     major_version, minor_version = runtime.get_major_minor()
