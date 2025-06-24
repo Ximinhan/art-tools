@@ -422,17 +422,17 @@ class PrepareReleaseKonfluxPipeline:
         gl.auth()
         return gl
 
-    @property
-    def release_name(self) -> str:
-        return get_release_name_for_assembly(self.group, self.releases_config, self.assembly)
+    # @property
+    # def release_name(self) -> str:
+    #     return get_release_name_for_assembly(self.group, self.releases_config, self.assembly)
 
-    @property
-    def assembly_group_config(self) -> dict:
-        return assembly_config_struct(Model(self.releases_config), self.assembly, "group", {})
+    # @property
+    # def assembly_group_config(self) -> dict:
+    #     return assembly_config_struct(Model(self.releases_config), self.assembly, "group", {})
 
-    @property
-    def shipment_config(self) -> dict:
-        return self.assembly_group_config.get("shipment", [])
+    # @property
+    # def shipment_config(self) -> dict:
+    #     return self.assembly_group_config.get("shipment", [])
 
     def setup_working_dir(self):
         self.working_dir.mkdir(parents=True, exist_ok=True)
