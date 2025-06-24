@@ -964,7 +964,7 @@ async def prepare_release(
             build_repo_url=build_repo_url,
             shipment_repo_url=shipment_repo_url,
             job_url=job_url,
-            data=data,
+            date=date,
         )
         await pipeline.run()
         await slack_client.say_in_thread(f":white_check_mark: prepare-release-konflux for {assembly} completes.")
