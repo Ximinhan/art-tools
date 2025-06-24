@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 from functools import cached_property
@@ -327,7 +328,7 @@ class PrepareReleaseKonfluxPipeline:
                     data=Data(
                         releaseNotes=ReleaseNotes(
                             type=errata_type.upper(),
-                            issues=Issues(fixed=[Issue(id=bug["id"], source=bug["url"]) for bug in shipment_item.bugs]),
+                            issues=Issues(fixed=[Issue(id=bug["id"], source=urlparse(bug['url']).hostname) for bug in shipment_item.bugs]),
                             synopsis=synopsis,
                             topic=advisory_topic,
                             description=advisory_description,
