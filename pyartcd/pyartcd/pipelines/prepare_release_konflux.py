@@ -115,14 +115,14 @@ class PrepareReleaseKonfluxPipeline:
 
         # await self.setup_repos()
         # await self.validate_assembly()
-        self.init_assembly_data()
+        await self.init_assembly_data()
         # advisories, jira_issue_key = await self.create_and_prepare_advisory()
         shipment = await self.prepare_shipment()
         shipment_mr = self.create_shipment(shipment)
 
         # self.update_build_data(advisories, jira_issue_key, shipment_mr)
 
-    def init_assembly_data(self):
+    async def init_assembly_data(self):
         """
         load necessary data for release, include
         group_config
@@ -143,13 +143,13 @@ class PrepareReleaseKonfluxPipeline:
         self.release_name = get_release_name_for_assembly(self.group, releases_config, self.assembly)
         nightlies = get_assembly_basis(releases_config, self.assembly).get("reference_releases", {}).values()
         self.candidate_nightlies = nightlies_with_pullspecs(nightlies)
-        if not self.release_date:
-            _LOGGER.info("Release date not provided. Fetching release date from release schedule...")
-            try:
-                self.release_date = await get_assembly_release_date_async(self.release_name)
-            except Exception as ex:
-                raise ValueError(f"Failed to fetch release date from release schedule for {self.release_name}: {ex}")
-            _LOGGER.info("Release date: %s", self.release_date)
+        # if not self.release_date:
+        #     _LOGGER.info("Release date not provided. Fetching release date from release schedule...")
+        #     try:
+        #         self.release_date = await get_assembly_release_date_async(self.release_name)
+        #     except Exception as ex:
+        #         raise ValueError(f"Failed to fetch release date from release schedule for {self.release_name}: {ex}")
+        #     _LOGGER.info("Release date: %s", self.release_date)
         return
 
     async def create_and_prepare_advisory(self):
