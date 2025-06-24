@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import sys
-from typing import Dict, List, Set, Union, Optional
+from typing import Dict, List, Optional, Set, Union
 
 import click
 import koji
@@ -427,7 +427,9 @@ def _gen_nvrp_tuples(builds: List[Dict], tag_pv_map: Dict[str, str]):
     return nvrps
 
 
-def _json_dump(as_json: str, builds: list, kind: str, olm_builds: Optional[list] = [], olm_records_not_found: Optional[list] = []):
+def _json_dump(
+    as_json: str, builds: list, kind: str, olm_builds: Optional[list] = [], olm_records_not_found: Optional[list] = []
+):
     """Dumps builds as JSON to a file or stdout
     :param as_json: file name to dump JSON to, or '-' for stdout
     :param builds: list of Brew build objects
@@ -438,7 +440,7 @@ def _json_dump(as_json: str, builds: list, kind: str, olm_builds: Optional[list]
         'builds': sorted([b.nvr for b in builds]),
         'kind': kind,
         'olm_builds': sorted([b.nvr for b in olm_builds]),
-        'olm_builds_not_found': sorted([b.nvr for b in olm_records_not_found])
+        'olm_builds_not_found': sorted([b.nvr for b in olm_records_not_found]),
     }
     if as_json == '-':
         click.echo(json.dumps(json_data, indent=4, sort_keys=True))
@@ -706,7 +708,9 @@ async def find_builds_konflux(runtime, payload):
             continue
         image_metas.append(image)
 
-    tasks = [(image.is_olm_operator, image.get_latest_build(el_target=image.branch_el_target())) for image in image_metas]
+    tasks = [
+        (image.is_olm_operator, image.get_latest_build(el_target=image.branch_el_target())) for image in image_metas
+    ]
     results = await asyncio.gather(*[task[1] for task in tasks])
     records_with_olm = [(task[0], r) for task, r in zip(tasks, results) if r is not None]
     if len(records_with_olm) != len(image_metas):
@@ -716,11 +720,12 @@ async def find_builds_konflux(runtime, payload):
     LOGGER.info("Fetching bundle build from DB ...")
     runtime.konflux_db.bind(KonfluxBundleBuildRecord)
     olm_tasks = [
-        (record.nvr, anext(runtime.konflux_db.search_builds_by_fields(
-            where={"operator_nvr": record.nvr},
-            limit=1
-        ), None))
-        for is_olm, record in records_with_olm if is_olm
+        (
+            record.nvr,
+            anext(runtime.konflux_db.search_builds_by_fields(where={"operator_nvr": record.nvr}, limit=1), None),
+        )
+        for is_olm, record in records_with_olm
+        if is_olm
     ]
     olm_records = await asyncio.gather(*[task[1] for task in olm_tasks])
     olm_records_not_found = [olm_task[0] for olm_task, r in zip(olm_tasks, olm_records) if r is None]
