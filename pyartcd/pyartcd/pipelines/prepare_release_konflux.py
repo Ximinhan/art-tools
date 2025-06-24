@@ -310,6 +310,7 @@ class PrepareReleaseKonfluxPipeline:
         application = self.group.replace(".", "-")
         # create gitlab shipment fork branch
         branch_name = f"Add_shipment_{self.assembly}"
+        # TODO: if branch exist delete the branch first
         fork_branch = project.branches.create({'branch': branch_name, 'ref': 'main'})
         _LOGGER.info(f"Created fork branch {fork_branch.name} : {fork_branch.web_url}")
 
@@ -347,7 +348,8 @@ class PrepareReleaseKonfluxPipeline:
                 ),
             )
             shipment_yaml = shipment.model_dump(exclude_unset=True, exclude_none=True)
-            output = io.BytesIO()
+            _LOGGER.info(f"created shipment yaml for {shipment_item['kind']}: \n {shipment_yaml}")
+            output = StringIO()
             yaml.dump(shipment_yaml, output)
             file_path = (
                 f"shipment/ocp/{self.group}/{application}/prod/{self.assembly}-{shipment_item['kind']}.{time_suffix}.yaml"
