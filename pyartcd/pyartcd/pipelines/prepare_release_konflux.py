@@ -223,7 +223,7 @@ class PrepareReleaseKonfluxPipeline:
         self.jira_issue_key = jira_issue_key
         return advisories, jira_issue_key
 
-    async def prepare_shipment():
+    async def prepare_shipment(self):
         """
         get builds for image
         get builds for extras
