@@ -349,7 +349,6 @@ class PrepareReleaseKonfluxPipeline:
             shipment_yaml = shipment.model_dump(exclude_unset=True, exclude_none=True)
             output = io.BytesIO()
             yaml.dump(shipment_yaml, output)
-            output.seek(0)
             file_path = (
                 f"shipment/ocp/{self.group}/{application}/prod/{self.assembly}-{shipment_item['kind']}.{time_suffix}.yaml"
             )
@@ -358,7 +357,7 @@ class PrepareReleaseKonfluxPipeline:
                 {
                     'file_path': file_path,
                     'branch': fork_branch.name,
-                    'content': output.read(),
+                    'content': output.getvalue(),
                     #'author_email': self.gitlab_client.user.emails.list(get_all=True)[0].email,
                     #'author_name': self.gitlab_client.user.name,
                     'commit_message': f"Add shipment files for {self.assembly}",
