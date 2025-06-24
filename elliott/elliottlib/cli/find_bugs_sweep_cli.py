@@ -276,6 +276,7 @@ async def find_and_attach_bugs(
         minor_version=minor_version,
         operator_bundle_advisory=operator_bundle_advisory,
         permissive=permissive,
+        skip_validating=(runtime.build_system == 'konflux'),
     )
     for kind, kind_bugs in bugs_by_type.items():
         logger.info(f'{kind} bugs: {[b.id for b in kind_bugs]}')
@@ -337,6 +338,7 @@ def categorize_bugs_by_type(
     minor_version: int,
     operator_bundle_advisory: str = "metadata",
     permissive=False,
+    skip_validating=False,
 ):
     """Categorize bugs into different types of advisories
     :return: (bugs_by_type, issues) where bugs_by_type is a dict of {advisory_type: bugs} and issues is a list of issues
@@ -404,7 +406,7 @@ def categorize_bugs_by_type(
             except Exception as e:
                 logger.warning("Failed to fix summary: %s", str(e))
 
-    if not advisory_id_map:
+    if not advisory_id_map or skip_validating:
         logger.warning(
             "Skipping categorizing Tracker Bugs; advisories with attached builds must be given for this operation."
         )
