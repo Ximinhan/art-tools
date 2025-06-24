@@ -372,8 +372,9 @@ class PrepareReleaseKonfluxPipeline:
 
         bugs = []
         if stdout:
+            _LOGGER.info(f"find-bugs:sweep output: \n {stdout}")
             out = json.loads(stdout)
-            bugs = [{"id": bug.id, "url": bug.url} for bug in out]
+            bugs = [{"id": bug['id'], "url": bug['url']} for bug in out]
         return bugs
 
     @staticmethod
