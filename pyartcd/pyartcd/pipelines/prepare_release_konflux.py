@@ -139,10 +139,10 @@ class PrepareReleaseKonfluxPipeline:
         group_cofnig = yaml.load(upstream_repo.get_contents("group.yml", ref=build_gitref).decoded_content)
         release_config = yaml.load(upstream_repo.get_contents("releases.yml", ref=build_gitref).decoded_content)
         self.group_config = assembly_group_config(
-            Model(releases_config), self.assembly, Model(group_config)
+            Model(release_config), self.assembly, Model(group_config)
         ).primitive()
-        self.release_name = get_release_name_for_assembly(self.group, releases_config, self.assembly)
-        nightlies = get_assembly_basis(releases_config, self.assembly).get("reference_releases", {}).values()
+        self.release_name = get_release_name_for_assembly(self.group, release_config, self.assembly)
+        nightlies = get_assembly_basis(release_config, self.assembly).get("reference_releases", {}).values()
         self.candidate_nightlies = nightlies_with_pullspecs(nightlies)
         # if not self.release_date:
         #     _LOGGER.info("Release date not provided. Fetching release date from release schedule...")
@@ -951,7 +951,7 @@ async def prepare_release(
 
     slack_client = runtime.new_slack_client()
     slack_client.bind_channel(group)
-    await slack_client.say_in_thread(f":construction: prepare-release-konflux for {assembly} :construction:")
+    #await slack_client.say_in_thread(f":construction: prepare-release-konflux for {assembly} :construction:")
 
     try:
         # start pipeline
@@ -968,7 +968,7 @@ async def prepare_release(
             date=date,
         )
         await pipeline.run()
-        await slack_client.say_in_thread(f":white_check_mark: prepare-release-konflux for {assembly} completes.")
+        #await slack_client.say_in_thread(f":white_check_mark: prepare-release-konflux for {assembly} completes.")
     except Exception as e:
-        await slack_client.say_in_thread(f":warning: prepare-release-konflux for {assembly} has result FAILURE.")
+        #await slack_client.say_in_thread(f":warning: prepare-release-konflux for {assembly} has result FAILURE.")
         raise e
