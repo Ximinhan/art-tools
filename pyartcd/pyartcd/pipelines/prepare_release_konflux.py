@@ -102,6 +102,7 @@ class PrepareReleaseKonfluxPipeline:
         self.for_fbc = False
         self.stage_rpa = None
         self.prod_rpa = None
+        self.build_repo = None
         self.olm_builds = []
 
         group_param = f'--group={group}'
@@ -137,11 +138,11 @@ class PrepareReleaseKonfluxPipeline:
         candidate_nightlies
         release_date
         """
-        build_repo = constants.GITHUB_OWNER
+        self.build_repo = constants.GITHUB_OWNER
         build_gitref = self.group
         if self.build_repo_url:
-            build_repo, build_gitref = build_repo_url.split("@", 1)
-        upstream_repo = self.github_client.get_repo(f"{build_repo}/ocp-build-data")
+            self.build_repo, build_gitref = build_repo_url.split("@", 1)
+        upstream_repo = self.github_client.get_repo(f"{self.build_repo}/ocp-build-data")
         group_config = yaml.load(upstream_repo.get_contents("group.yml", ref=build_gitref).decoded_content)
         release_config = yaml.load(upstream_repo.get_contents("releases.yml", ref=build_gitref).decoded_content)
         self.group_config = assembly_group_config(
@@ -285,7 +286,7 @@ class PrepareReleaseKonfluxPipeline:
             major, minor = isolate_major_minor_in_group(self.group)
             patch = 0
         self.for_fbc = False
-        upstream_repo = self.github_client.get_repo(f"build_repo/ocp-build-data")
+        upstream_repo = self.github_client.get_repo(f"{self.build_repo}/ocp-build-data")
         common_advisory_template = yaml.load(
             upstream_repo.get_contents("config/advisory_templates.yml", ref="main").decoded_content
         )
