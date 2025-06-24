@@ -367,7 +367,7 @@ class PrepareReleaseKonfluxPipeline:
     async def find_bugs_with_flaws(self, default_advisory_type):
         cmd = self._elliott_base_command + ["find-bugs:sweep", "--report", "--noop", "--output=json"]
         if default_advisory_type:
-            cmd.append(f"--default-advisory-type={default_advisory_type}")
+            cmd.append(f"--use-default-advisory={default_advisory_type}")
         rc, stdout, stderr = await exectools.cmd_gather_async(cmd)
 
         bugs = []
