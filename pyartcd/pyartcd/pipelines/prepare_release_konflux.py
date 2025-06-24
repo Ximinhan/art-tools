@@ -44,6 +44,7 @@ class PrepareReleaseKonfluxPipeline:
         assembly: str,
         github_token: str,
         gitlab_token: str,
+        date: Optional[str],
         build_repo_url: Optional[str] = None,
         shipment_repo_url: Optional[str] = None,
         job_url: Optional[str] = None,
@@ -53,7 +54,10 @@ class PrepareReleaseKonfluxPipeline:
         self.group = group
         self._slack_client = slack_client
         self.github_token = github_token
+        self.github_client = Github(github_token)
         self.gitlab_token = gitlab_token
+        self.gitlab_client = gitlab.Gitlab(url="https://gitlab.cee.redhat.com", private_token=gitlab_token)
+        self.release_date = date
 
         self.gitlab_url = self.runtime.config.get("gitlab_url", "https://gitlab.cee.redhat.com")
         self.application = KonfluxImageBuilder.get_application_name(self.group)
@@ -89,6 +93,257 @@ class PrepareReleaseKonfluxPipeline:
             f'--working-dir={self.elliott_working_dir}',
             f'--data-path={self.build_repo_pull_url}',
         ]
+
+    async def run(self):
+        #self.setup_working_dir()
+        
+        #await self.setup_repos()
+        #await self.validate_assembly()
+        self.init_assembly_data()
+        #advisories, jira_issue_key = await self.create_and_prepare_advisory()
+        shipment = await self.prepare_shipment()
+        shipment_mr = self.create_shipment(shipment)
+        
+        #self.update_build_data(advisories, jira_issue_key, shipment_mr)
+
+
+    def init_assembly_data(self):
+        """
+        load necessary data for release, include
+        group_config
+        release_name
+        candidate_nightlies
+        release_date
+        """
+        build_repo = constants.GITHUB_OWNER
+        build_gitref = self.group
+        if build_repo_url:
+            build_repo, build_gitref = build_repo_url.split("@", 1)
+        upstream_repo = self.github_client.get_repo(f"build_repo/ocp-build-data")
+        group_cofnig = yaml.load(upstream_repo.get_contents("group.yaml", ref=build_gitref).decoded_content)
+        release_config = yaml.load(upstream_repo.get_contents("releases.yaml", ref=build_gitref).decoded_content)
+        self.group_config = assembly_group_config(Model(releases_config), self.assembly, Model(group_config)).primitive()
+        self.release_name = get_release_name_for_assembly(self.group, releases_config, self.assembly)
+        nightlies = get_assembly_basis(releases_config, self.assembly).get("reference_releases", {}).values()
+        self.candidate_nightlies = nightlies_with_pullspecs(nightlies)
+        if not self.release_date:
+            _LOGGER.info("Release date not provided. Fetching release date from release schedule...")
+            try:
+                self.release_date = await get_assembly_release_date_async(self.release_name)
+            except Exception as ex:
+                raise ValueError(f"Failed to fetch release date from release schedule for {self.release_name}: {ex}")
+            _LOGGER.info("Release date: %s", self.release_date)
+        return
+    
+    async def create_and_prepare_advisory(self):
+        """
+        create_rpm_advisory
+          - find builds for rpm
+          - find bugs for rpm
+          - move advisory to qe
+        create_prerelease_advisory
+          - find builds for prerelease
+          - move advisory to qe
+        record advisory id to self
+        """
+        # create advisory and sweep bug
+        self.release_version = semver.VersionInfo.parse(self.release_name).to_tuple()
+        is_ga = self.release_version[2] == 0
+        advisory_type = "RHEA" if is_ga else "RHBA"
+        advisories = group_config.get("advisories", {})
+        for ad in advisories:
+            if advisories[ad] >= 0:
+                continue
+            if ad == "prerelease":
+                today = datetime.now(tz=timezone.utc)
+                release_date = today + timedelta(days=3)
+                if release_date.weekday() >= 5:
+                    release_date += timedelta(days=7 - release_date.weekday())
+                prerelease_advisory_num = self.create_advisory(
+                        advisory_type=advisory_type, art_advisory_key=ad, release_date=release_date
+                    )
+                advisories[ad] = prerelease_advisory_num
+                await self.build_and_attach_bundles(prerelease_advisory_num)
+                self.sweep_bugs(advisory=prerelease_advisory_num, permissive=True)
+            # usually this should be rpm advisory
+            standard_advisory_num = self.create_advisory(
+                    advisory_type=advisory_type, art_advisory_key=ad, release_date=self.release_date, batch_id=0
+                )
+            advisories[ad] = standard_advisory_num
+            await self.sweep_builds_async(ad, standard_advisory_num)
+            self.sweep_bugs(default_advisory_type=ad, permissive=False)  # sweep bugs for type ad
+            self.attach_cve_flaws(standard_advisory_num)  # attach cve falws for advisory
+            await self.change_advisory_state_qe(standard_advisory_num)  # change advisory to QE
+        self.advisories = advisories
+        # create release jira
+        jira_issue_key = group_config.get("release_jira")
+        jira_issue = None
+        jira_template_vars = {
+            "release_name": self.release_name,
+            "x": self.release_version[0],
+            "y": self.release_version[1],
+            "z": self.release_version[2],
+            "release_date": self.release_date,
+            "advisories": advisories,
+            "candidate_nightlies": self.candidate_nightlies,
+        }
+        if jira_issue_key and jira_issue_key != "ART-0":
+            _LOGGER.info("Reusing existing release JIRA %s", jira_issue_key)
+            jira_issue = self._jira_client.get_issue(jira_issue_key)
+            subtasks = [self._jira_client.get_issue(subtask.key) for subtask in jira_issue.fields.subtasks]
+            self.update_release_jira(jira_issue, subtasks, jira_template_vars)
+        else:
+            _LOGGER.info("Creating a release JIRA...")
+            jira_issues = self.create_release_jira(jira_template_vars)
+            jira_issue = jira_issues[0] if jira_issues else None
+            jira_issue_key = jira_issue.key if jira_issue else None
+        self.jira_issue_key = jira_issue_key
+        return advisories, jira_issue_key
+    
+    async def prepare_shipment():
+        """
+        get builds for image
+        get builds for extras
+        get builds for metadata
+        get bugs for each advisory
+        get cve falws for each advisory
+        get cves for each advisory
+        """
+        # find builds for image
+        image_builds, olm_builds_image = await self.find_builds("image")
+        # find builds for extras
+        extra_builds, olm_builds_extras = await self.find_builds("extras")
+        # find builds for metadata
+        olm_builds = olm_builds_image + olm_builds_extras
+
+        # find bugs for image
+        image_bugs = await self.find_bugs("image")
+        extras_bugs = await self.find_bugs("extras")
+        metadata_bugs = await self.find_bugs("metadata")
+
+        # TODO:find cve falws
+        # TODO:find cve names
+
+        # return a dict contains builds, bugs, cves
+        res = [
+            {
+                "kind": "image",
+                "builds": image_builds,
+                "bugs": image_bugs,
+                "cves": [],
+            },
+            {
+                "kind": "extras",
+                "builds": extra_builds,
+                "bugs": extras_bugs,
+                "cves": [],
+            },
+            {
+                "kind": "metadata",
+                "builds": olm_builds,
+                "bugs": metadata_bugs,
+                "cves": [],
+            }
+        ]
+        return res
+
+    
+    def create_shipment(self, shipment_config):
+        """
+        check shipment mr
+        create/rebase shipment branch
+        """
+        match = re.search(r"\d+.\d+.\d+", self.assembly)
+        if match:
+            major, minor, patch = self.assembly.split(".")
+        else:
+            major, minor = isolate_major_minor_in_group(self.group)
+            patch = 0
+        self.for_fbc = False
+        upstream_repo = self.github_client.get_repo(f"build_repo/ocp-build-data")
+        common_advisory_template = yaml.load(upstream_repo.get_contents("config/advisory_templates.yml", ref="main").decoded_content)
+        boilerplate = common_advisory_template.get("boilerplates", {})
+
+        # get gitlab shipment config
+        project = self.gitlab_client.projects.get(116177)
+        shipment_env_config = yaml.load(project.files.get(file_path='config.yaml',ref='main').decode())
+        app_env_config = shipment_config.get("applications", {}).get(self.application, {}).get("environments", {})
+        self.stage_rpa = self.stage_rpa or app_env_config.get("stage", {}).get("releasePlan", "test-stage-rpa")
+        self.prod_rpa = self.prod_rpa or app_env_config.get("prod", {}).get("releasePlan", "test-prod-rpa")
+        # create gitlab shipment fork branch
+        branch_name = f"Add_shipment_{self.assembly}"
+        fork_branch = project.branches.create({'branch': branch_name, 'ref': 'main'})
+
+        for shipment in shipment_config:
+            errata_type = "rhsa" if shipment.cves else "rhba"
+            advisory_boilerplate = boilerplate[shipment.kind][errata_type]
+            synopsis = advisory_boilerplate['synopsis'].format(MINOR=minor, PATCH=patch)
+            advisory_topic = advisory_boilerplate['topic'].format(MINOR=minor, PATCH=patch)
+            advisory_description = advisory_boilerplate['description'].format(MINOR=minor, PATCH=patch)
+            advisory_solution = advisory_boilerplate['solution'].format(MINOR=minor, PATCH=patch)
+            application = self.group.replace(".", "-")
+            shipment = ShipmentConfig(
+                shipment=Shipment(
+                    metadata=Metadata(
+                        product="ocp",
+                        application=application,
+                        group=self.group,
+                        assembly=self.assembly,
+                        fbc=self.for_fbc,
+                    ),
+                    environments=Environments(
+                        stage=ShipmentEnv(releasePlan=self.stage_rpa),
+                        prod=ShipmentEnv(releasePlan=self.prod_rpa),
+                    ),
+                    snapshot=Snapshot(name=self.snapshot, spec=Spec(nvrs=[])),
+                    data=Data(
+                        releaseNotes=ReleaseNotes(
+                            type=errata_type.upper(),
+                            synopsis=synopsis,
+                            topic=advisory_topic,
+                            description=advisory_description,
+                            solution=advisory_solution,
+                        ),
+                    ),
+                ),
+            )
+            shipment_yaml = shipment.model_dump(exclude_unset=True, exclude_none=True)
+            output = io.BytesIO()
+            yaml.dump(shipment_yaml, output)
+            output.seek(0)
+            time_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+            file_path = f"shipment/ocp/{self.group}/{application}/prod/{self.assembly}-{shipment.kind}.{time_suffix}.yaml"
+            # add shipment to fork repo
+            f = project.files.create({'file_path': file_path,
+                                    'branch': fork_branch.name,
+                                    'content':  output.read(),
+                                    'author_email': self.gitlab_client.user.emails.list(get_all=True)[0].email,
+                                    'author_name': self.gitlab_client.user.name,
+                                    'commit_message': f"Add shipment files for {self.assembly}"})
+        mr = project.mergerequests.create({'source_branch': fork_branch.name,
+                                        'target_branch': 'main',
+                                        'title': f"Add shipment files for {self.assembly}",})
+        return mr.web_url
+
+
+    async def find_bugs_with_flaws(self, default_advisory_type):
+        cmd = self._elliott_base_command + [
+            "find-bugs:sweep",
+            "--report",
+            "--noop",
+            "--output=json"
+        ]
+        if default_advisory_type:
+            cmd.append(f"--default-advisory-type={default_advisory_type}")
+        rc, stdout, stderr = await exectools.cmd_gather_async(cmd)
+
+        bugs = []
+        if stdout:
+            out = json.loads(stdout)
+            bugs = [(bug.id, bug.web_url) for bug in out]
+        return bugs
+
+
 
     @staticmethod
     def basic_auth_url(url: str, token: str) -> str:
@@ -148,11 +403,6 @@ class PrepareReleaseKonfluxPipeline:
     def shipment_config(self) -> dict:
         return self.assembly_group_config.get("shipment", [])
 
-    async def run(self):
-        self.setup_working_dir()
-        await self.setup_repos()
-        await self.validate_assembly()
-        await self.prepare_shipment()
 
     def setup_working_dir(self):
         self.working_dir.mkdir(parents=True, exist_ok=True)
@@ -196,29 +446,29 @@ class PrepareReleaseKonfluxPipeline:
                 f"Product mismatch: {group_product} != {self.product}. This pipeline only supports {self.product}."
             )
 
-    async def prepare_shipment(self):
-        """Prepare the shipment for the assembly.
-        This includes:
-        - Validating the shipment advisory config
-        - Generating shipment files for each advisory kind
-        - Creating or updating the shipment MR
-        - Creating or updating the build data PR with the shipment config
-        """
+    # async def prepare_shipment(self):
+    #     """Prepare the shipment for the assembly.
+    #     This includes:
+    #     - Validating the shipment advisory config
+    #     - Generating shipment files for each advisory kind
+    #     - Creating or updating the shipment MR
+    #     - Creating or updating the build data PR with the shipment config
+    #     """
 
-        self.validate_shipment_config(self.shipment_config)
+    #     self.validate_shipment_config(self.shipment_config)
 
-        shipment_config = self.shipment_config.copy()  # make a copy to avoid modifying the original
-        env = shipment_config.get("env", "prod")
-        generated_shipments: Dict[str, ShipmentConfig] = {}
-        for shipment_advisory_config in shipment_config.get("advisories"):
-            kind = shipment_advisory_config.get("kind")
-            generated_shipments[kind] = await self.generate_shipment(shipment_advisory_config, env)
+    #     shipment_config = self.shipment_config.copy()  # make a copy to avoid modifying the original
+    #     env = shipment_config.get("env", "prod")
+    #     generated_shipments: Dict[str, ShipmentConfig] = {}
+    #     for shipment_advisory_config in shipment_config.get("advisories"):
+    #         kind = shipment_advisory_config.get("kind")
+    #         generated_shipments[kind] = await self.generate_shipment(shipment_advisory_config, env)
 
-        await self.create_update_shipment_mr(shipment_config, generated_shipments, env)
-        await self.create_update_build_data_pr(shipment_config)
+    #     await self.create_update_shipment_mr(shipment_config, generated_shipments, env)
+    #     await self.create_update_build_data_pr(shipment_config)
 
-        if "_errata_api" in self.__dict__:
-            await self._errata_api.close()
+    #     if "_errata_api" in self.__dict__:
+    #         await self._errata_api.close()
 
     def validate_shipment_config(self, shipment_config: dict):
         """Validate the given shipment configuration for an assembly.
@@ -356,14 +606,11 @@ class PrepareReleaseKonfluxPipeline:
         shipment = ShipmentConfig(**out)
         return shipment
 
-    async def find_builds(self, kind: str) -> Spec:
+    async def find_builds(self, kind: str):
         """Find builds for the given kind and return a snapshot Spec object containing the NVRs.
         :param kind: The kind for which to find builds
         :return: A Spec object containing the NVRs of the builds found (part of shipment definition)
         """
-
-        if kind not in ("image", "extras"):
-            raise ValueError(f"Invalid kind: {kind}. Only image and extras are supported")
         payload = True if kind == "image" else False
 
         find_builds_cmd = self._elliott_base_command + [
@@ -384,8 +631,8 @@ class PrepareReleaseKonfluxPipeline:
         if stdout:
             out = json.loads(stdout)
             builds = out.get("builds", [])
-            self.olm_builds = self.olm_builds.append(out.get("olm_builds", []))
-        return Spec(nvrs=builds)
+            olm_builds = out.get("olm_builds", [])
+        return builds, olm_builds
 
     async def create_update_shipment_mr(
         self, shipment_config: dict, generated_shipments: Dict[str, ShipmentConfig], env: str

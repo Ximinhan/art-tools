@@ -281,6 +281,8 @@ async def find_and_attach_bugs(
         logger.info(f'{kind} bugs: {[b.id for b in kind_bugs]}')
 
     if runtime.build_system == 'konflux':
+        if default_advisory_type:
+            return bugs_by_type.get(default_advisory_type)
         return bugs
 
     if not any([advisory_id, default_advisory_type, advisory_ids]):
