@@ -708,6 +708,8 @@ async def find_builds_konflux(runtime, payload):
             continue
         image_metas.append(image)
 
+    LOGGER.info("Fetching NVRs from DB...")
+    # find build result (is_olm_operator, build_Record)
     tasks = [
         (image.is_olm_operator, image.get_latest_build(el_target=image.branch_el_target())) for image in image_metas
     ]
@@ -716,17 +718,16 @@ async def find_builds_konflux(runtime, payload):
     if len(records_with_olm) != len(image_metas):
         raise ElliottFatalError(f"Failed to find Konflux builds for {len(image_metas) - len(records_with_olm)} images")
 
-    # get related bundle records
+    # get related bundle records in KonfluxBundleBuildRecord
     LOGGER.info("Fetching bundle build from DB ...")
     runtime.konflux_db.bind(KonfluxBundleBuildRecord)
     olm_tasks = [
-        (
-            record.nvr,
-            anext(runtime.konflux_db.search_builds_by_fields(where={"operator_nvr": record.nvr}, limit=1), None),
-        )
+        (record, anext(runtime.konflux_db.search_builds_by_fields(where={"operator_nvr": record.nvr}, limit=1), None))
         for is_olm, record in records_with_olm
         if is_olm
     ]
+    # find olm result (olm_operator build, olm build)
     olm_records = await asyncio.gather(*[task[1] for task in olm_tasks])
     olm_records_not_found = [olm_task[0] for olm_task, r in zip(olm_tasks, olm_records) if r is None]
+    olm_records = [record for record in olm_records if record is not None]
     return [record for _, record in records_with_olm], olm_records, olm_records_not_found
