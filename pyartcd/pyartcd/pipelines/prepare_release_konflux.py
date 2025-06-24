@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 import click
 import gitlab
+from github import Github, GithubException
 from artcommonlib import exectools
 from artcommonlib.assembly import AssemblyTypes, assembly_config_struct, assembly_group_config
 from artcommonlib.constants import SHIPMENT_DATA_URL_TEMPLATE
