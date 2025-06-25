@@ -246,8 +246,10 @@ class PrepareReleaseKonfluxPipeline:
                 'MINOR': minor,
                 'PATCH': patch,
             }
+            description_kwargs = topic_kwargs
             if shipment_item['cves']:
                 topic_kwargs['IMPACT'] = 'low'
+                description_kwargs['CVES'] = '\n'.join([f'* {cve['key']}' for cve in shipment_item['cves']])
             shipment = shipment_model.ShipmentConfig(
                 shipment=shipment_model.Shipment(
                     metadata=shipment_model.Metadata(
@@ -272,7 +274,7 @@ class PrepareReleaseKonfluxPipeline:
                             issues=shipment_model.Issues(fixed=fixed_issues),
                             synopsis=advisory_boilerplate['synopsis'].format(MINOR=minor, PATCH=patch),
                             topic=advisory_boilerplate['topic'].format(**topic_kwargs),
-                            description=advisory_boilerplate['description'].format(MINOR=minor, PATCH=patch),
+                            description=advisory_boilerplate['description'].format(**description_kwargs),
                             solution=advisory_boilerplate['solution'].format(MINOR=minor, PATCH=patch),
                         ),
                     ),
