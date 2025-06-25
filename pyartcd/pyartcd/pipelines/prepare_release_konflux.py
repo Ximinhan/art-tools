@@ -174,6 +174,8 @@ class PrepareReleaseKonfluxPipeline:
         # TODO: rebuild olm_builds_not_found
         # find bugs for image, note the bugs didn't sweep and didn't find cve_flaws
         image_bugs, extras_bugs, metadata_bugs, cve_list_map = await self.find_bugs_with_flaws(image_builds, extra_builds, olm_builds)
+        # TODO:find cve falws
+
         # return a dict contains builds, bugs, cves
         res = []
         for kind, builds, bugs, cve_list in [
