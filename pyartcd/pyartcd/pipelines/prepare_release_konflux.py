@@ -7,7 +7,7 @@ import shutil
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, SimpleNamespace
 from urllib.parse import urlparse
 
 import click
