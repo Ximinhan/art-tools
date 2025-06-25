@@ -467,11 +467,11 @@ def validate_tracker_bugs(bugs_by_type, logger, tracker_bugs, kind_nvrs_map, per
                     f"skip attach microshift bug {bug.id} to {advisory} because this advisory has no builds attached"
                 )
                 found.add(bug)
-            elif (package_name in packages) or (package_name in exception_packages):
-                if package_name in packages:
-                    logger.info(f"{kind} build found for #{bug.id}, {package_name} ")
+            elif any(package_name in p for p in packages) or (package_name in exception_packages):
                 if package_name in exception_packages:
                     logger.info(f"{package_name} bugs included by default")
+                else:
+                    logger.info(f"{kind} build found for #{bug.id}, {package_name} ")
                 if isinstance(bugs_by_type[kind], list):
                     bugs_by_type[kind].append(bug)
                 else:

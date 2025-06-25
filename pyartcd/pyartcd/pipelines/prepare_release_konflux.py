@@ -251,6 +251,7 @@ class PrepareReleaseKonfluxPipeline:
                     data=shipment_model.Data(
                         releaseNotes=shipment_model.ReleaseNotes(
                             type=errata_type.upper(),
+                            cves=[shipment_model.CveAssociation(key=cve['key'], component=cve['component']) for cve in shipment_item['cves']],
                             issues=shipment_model.Issues(fixed=[shipment_model.Issue(id=bug["id"], source=urlparse(bug['url']).hostname) for bug in shipment_item['bugs']]),
                             synopsis=advisory_boilerplate['synopsis'].format(MINOR=minor, PATCH=patch),
                             topic=advisory_boilerplate['topic'].format(MINOR=minor, PATCH=patch),
@@ -305,7 +306,7 @@ class PrepareReleaseKonfluxPipeline:
                 else:
                     # this should be tracker bug
                     if bug.cve_id not in cve_list_map[cve_bug_type]:
-                        cve_list_map[cve_bug_type].append(bug.cve_id)
+                        cve_list_map[cve_bug_type].append({"key": bug.cve_id, "component": bug.component})
                     res.append({"id": bug.id, "url": bug.url})
             return res
 
