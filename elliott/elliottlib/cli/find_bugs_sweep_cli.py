@@ -472,15 +472,21 @@ def validate_tracker_bugs(bugs_by_type, logger, tracker_bugs, kind_nvrs_map, per
                     logger.info(f"{kind} build found for #{bug.id}, {package_name} ")
                 if package_name in exception_packages:
                     logger.info(f"{package_name} bugs included by default")
+                if isinstance(bugs_by_type[kind], list):
+                    bugs_by_type[kind].append(bug)
+                else:
+                    bugs_by_type[kind].add(bug)
                 found.add(bug)
-                bugs_by_type[kind].add(bug)
             elif package_name == "rhcos" and packages & arch_util.RHCOS_BREW_COMPONENTS:
                 # rhcos trackers are special, since they have per-architecture component names
                 # (rhcos-x86_64, rhcos-aarch64, ...) in Brew,
                 # but the tracker bug has a generic "rhcos" component name
                 logger.info(f"{kind} build found for #{bug.id}, {package_name} ")
+                if isinstance(bugs_by_type[kind], list):
+                    bugs_by_type[kind].append(bug)
+                else:
+                    bugs_by_type[kind].add(bug)
                 found.add(bug)
-                bugs_by_type[kind].add(bug)
 
     not_found = set(tracker_bugs) - found
     if not_found:
