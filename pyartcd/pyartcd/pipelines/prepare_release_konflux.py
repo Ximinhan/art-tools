@@ -277,7 +277,7 @@ class PrepareReleaseKonfluxPipeline:
         _LOGGER.info(f"Created shipment mr {mr.web_url}")
         return mr.web_url
 
-    async def find_bugs_with_flaws(self, image_builds, extra_builds, olm_builds)
+    async def find_bugs_with_flaws(self, image_builds, extra_builds, olm_builds):
         """
         Run the elliott 'find-bugs:sweep' command and extract bug IDs and URLs for each bug type.
         Returns:
