@@ -287,7 +287,7 @@ class PrepareReleaseKonfluxPipeline:
         rc, stdout, stderr = await exectools.cmd_gather_async(cmd)
         if not stdout:
             return [], [], []
-        _LOGGER.info(f"find-bugs:sweep output:\n{stdout}")
+        #_LOGGER.info(f"find-bugs:sweep output:\n{stdout}")
         out = json.loads(stdout)
 
         def extract_bugs(bug_list):
