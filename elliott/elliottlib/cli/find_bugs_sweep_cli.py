@@ -189,9 +189,10 @@ async def find_bugs_sweep_cli(
             serializable_bugs = {}
             for key, bug_list in bugs.items():
                 if key == "permitted":
-                    serializable_bugs[key] = bug_list
+                    serializable_bugs[key] = list(bug_list)
                 else:
                     serializable_bugs[key] = [bug_to_dict(bug) for bug in bug_list]
+            logger.info(f"find bugs find: \n {serializable_bugs}")
             print(json.dumps(serializable_bugs, indent=4))
         else:
             print_report(bugs, output)
