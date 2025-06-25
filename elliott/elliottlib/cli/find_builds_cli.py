@@ -699,7 +699,7 @@ def _filter_out_attached_builds(
     return unattached_builds, attached_to_advisories
 
 
-async def find_builds_konflux(runtime, payload):
+async def find_builds_konflux(runtime):
     """
     Find Konflux builds for a group/assembly, separating payload and non-payload images,
     and fetch related OLM bundle builds.
