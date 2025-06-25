@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from typing import Dict, Optional
-from types import SimpleNamespace
+from collections import namedtuple
 from urllib.parse import urlparse
 
 import click
@@ -309,8 +309,9 @@ class PrepareReleaseKonfluxPipeline:
                     res.append({"id": bug.id, "url": bug.url})
             return res
 
+        TrackerBug = namedtuple('TrackerBug', ['id', 'component', 'sub_component', 'whiteboard_component', 'status', 'url', 'cve_id'])
         tracker_bugs = [
-            SimpleNamespace(
+            TrackerBug(
                 id=bug['id'],
                 component=bug['component'],
                 sub_component=bug['sub_component'],
