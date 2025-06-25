@@ -231,6 +231,23 @@ class PrepareReleaseKonfluxPipeline:
         for shipment_item in shipment_data:
             errata_type = "rhsa" if shipment_item['cves'] else "rhba"
             advisory_boilerplate = boilerplate[shipment_item['kind']][errata_type]
+            cve_associations = [
+                shipment_model.CveAssociation(key=cve['key'], component=cve['component'])
+                for cve in shipment_item['cves']
+            ]
+            fixed_issues = [
+                shipment_model.Issue(
+                    id=bug["id"],
+                    source=urlparse(bug['url']).hostname
+                )
+                for bug in shipment_item['bugs']
+            ]
+            topic_kwargs = {
+                'MINOR': minor,
+                'PATCH': patch,
+            }
+            if shipment_item['cves']:
+                topic_kwargs['IMPACT'] = 'low'
             shipment = shipment_model.ShipmentConfig(
                 shipment=shipment_model.Shipment(
                     metadata=shipment_model.Metadata(
@@ -251,10 +268,10 @@ class PrepareReleaseKonfluxPipeline:
                     data=shipment_model.Data(
                         releaseNotes=shipment_model.ReleaseNotes(
                             type=errata_type.upper(),
-                            cves=[shipment_model.CveAssociation(key=cve['key'], component=cve['component']) for cve in shipment_item['cves']],
-                            issues=shipment_model.Issues(fixed=[shipment_model.Issue(id=bug["id"], source=urlparse(bug['url']).hostname) for bug in shipment_item['bugs']]),
+                            cves=cve_associations,
+                            issues=shipment_model.Issues(fixed=fixed_issues),
                             synopsis=advisory_boilerplate['synopsis'].format(MINOR=minor, PATCH=patch),
-                            topic=advisory_boilerplate['topic'].format(MINOR=minor, PATCH=patch),
+                            topic=advisory_boilerplate['topic'].format(**topic_kwargs),
                             description=advisory_boilerplate['description'].format(MINOR=minor, PATCH=patch),
                             solution=advisory_boilerplate['solution'].format(MINOR=minor, PATCH=patch),
                         ),
