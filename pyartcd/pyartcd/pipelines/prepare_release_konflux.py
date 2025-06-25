@@ -173,18 +173,15 @@ class PrepareReleaseKonfluxPipeline:
         image_builds, extra_builds, olm_builds, olm_builds_not_found = await self.find_builds()
         # TODO: rebuild olm_builds_not_found
         # find bugs for image, note the bugs didn't sweep and didn't find cve_flaws
-        image_bugs, extras_bugs, metadata_bugs = await self.find_bugs_with_flaws()
-        # TODO:find cve falws
-        # TODO:find cve names
-
+        image_bugs, extras_bugs, metadata_bugs, cve_list_map = await self.find_bugs_with_flaws(image_builds, extra_builds, olm_builds)
         # return a dict contains builds, bugs, cves
         res = []
-        for kind, builds, bugs in [
-            ("image", image_builds, image_bugs),
-            ("extras", extra_builds, extras_bugs),
-            ("metadata", olm_builds, metadata_bugs),
+        for kind, builds, bugs, cve_list in [
+            ("image", image_builds, image_bugs, cve_list_map['image']),
+            ("extras", extra_builds, extras_bugs, cve_list_map['extras']),
+            ("metadata", olm_builds, metadata_bugs, cve_list_map['metadata']),
         ]:
-            res.append({"kind": kind, "builds": builds, "bugs": bugs, "cves": [],})
+            res.append({"kind": kind, "builds": builds, "bugs": bugs, "cves": cve_list,})
         _LOGGER.info(f"Generated shipment data: \n {res}")
         return res
 
@@ -277,7 +274,7 @@ class PrepareReleaseKonfluxPipeline:
         _LOGGER.info(f"Created shipment mr {mr.web_url}")
         return mr.web_url
 
-    async def find_bugs_with_flaws(self):
+    async def find_bugs_with_flaws(self, image_builds, extra_builds, olm_builds)
         """
         Run the elliott 'find-bugs:sweep' command and extract bug IDs and URLs for each bug type.
         Returns:
@@ -289,17 +286,46 @@ class PrepareReleaseKonfluxPipeline:
         cmd = self._elliott_base_command + ["find-bugs:sweep", "--report", "--noop", "--output=json"]
         rc, stdout, stderr = await exectools.cmd_gather_async(cmd)
         if not stdout:
-            return [], [], []
+            return [], [], [], {}
         #_LOGGER.info(f"find-bugs:sweep output:\n{stdout}")
         out = json.loads(stdout)
+        cve_list_map = {'image': [], 'extras': [], 'metadata': []}
 
-        def extract_bugs(bug_list):
-            return [{"id": bug["id"], "url": bug["url"]} for bug in bug_list]
+        def extract_bugs(bug_list, cve_bug_type):
+            res = []
+            for bug in bug_list:
+                if isinstance(bug, dict):
+                    res.append({"id": bug["id"], "url": bug["url"]})
+                else:
+                    # this should be tracker bug
+                    if bug.cve_id not in cve_list_map[cve_bug_type]:
+                        cve_list_map[cve_bug_type].append(bug.cve_id)
+                    res.append({"id": bug.id, "url": bug.url})
+            return res
 
-        image_bugs = extract_bugs(out.get("image", []))
-        extras_bugs = extract_bugs(out.get("extras", []))
-        metadata_bugs = extract_bugs(out.get("metadata", []))
-        return image_bugs, extras_bugs, metadata_bugs
+        tracker_bugs = [
+            SimpleNamespace(
+                id=bug['id'],
+                component=bug['component'],
+                sub_component=bug['sub_component'],
+                whiteboard_component=bug['whiteboard_component'],
+                status=bug['status'],
+                url=bug['url'],
+                cve_id=bug['cve_id'],
+            )
+            for bug in out.get("tracker", [])
+        ]
+        permitted_bug_ids = out.get("permitted", [])
+        kind_nvrs_map = {
+            "image": image_builds,
+            "extras": extra_builds,
+            "metadata": olm_builds,
+        }
+        bugs_by_type = validate_tracker_bugs(out, _LOGGER, tracker_bugs, kind_nvrs_map, permitted_bug_ids, False)
+        image_bugs = extract_bugs(bugs_by_type.get("image", []), "image")
+        extras_bugs = extract_bugs(bugs_by_type.get("extras", []), "extras")
+        metadata_bugs = extract_bugs(bugs_by_type.get("metadata", []), "metadata")
+        return image_bugs, extras_bugs, metadata_bugs, cve_list_map
 
     async def find_builds(self):
         """

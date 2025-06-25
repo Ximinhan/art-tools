@@ -180,13 +180,18 @@ async def find_bugs_sweep_cli(
                 return {
                     "id": bug.id,
                     "component": bug.component,
+                    "sub_component": bug.sub_component,
+                    "whiteboard_component": bug.whiteboard_component,
+                    "cve_id": bug.cve_id,
                     "status": bug.status,
                     "url": bug.weburl,
                 }
-            serializable_bugs = {
-                key: [bug_to_dict(bug) for bug in bug_list]
-                for key, bug_list in bugs.items()
-            }
+            serializable_bugs = {}
+            for key, bug_list in bugs.items():
+                if key == "permitted":
+                    serializable_bugs[key] = bug_list
+                else:
+                    serializable_bugs[key] = [bug_to_dict(bug) for bug in bug_list]
             print(json.dumps(serializable_bugs, indent=4))
         else:
             print_report(bugs, output)
@@ -282,9 +287,13 @@ async def find_and_attach_bugs(
     advisory_ids = runtime.get_default_advisories()
     included_bug_ids, _ = get_assembly_bug_ids(runtime, bug_tracker_type=bug_tracker.type)
     major_version, minor_version = runtime.get_major_minor()
+    kind_nvrs_map = {}
+    for key, advisory in advisory_ids.items():
+        kind_nvrs_map[key] = set(errata.get_advisory_nvrs(advisory).keys())
+
     bugs_by_type, _ = categorize_bugs_by_type(
         bugs=bugs,
-        advisory_id_map=advisory_ids,
+        kind_nvrs_map=kind_nvrs_map,
         permitted_bug_ids=included_bug_ids,
         noop=noop,
         major_version=major_version,
@@ -294,7 +303,10 @@ async def find_and_attach_bugs(
         skip_validating=(runtime.build_system == 'konflux'),
     )
     for kind, kind_bugs in bugs_by_type.items():
-        logger.info(f'{kind} bugs: {[b.id for b in kind_bugs]}')
+        if kind == "permitted":
+            logger.info(f'{kind} bugs: {[b for b in kind_bugs]}')
+        else:
+            logger.info(f'{kind} bugs: {[b.id for b in kind_bugs]}')
 
     if runtime.build_system == 'konflux':
         return bugs_by_type
@@ -344,7 +356,7 @@ def get_assembly_bug_ids(runtime, bug_tracker_type):
 
 def categorize_bugs_by_type(
     bugs: List[Bug],
-    advisory_id_map: Dict[str, int],
+    kind_nvrs_map: Dict[str, list],
     permitted_bug_ids,
     noop,
     major_version: int,
@@ -419,22 +431,26 @@ def categorize_bugs_by_type(
             except Exception as e:
                 logger.warning("Failed to fix summary: %s", str(e))
 
-    if not advisory_id_map or skip_validating:
+    if not kind_nvrs_map or skip_validating:
         logger.warning(
             "Skipping categorizing Tracker Bugs; advisories with attached builds must be given for this operation."
         )
+        bugs_by_type['tracker'] = tracker_bugs
+        bugs_by_type['permitted'] = permitted_bug_ids
         return bugs_by_type, issues
 
+    bugs_by_type = validate_tracker_bugs(bugs_by_type, logger, tracker_bugs, kind_nvrs_map, permitted_bug_ids, permissive)
+
+    return bugs_by_type, issues
+
+
+def validate_tracker_bugs(bugs_by_type, logger, tracker_bugs, kind_nvrs_map, permitted_bug_ids, permissive):
     logger.info("Validating tracker bugs with builds in advisories..")
     found = set()
     for kind in bugs_by_type.keys():
         if len(found) == len(tracker_bugs):
             break
-        advisory = advisory_id_map.get(kind)  # this should be kind_nvrs_map so konflux can use
-        if not advisory:
-            continue
-        attached_builds = errata.get_advisory_nvrs(advisory)
-        packages = set(attached_builds.keys())
+        packages = kind_nvrs_map.get(kind, [])
         exception_packages = []
         if kind == 'image':
             # golang builder is a special tracker component
@@ -484,11 +500,9 @@ def categorize_bugs_by_type(
             )
             if permissive:
                 logger.warning(f"{message} Ignoring them because --permissive.")
-                issues.append(message)
             else:
                 raise ValueError(message)
-
-    return bugs_by_type, issues
+    return bugs_by_type
 
 
 def extras_bugs(bugs: type_bug_set) -> type_bug_set:
