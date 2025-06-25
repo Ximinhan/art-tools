@@ -249,7 +249,7 @@ class PrepareReleaseKonfluxPipeline:
             description_kwargs = topic_kwargs
             if shipment_item['cves']:
                 topic_kwargs['IMPACT'] = 'low'
-                description_kwargs['CVES'] = '\n'.join([f'* {cve['key']}' for cve in shipment_item['cves']])
+                description_kwargs['CVES'] = '\n'.join([f"* {cve['key']}" for cve in shipment_item['cves']])
             shipment = shipment_model.ShipmentConfig(
                 shipment=shipment_model.Shipment(
                     metadata=shipment_model.Metadata(
