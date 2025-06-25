@@ -80,7 +80,7 @@ class PrepareReleaseKonfluxPipeline:
         await self.init_assembly_data()
         # advisories, jira_issue_key = await self.create_and_prepare_advisory()
         shipment = await self.prepare_shipment()
-        # shipment_mr = self.create_shipment(shipment)
+        shipment_mr = self.create_shipment(shipment)
         # self.update_build_data(advisories, jira_issue_key, shipment_mr)
 
     async def init_assembly_data(self):
