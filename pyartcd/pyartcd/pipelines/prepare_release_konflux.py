@@ -20,6 +20,7 @@ from artcommonlib.model import Model
 from artcommonlib.util import get_assembly_release_date_async, isolate_major_minor_in_group, new_roundtrip_yaml_handler
 from doozerlib.backend.konflux_image_builder import KonfluxImageBuilder
 from elliottlib.errata_async import AsyncErrataAPI
+from elliottlib.cli.find_bugs_sweep_cli import validate_tracker_bugs
 from elliottlib import shipment_model
 
 from pyartcd import constants
@@ -323,6 +324,7 @@ class PrepareReleaseKonfluxPipeline:
             "extras": extra_builds,
             "metadata": olm_builds,
         }
+        _LOGGER.info(f"validate tracker bug {tracker_bugs}")
         bugs_by_type = validate_tracker_bugs(out, _LOGGER, tracker_bugs, kind_nvrs_map, permitted_bug_ids, False)
         image_bugs = extract_bugs(bugs_by_type.get("image", []), "image")
         extras_bugs = extract_bugs(bugs_by_type.get("extras", []), "extras")
