@@ -482,7 +482,10 @@ def validate_tracker_bugs(bugs_by_type, logger, tracker_bugs, kind_nvrs_map, per
                 found.add(bug)
                 bugs_by_type[kind].add(bug)
 
-    not_found = set(tracker_bugs) - found
+    tracker_bug_ids = {bug.id for bug in tracker_bugs}
+    found_ids = {bug.id for bug in found}
+    not_found_ids = tracker_bug_ids - found_ids
+    not_found = [bug for bug in tracker_bugs if bug.id in not_found_ids]
     if not_found:
         still_not_found = not_found
         if permitted_bug_ids:
