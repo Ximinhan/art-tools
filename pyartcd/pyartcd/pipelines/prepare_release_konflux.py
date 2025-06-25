@@ -242,7 +242,10 @@ class PrepareReleaseKonfluxPipeline:
                         stage=shipment_model.ShipmentEnv(releasePlan=self.stage_rpa),
                         prod=shipment_model.ShipmentEnv(releasePlan=self.prod_rpa),
                     ),
-                    snapshot=shipment_model.Snapshot(spec=shipment_model.Spec(nvrs=shipment_item['builds'])),
+                    snapshot=shipment_model.Snapshot(
+                        name=f"ose-{self.assembly}-{time_suffix}",
+                        spec=shipment_model.Spec(nvrs=shipment_item['builds'])
+                    ),
                     data=shipment_model.Data(
                         releaseNotes=shipment_model.ReleaseNotes(
                             type=errata_type.upper(),
