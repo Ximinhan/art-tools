@@ -174,9 +174,15 @@ async def find_builds_cli(
             )
         if kind != 'image':
             raise click.BadParameter('Konflux only supports --kind image.')
-        records, olm_records, olm_records_not_found = await find_builds_konflux(runtime, payload)
+        payload_records, non_payload_records, olm_records, olm_records_not_found = await find_builds_konflux(runtime)
         if as_json:
-            _json_dump(as_json, records, kind, olm_records, olm_records_not_found)
+            json_data = {
+                'payload': sorted([b.nvr for b in payload_records]),
+                'nonpayload': sorted([b.nvr for b in non_payload_records]),
+                'olm_builds': sorted([b.nvr for b in olm_builds]),
+                'olm_builds_not_found': sorted([b.nvr for b in olm_records_not_found]),
+            }
+            click.echo(json.dumps(json_data, indent=4, sort_keys=True))
             return
         for nvr in sorted([r.nvr for r in records]):
             click.echo(nvr)
@@ -695,26 +701,52 @@ def _filter_out_attached_builds(
 
 async def find_builds_konflux(runtime, payload):
     """
-    Find konflux builds for group/assembly
-    """
+    Find Konflux builds for a group/assembly, separating payload and non-payload images,
+    and fetch related OLM bundle builds.
 
+    This function:
+    - Iterates over image metadata from the runtime, filtering out base-only and non-release images.
+    - For each image, determines if it is a payload image and collects its build record.
+    - Separates the results into payload and non-payload image builds.
+    - For OLM operator images, fetches the related bundle build records from the database.
+    - Returns four lists:
+        1. Build records for payload images.
+        2. Build records for non-payload images.
+        3. OLM bundle build records found.
+        4. OLM operator build records for which no bundle build was found.
+
+    Args:
+        runtime: The runtime object providing access to image metadata and the Konflux database.
+        payload: Boolean flag indicating whether to process payload images.
+
+    Returns:
+        Tuple of four lists:
+            - List of build records for payload images.
+            - List of build records for non-payload images.
+            - List of OLM bundle build records found.
+            - List of OLM operator build records for which no bundle build was found.
+
+    Raises:
+        ElliottFatalError: If any image build records could not be found.
+    """
     runtime.konflux_db.bind(KonfluxBuildRecord)
 
-    image_metas: List[ImageMetadata] = []
+    image_metas: list[tuple[bool, ImageMetadata]] = []
     for image in runtime.image_metas():
         if image.base_only or not image.is_release:
             continue
-        if (payload and not image.is_payload) or (not payload and image.is_payload):
-            continue
-        image_metas.append(image)
+        image_metas.append((image.is_payload, image))
 
     LOGGER.info("Fetching NVRs from DB...")
-    # find build result (is_olm_operator, build_Record)
+    # find build result (is_olm_operator, build_Record, is_payload)
     tasks = [
-        (image.is_olm_operator, image.get_latest_build(el_target=image.branch_el_target())) for image in image_metas
+        (image.is_olm_operator, image.get_latest_build(el_target=image.branch_el_target()), is_payload)
+        for is_payload, image in image_metas
     ]
     results = await asyncio.gather(*[task[1] for task in tasks])
-    records_with_olm = [(task[0], r) for task, r in zip(tasks, results) if r is not None]
+    records_with_olm = [
+        (task[0], r, task[2]) for task, r in zip(tasks, results) if r is not None
+    ]
     if len(records_with_olm) != len(image_metas):
         raise ElliottFatalError(f"Failed to find Konflux builds for {len(image_metas) - len(records_with_olm)} images")
 
@@ -722,12 +754,18 @@ async def find_builds_konflux(runtime, payload):
     LOGGER.info("Fetching bundle build from DB ...")
     runtime.konflux_db.bind(KonfluxBundleBuildRecord)
     olm_tasks = [
-        (record, anext(runtime.konflux_db.search_builds_by_fields(where={"operator_nvr": record.nvr}, limit=1), None))
-        for is_olm, record in records_with_olm
+        (record, anext(runtime.konflux_db.search_builds_by_fields(where={"operator_nvr": record.nvr}, limit=1), None), is_payload)
+        for is_olm, record, is_payload in records_with_olm
         if is_olm
     ]
-    # find olm result (olm_operator build, olm build)
+    # find olm result (olm_operator build, olm build, is_payload)
     olm_records = await asyncio.gather(*[task[1] for task in olm_tasks])
     olm_records_not_found = [olm_task[0] for olm_task, r in zip(olm_tasks, olm_records) if r is None]
     olm_records = [record for record in olm_records if record is not None]
-    return [record for _, record in records_with_olm], olm_records, olm_records_not_found
+
+    return (
+        [record for _, record, is_payload in records_with_olm if is_payload],
+        [record for _, record, is_payload in records_with_olm if not is_payload],
+        olm_records,
+        olm_records_not_found,
+    )

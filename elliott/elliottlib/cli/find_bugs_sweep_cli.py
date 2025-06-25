@@ -154,7 +154,7 @@ async def find_bugs_sweep_cli(
     find_bugs_obj.include_status(include_status)
     find_bugs_obj.exclude_status(exclude_status)
 
-    bugs: type_bug_list = await find_and_attach_bugs(
+    bugs = await find_and_attach_bugs(
         runtime,
         advisory_id,
         default_advisory_type,
@@ -174,7 +174,24 @@ async def find_bugs_sweep_cli(
         click.echo(", ".join(sorted(str(b.id) for b in bugs)))
 
     if report:
-        print_report(bugs, output)
+        if runtime.build_system == 'konflux':
+            # find_and_attach_bugs for konflux will return bugs_by_type
+            def bug_to_dict(bug):
+                return {
+                    "id": bug.id,
+                    "component": bug.component,
+                    "status": bug.status,
+                    "date": str(bug.creation_time_parsed()),
+                    "summary": bug.summary[:60],
+                    "url": bug.weburl,
+                }
+            serializable_bugs = {
+                key: [bug_to_dict(bug) for bug in bug_list]
+                for key, bug_list in bugs.items()
+            }
+            print(json.dumps(serializable_bugs, indent=4))
+        else:
+            print_report(bugs, output)
 
     sys.exit(0)
 
@@ -282,9 +299,7 @@ async def find_and_attach_bugs(
         logger.info(f'{kind} bugs: {[b.id for b in kind_bugs]}')
 
     if runtime.build_system == 'konflux':
-        if default_advisory_type:
-            return bugs_by_type.get(default_advisory_type)
-        return bugs
+        return bugs_by_type
 
     if not any([advisory_id, default_advisory_type, advisory_ids]):
         return bugs
@@ -417,7 +432,7 @@ def categorize_bugs_by_type(
     for kind in bugs_by_type.keys():
         if len(found) == len(tracker_bugs):
             break
-        advisory = advisory_id_map.get(kind)
+        advisory = advisory_id_map.get(kind)  # this should be kind_nvrs_map so konflux can use
         if not advisory:
             continue
         attached_builds = errata.get_advisory_nvrs(advisory)
