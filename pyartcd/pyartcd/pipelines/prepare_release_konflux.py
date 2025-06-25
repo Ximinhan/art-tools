@@ -325,7 +325,7 @@ class PrepareReleaseKonfluxPipeline:
                 else:
                     # this should be tracker bug
                     if bug.cve_id not in cve_list_map[cve_bug_type]:
-                        cve_list_map[cve_bug_type].append({"key": bug.cve_id, "component": bug.component})
+                        cve_list_map[cve_bug_type].append({"key": bug.cve_id, "component": bug.whiteboard_component})
                     res.append({"id": bug.id, "url": bug.url})
             return res
 
