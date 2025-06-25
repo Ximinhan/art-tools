@@ -181,8 +181,6 @@ async def find_bugs_sweep_cli(
                     "id": bug.id,
                     "component": bug.component,
                     "status": bug.status,
-                    "date": str(bug.creation_time_parsed()),
-                    "summary": bug.summary[:60],
                     "url": bug.weburl,
                 }
             serializable_bugs = {

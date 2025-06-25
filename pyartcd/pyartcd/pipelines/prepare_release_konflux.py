@@ -212,8 +212,8 @@ class PrepareReleaseKonfluxPipeline:
         application = self.group.replace(".", "-")
         shipment_env_config = yaml.load(project.files.get(file_path='config.yaml', ref='main').decode())
         app_env_config = shipment_env_config.get("applications", {}).get(application, {}).get("environments", {})
-        self.stage_rpa = self.stage_rpa or app_env_config.get("stage", {}).get("releasePlan", "test-stage-rpa")
-        self.prod_rpa = self.prod_rpa or app_env_config.get("prod", {}).get("releasePlan", "test-prod-rpa")
+        self.stage_rpa = app_env_config.get("stage", {}).get("releasePlan", "test-stage-rpa")
+        self.prod_rpa = app_env_config.get("prod", {}).get("releasePlan", "test-prod-rpa")
         time_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
         branch_name = f"Add_shipment_{self.assembly}"
         # create gitlab shipment fork branch
@@ -269,7 +269,7 @@ class PrepareReleaseKonfluxPipeline:
         mr = project.mergerequests.create({
             'source_branch': fork_branch.name,
             'target_branch': 'main',
-            'title': f"Add shipment files for {self.assembly}",
+            'title': f"[TEST] Add shipment files for {self.assembly}",
         })
         _LOGGER.info(f"Created shipment mr {mr.web_url}")
         return mr.web_url
