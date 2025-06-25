@@ -179,7 +179,7 @@ async def find_builds_cli(
             json_data = {
                 'payload': sorted([b.nvr for b in payload_records]),
                 'nonpayload': sorted([b.nvr for b in non_payload_records]),
-                'olm_builds': sorted([b.nvr for b in olm_builds]),
+                'olm_builds': sorted([b.nvr for b in olm_records]),
                 'olm_builds_not_found': sorted([b.nvr for b in olm_records_not_found]),
             }
             click.echo(json.dumps(json_data, indent=4, sort_keys=True))
