@@ -433,21 +433,14 @@ def _gen_nvrp_tuples(builds: List[Dict], tag_pv_map: Dict[str, str]):
     return nvrps
 
 
-def _json_dump(
-    as_json: str, builds: list, kind: str, olm_builds: Optional[list] = [], olm_records_not_found: Optional[list] = []
-):
+def _json_dump(as_json: str, builds: list, kind: str):
     """Dumps builds as JSON to a file or stdout
     :param as_json: file name to dump JSON to, or '-' for stdout
     :param builds: list of Brew build objects
     :param kind: kind of builds, either 'rpm' or 'image'
     """
 
-    json_data = {
-        'builds': sorted([b.nvr for b in builds]),
-        'kind': kind,
-        'olm_builds': sorted([b.nvr for b in olm_builds]),
-        'olm_builds_not_found': sorted([b.nvr for b in olm_records_not_found]),
-    }
+    json_data = dict(builds=sorted([b.nvr for b in builds]), kind=kind)
     if as_json == '-':
         click.echo(json.dumps(json_data, indent=4, sort_keys=True))
     else:
