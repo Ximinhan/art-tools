@@ -170,7 +170,7 @@ class PrepareReleaseKonfluxPipeline:
         prepare shipment data
         """
         # find builds for image
-        image_builds, extra_builds, olm_builds_image, olm_builds_not_found = await self.find_builds()
+        image_builds, extra_builds, olm_builds, olm_builds_not_found = await self.find_builds()
         # TODO: rebuild olm_builds_not_found
         # find bugs for image, note the bugs didn't sweep and didn't find cve_flaws
         image_bugs, extras_bugs, metadata_bugs = await self.find_bugs_with_flaws()
