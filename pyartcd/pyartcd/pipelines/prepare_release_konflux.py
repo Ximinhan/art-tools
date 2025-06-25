@@ -15,6 +15,7 @@ import click
 import gitlab
 from github import Github, GithubException
 from artcommonlib import exectools
+from artcommonlib.rpm_utils import parse_nvr
 from artcommonlib.assembly import AssemblyTypes, assembly_config_struct, assembly_group_config
 from artcommonlib.constants import SHIPMENT_DATA_URL_TEMPLATE
 from artcommonlib.model import Model
@@ -322,9 +323,9 @@ class PrepareReleaseKonfluxPipeline:
         ]
         permitted_bug_ids = out.get("permitted", [])
         kind_nvrs_map = {
-            "image": image_builds,
-            "extras": extra_builds,
-            "metadata": olm_builds,
+            "image": [parse_nvr(b)["name"] for b in image_builds],
+            "extras": [parse_nvr(b)["name"] for b in extra_builds],
+            "metadata": [parse_nvr(b)["name"] for b in olm_builds],
         }
         _LOGGER.info(f"validate tracker bug {tracker_bugs}")
         bugs_by_type = validate_tracker_bugs(out, _LOGGER, tracker_bugs, kind_nvrs_map, permitted_bug_ids, False)
