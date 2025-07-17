@@ -16,6 +16,7 @@ from slack_sdk.errors import SlackApiError
 
 from pyartcd.cli import cli, click_coroutine, pass_runtime
 from pyartcd.runtime import Runtime
+from pyartcd import jenkins
 
 SEARCH_WINDOW_HOURS = 8  # Window of last X hours that we consider for our failed builds search
 RELEASE_ARTIST_HANDLE = 'release-artists'
@@ -73,6 +74,10 @@ class ArtNotifyPipeline:
             token=os.getenv('SLACK_API_TOKEN'),
             signing_secret=os.getenv('SLACK_SIGNING_SECRET'),
         )
+        self.attachments = [{
+                    "title": f"Job: {jenkins.get_job_name()} <{jenkins.get_build_url()}/consoleFull|{jenkins.get_build_id(}>",
+                    "color": "#439FE0",
+                }]
 
     def _get_failed_jobs_text(self):
         art_bot_jenkins_userid = 'openshift-art'
@@ -301,6 +306,7 @@ class ArtNotifyPipeline:
                 text=f'@{RELEASE_ARTIST_HANDLE} - {fallback_text}',
                 blocks=header_block,
                 unfurl_links=False,
+                attachments=self.attachments,
             )
 
             # Post warnings about inaccessible channels first
@@ -368,6 +374,7 @@ class ArtNotifyPipeline:
                     channel=channel,
                     text=f":warning: {len(failures)} image{'s' if len(failures) > 1 else ''} failed to rebase in *{engine.capitalize()}*",
                     link_names=True,
+                    attachments=self.attachments,
                 )
 
                 for image, counter in failures.items():
@@ -386,7 +393,7 @@ class ArtNotifyPipeline:
         else:
             self.logger.info('No messages matching attention emoji criteria and no failed jobs found')
             self.app.client.chat_postMessage(
-                channel=self.channel, text=':check: no unresolved threads / job failures found'
+                channel=self.channel, text=':check: no unresolved threads / job failures found', attachments=self.attachments,
             )
 
         await self._notify_rebase_failures()
