@@ -672,7 +672,7 @@ def resolve_upstream_from(runtime, image_entry):
     minor = runtime.group_config.vars['MINOR']
 
     if image_entry.member:
-        target_meta = runtime.resolve_image(image_entry.member, True)
+        target_meta = runtime.late_resolve_image(image_entry.member, False, True)
 
         if target_meta.config.content.source.ci_alignment.upstream_image is not Missing:
             # If the upstream is specified in the metadata, use this information
