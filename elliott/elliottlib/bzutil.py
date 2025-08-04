@@ -804,7 +804,6 @@ class JIRABugTracker(BugTracker):
             'issuetype': {'name': 'Bug'},
             'components': [{'name': 'Release'}],
             'versions': [{'name': self.config.get('version')[0]}],  # Affects Version/s
-            self.field_target_version: [{'name': self.config.get('target_release')[0]}],  # Target Version
             'summary': bug_title,
             'labels': keywords,
             'description': bug_description,
@@ -812,7 +811,33 @@ class JIRABugTracker(BugTracker):
         if noop:
             logger.info(f"Would have created JIRA Issue with status={target_status} and fields={fields}")
             return
+
+        # Create the bug without field_target_version
         bug = self._client.create_issue(fields=fields)
+
+        # Set the target version field after creation
+        target_version_value = [{'name': self.config.get('target_release')[0]}]
+
+        # Try primary field first
+        try:
+            target_version_field = {self.field_target_version: target_version_value}
+            self._client.update_issue(bug, fields=target_version_field)
+            logger.info(f"Successfully set target version field '{self.field_target_version}' for bug {bug}")
+        except Exception as e:
+            logger.warning(f"Failed to set target version field '{self.field_target_version}' for bug {bug}: {e}")
+
+            # Try fallback field
+            try:
+                fallback_field = {'customfield_12323140': target_version_value}
+                self._client.update_issue(bug, fields=fallback_field)
+                logger.info(f"Successfully set target version to fallback field 'customfield_12323140' for bug {bug}")
+            except Exception as fallback_e:
+                logger.warning(
+                    f"Failed to set target version to fallback field 'customfield_12323140' for bug {bug}: {fallback_e}"
+                )
+                logger.warning("Bug was created successfully but target version field could not be set")
+
+        # Transition to target status
         self._client.transition_issue(bug, target_status)
         return JIRABug(bug)
 
