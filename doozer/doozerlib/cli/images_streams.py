@@ -755,7 +755,7 @@ def prs():
 )
 @pass_runtime
 def prs_list(runtime, as_user, include_master):
-    runtime.initialize(clone_distgits=False, clone_source=False)
+    runtime.initialize(clone_distgits=False, clone_source=False, disabled=True)
     major = runtime.group_config.vars['MAJOR']
     minor = runtime.group_config.vars['MINOR']
     retdata = {}
@@ -1028,7 +1028,7 @@ def images_streams_prs(
     add_auto_labels,
     add_label,
 ):
-    runtime.initialize(clone_distgits=False, clone_source=False)
+    runtime.initialize(clone_distgits=False, clone_source=False, disabled=True)
     g = Github(login_or_token=github_access_token)
     github_user = g.get_user()
 
