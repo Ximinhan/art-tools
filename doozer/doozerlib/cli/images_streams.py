@@ -105,7 +105,7 @@ def images_streams():
 @click.option('--dry-run', default=False, is_flag=True, help='Do not build anything, but only print build operations.')
 @pass_runtime
 def images_streams_mirror(runtime, streams, only_if_missing, live_test_mode, force, dry_run):
-    runtime.initialize(clone_distgits=False, clone_source=False)
+    runtime.initialize(clone_distgits=False, clone_source=False, disabled=True)
     runtime.assert_mutation_is_permitted()
 
     upstreaming_entries = _get_upstreaming_entries(runtime, streams)
