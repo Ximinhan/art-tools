@@ -300,11 +300,15 @@ def is_manual_build() -> bool:
 
     build_user_email = os.getenv('BUILD_USER_EMAIL')
     logger.info('Found BUILD_USER_EMAIL=%s', build_user_email)
+    build_user_id = os.getenv('BUILD_USER_ID')
+    logger.info('Found BUILD_USER_ID=%s', build_user_id)
 
     if build_user_email is not None:
         logger.info('Considering this a manual build')
         return True
-
+    if build_user_id != "openshift-art":
+        logger.info(f'Considering this a manual build by {build_user_id}')
+        return True
     logger.info('Considering this a scheduled build')
     return False
 
