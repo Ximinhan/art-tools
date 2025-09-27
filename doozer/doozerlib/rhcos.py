@@ -1,22 +1,24 @@
-
 import asyncio
 import json
+import os
+import tempfile
 from typing import Dict, List, Optional, Tuple
 from urllib import request
 from urllib.error import URLError
 
 import koji
-from tenacity import retry, stop_after_attempt, wait_fixed
-
-from artcommonlib.arch_util import brew_suffix_for_arch
-from artcommonlib.model import Model
+from artcommonlib import exectools, logutil, rhcos
+from artcommonlib.arch_util import brew_suffix_for_arch, go_arch_for_brew_arch
+from artcommonlib.constants import RHCOS_RELEASES_BASE_URL, RHCOS_RELEASES_STREAM_URL
+from artcommonlib.model import Missing, Model
 from artcommonlib.release_util import isolate_el_version_in_release
 from artcommonlib.rhcos import get_build_id_from_rhcos_pullspec
-from doozerlib import brew
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+from doozerlib import brew, util
+from doozerlib.constants import ART_PROD_IMAGE_REPO
 from doozerlib.repodata import OutdatedRPMFinder, Repodata
 from doozerlib.runtime import Runtime
-from artcommonlib import rhcos, logutil, exectools
-from artcommonlib.constants import RHCOS_RELEASES_BASE_URL
 
 logger = logutil.get_logger(__name__)
 
@@ -26,7 +28,6 @@ class RHCOSNotFound(Exception):
 
 
 class RHCOSBuildFinder:
-
     def __init__(self, runtime, version: str, brew_arch: str = "x86_64", private: bool = False, custom: bool = False):
         """
         @param runtime  The Runtime object passed in from the CLI
@@ -34,7 +35,7 @@ class RHCOSBuildFinder:
         @param brew_arch  architecture we are interested in (e.g. "s390x")
         @param private  boolean, true for private stream, false for public (currently, no effect)
         @param custom If the caller knows this build is custom, the library will only search in the -custom buckets. When the RHCOS pipeline runs a custom build, artifacts
-            should be stored in a different area; e.g. https://releases-rhcos-art.apps.ocp-virt.prod.psi.redhat.com/storage/releases/rhcos-4.8-custom/48.84.....-0/x86_64/commitmeta.json
+            should be stored in a different area; e.g. https://releases-rhcos--prod-pipeline.apps.int.prod-stable-spoke1-dc-iad2.itup.redhat.com/storage/releases/rhcos-4.8-custom/48.84.....-0/x86_64/commitmeta.json
             This is done by ART's RHCOS pipeline code when a custom build is indicated: https://gitlab.cee.redhat.com/openshift-art/rhcos-upshift/-/blob/fdad7917ebdd9c8b47d952010e56e511394ed348/Jenkinsfile#L30
         """
         self.runtime = runtime
@@ -42,7 +43,11 @@ class RHCOSBuildFinder:
         self.brew_arch = brew_arch
         self.private = private
         self.custom = custom
+        self.go_arch = go_arch_for_brew_arch(brew_arch)
         self._primary_container = None
+        self.layered = self.runtime.group_config.rhcos.get("layered_rhcos", False)
+        if self.layered is Missing:
+            self.layered = False
 
     def get_primary_container_conf(self):
         """
@@ -116,8 +121,9 @@ class RHCOSBuildFinder:
             return False
         for arch in arches_building:
             if not self.meta_has_required_attributes(self.rhcos_build_meta(build_dict["id"], arch=arch)):
-                logger.warning(f"Skipping {build_dict['id']} - {arch} meta.json isn't complete - forget to run "
-                               "rhcos release job?")
+                logger.warning(
+                    f"Skipping {build_dict['id']} - {arch} meta.json isn't complete - forget to run rhcos release job?"
+                )
                 return False
         return True
 
@@ -129,16 +135,16 @@ class RHCOSBuildFinder:
         return True
 
     @retry(reraise=True, stop=stop_after_attempt(10), wait=wait_fixed(3))
-    def rhcos_build_meta(self, build_id: str, arch: str = None, meta_type: str = "meta") -> Dict:
+    def rhcos_build_meta(self, build_id: str, pullspec: str = None, arch: str = None, meta_type: str = "meta") -> Dict:
         """
         Queries the RHCOS release browser to return metadata about the specified RHCOS build.
         :param build_id: The RHCOS build_id to check (e.g. 410.81.20200520.0)
         :param arch: The arch to check - overrides the default self.brew_arch (e.g. ppc64le)
         :param meta_type: The data to retrieve. "commitmeta" (aka OS Metadata - ostree content) or "meta" (aka Build Metadata / Build record).
-        :return: Returns a Dict containing the parsed requested metadata. See the RHCOS release browser for examples: https://releases-rhcos-art.apps.ocp-virt.prod.psi.redhat.com/
+        :return: Returns a Dict containing the parsed requested metadata. See the RHCOS release browser for examples: https://releases-rhcos--prod-pipeline.apps.int.prod-stable-spoke1-dc-iad2.itup.redhat.com/
 
         Example 'meta.json':
-        https://releases-rhcos-art.apps.ocp-virt.prod.psi.redhat.com/storage/prod/streams/4.14-9.2/builds/414.92.202305050010-0/x86_64/meta.json
+        https://releases-rhcos--prod-pipeline.apps.int.prod-stable-spoke1-dc-iad2.itup.redhat.com/storage/prod/streams/4.14-9.2/builds/414.92.202305050010-0/x86_64/meta.json
          {
              "buildid": "410.81.20200520.0",
              ...
@@ -149,8 +155,26 @@ class RHCOSBuildFinder:
              ...
          }
         """
-        # this is hard to test with retries, so wrap testable method
-        return self._rhcos_build_meta(build_id, arch, meta_type)
+        if self.layered and pullspec:
+            if meta_type == "commitmeta":
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    stdout, _ = exectools.cmd_assert(
+                        f"oc image extract {pullspec}[-1] --path /usr/share/openshift/base/meta.json:{temp_dir} --confirm"
+                    )
+                    with open(os.path.join(temp_dir, "meta.json"), 'r') as f:
+                        meta_data = json.load(f)
+                return {"rpmostree.rpmdb.pkglist": meta_data["rpmdb.pkglist"]}
+            elif meta_type == "meta":
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    stdout, _ = exectools.cmd_assert(
+                        f"oc image extract {pullspec}[-1] --path /usr/share/rpm-ostree/extensions.json:{temp_dir} --confirm"
+                    )
+                    with open(os.path.join(temp_dir, "extensions.json"), 'r') as f:
+                        extensions_data = json.load(f)
+                return {"extensions": {"manifest": extensions_data}}
+        else:
+            # this is hard to test with retries, so wrap testable method
+            return self._rhcos_build_meta(build_id, arch, meta_type)
 
     def _rhcos_build_meta(self, build_id: str, arch: str = None, meta_type: str = "meta") -> Dict:
         """
@@ -162,51 +186,83 @@ class RHCOSBuildFinder:
         with request.urlopen(url) as req:
             return json.loads(req.read().decode())
 
+    def rhel_build_meta(self, build_id: str):
+        """
+        For layered node image, get it's rhel image rpm list
+        :param build_id: the rhel image build id eg. 9.6.20250527-0
+        :return: rpm list for rhel build
+        """
+        if self.layered:
+            url = f"{RHCOS_RELEASES_STREAM_URL}/rhel-{self.runtime.group_config.vars.RHCOS_EL_MAJOR}.{self.runtime.group_config.vars.RHCOS_EL_MINOR}/builds/{build_id}/{self.brew_arch}/commitmeta.json"
+            logger.info(f"Send request to {url}")
+            with request.urlopen(url) as req:
+                return json.loads(req.read().decode())['rpmostree.rpmdb.pkglist']
+        else:
+            return []
+
     def latest_container(self, container_conf: dict = None) -> Tuple[Optional[str], Optional[str]]:
         """
         :param container_conf: a payload tag conf Model from group.yml (with build_metadata_key)
         :return: Returns (rhcos build id, image pullspec) or (None, None) if not found.
         """
-        build_id = self.latest_rhcos_build_id()
-        if build_id is None:
-            return None, None
-        return build_id, rhcos.get_container_pullspec(
-            self.rhcos_build_meta(build_id),
-            container_conf or self.get_primary_container_conf()
-        )
+        if self.layered:
+            primary_conf = self.get_primary_container_conf()
+            rhcosdata = util.oc_image_info_for_arch(primary_conf.rhcos_index_tag, self.go_arch)
+            build_id = rhcosdata['config']['config']['Labels'][
+                "org.opencontainers.image.version"
+            ]  # in 4.19, the extension don't have rhcos-id
+            if container_conf or container_conf != primary_conf:
+                rhcosdata = util.oc_image_info_for_arch(container_conf.rhcos_index_tag, self.go_arch)
+            pullspec = f"{ART_PROD_IMAGE_REPO}@{rhcosdata['digest']}"
+            return build_id, pullspec
+        else:
+            build_id = self.latest_rhcos_build_id()
+            if build_id is None:
+                return None, None
+            return build_id, rhcos.get_container_pullspec(
+                self.rhcos_build_meta(build_id),
+                container_conf or self.get_primary_container_conf(),
+            )
 
 
 class RHCOSBuildInspector:
-
-    def __init__(self, runtime: Runtime, pullspec_for_tag: Dict[str, str], brew_arch: str, build_id: Optional[str] = None):
+    def __init__(
+        self, runtime: Runtime, pullspec_for_tag: Dict[str, str], brew_arch: str, build_id: Optional[str] = None
+    ):
         self.runtime = runtime
         self.brew_arch = brew_arch
         self.pullspec_for_tag = pullspec_for_tag
         self.build_id = build_id
+        self.stream_version = None
+        self.layered = self.runtime.group_config.rhcos.get("layered_rhcos", False)
 
-        # Remember the pullspec(s) provided in case it does not match what is in the releases.yaml.
-        # Because of an incident where we needed to repush RHCOS and get a new SHA for 4.10 GA,
-        # trust the exact pullspec in releases.yml instead of what we find in the RHCOS release
-        # browser.
-        for tag, pullspec in pullspec_for_tag.items():
-            image_build_id = get_build_id_from_rhcos_pullspec(pullspec)
-            if self.build_id and self.build_id != image_build_id:
-                raise Exception(f'Found divergent RHCOS build_id for {pullspec_for_tag}. {image_build_id} versus'
-                                f' {self.build_id}')
-            self.build_id = image_build_id
+        if self.layered:
+            # set build_id to the rhel base image build id of the rhel-coreos image
+            self.build_id = get_build_id_from_rhcos_pullspec(pullspec_for_tag["rhel-coreos"], layered_id=False)
 
-        # The first digits of the RHCOS build are the major.minor of the rhcos stream name.
-        # Which, near branch cut, might not match the actual release stream.
-        # Sadly we don't have any other labels or anything to look at to determine the stream.
-        version = self.build_id.split('.')[0]
-        self.stream_version = version[0] + '.' + version[1:]  # e.g. 43.82.202102081639.0 -> "4.3"
-
-        try:
             finder = RHCOSBuildFinder(runtime, self.stream_version, self.brew_arch)
-            self._build_meta = finder.rhcos_build_meta(self.build_id, meta_type='meta')
-            self._os_commitmeta = finder.rhcos_build_meta(self.build_id, meta_type='commitmeta')
-        except Exception:
-            # Fall back to trying to find a custom build
+            self._build_meta = finder.rhcos_build_meta(
+                self.build_id, pullspec=pullspec_for_tag.get("rhel-coreos-extensions", None), meta_type='meta'
+            )
+            self._os_commitmeta = finder.rhcos_build_meta(
+                self.build_id, pullspec=pullspec_for_tag.get("rhel-coreos", None), meta_type='commitmeta'
+            )
+            self.rhel_build_meta = finder.rhel_build_meta(self.build_id)
+        else:
+            for tag, pullspec in pullspec_for_tag.items():
+                image_build_id = get_build_id_from_rhcos_pullspec(pullspec)
+                if self.build_id and self.build_id != image_build_id:
+                    raise Exception(
+                        f'Found divergent RHCOS build_id for {tag} {pullspec}. {image_build_id} versus {self.build_id}'
+                    )
+                self.build_id = image_build_id
+
+            # The first digits of the RHCOS build are the major.minor of the rhcos stream name.
+            # Which, near branch cut, might not match the actual release stream.
+            # Sadly we don't have any other labels or anything to look at to determine the stream.
+            version = self.build_id.split('.')[0]
+            self.stream_version = version[0] + '.' + version[1:]  # e.g. 43.82.202102081639.0 -> "4.3"
+
             finder = RHCOSBuildFinder(runtime, self.stream_version, self.brew_arch, custom=True)
             self._build_meta = finder.rhcos_build_meta(self.build_id, meta_type='meta')
             self._os_commitmeta = finder.rhcos_build_meta(self.build_id, meta_type='commitmeta')
@@ -226,7 +282,7 @@ class RHCOSBuildInspector:
         """
         return self._build_meta
 
-    def get_os_metadata_rpm_list(self) -> List[List]:
+    def get_os_metadata_rpm_list(self, exclude_rhel: Optional[bool] = False) -> List[List]:
         """
         :return: Returns the raw RPM entries from the OS metadata. Example entry: ['NetworkManager', '1', '1.14.0', '14.el8', 'x86_64' ]
         Also include entries from the build meta.json extensions manifest. We don't have epoch for
@@ -245,7 +301,11 @@ class RHCOSBuildInspector:
         for name, vra in extensions.items():
             # e.g. "kernel-rt-core": "4.18.0-372.32.1.rt7.189.el8_6.x86_64"
             # or "qemu-img": "15:6.2.0-11.module+el8.6.0+16538+01ea313d.6.x86_64"
-            version, ra = vra.rsplit('-', 1)
+            values = vra.rsplit('-', 1)
+            if len(values) != 2:
+                self.runtime.logger.warning("Skipping extension rpm %s with invalid version-release: %s", name, vra)
+                continue
+            version, ra = values
             # if epoch is not specified, just use 0. for some reason it's included in the version in
             # RHCOS metadata as "epoch:version"; but if we query brew for it that way, it does not
             # like the format, so we separate it out from the version.
@@ -253,6 +313,14 @@ class RHCOSBuildInspector:
             release, arch = ra.rsplit('.', 1)
             entries.append([name, epoch, version, release, arch])
 
+        if exclude_rhel and self.layered:
+            # for node image exclude rpms in rhel layer
+            filtered_entries = []
+            for item in entries:
+                if item not in self.rhel_build_meta:
+                    logger.info(f"RPM {item} exist in node image but not rhel image")
+                    filtered_entries.append(item)
+            entries = filtered_entries
         return entries
 
     def get_rpm_nvrs(self) -> List[str]:
@@ -374,7 +442,7 @@ class RHCOSBuildInspector:
 
         raise IOError(f'Unable to determine RHEL version base for rhcos {self.build_id}')
 
-    async def find_non_latest_rpms(self) -> List[Tuple[str, str, str]]:
+    async def find_non_latest_rpms(self, exclude_rhel: Optional[bool] = False) -> List[Tuple[str, str, str]]:
         """
         If the packages installed in this image overlap packages in the build repo,
         return NVRs of the latest candidate builds that are not also installed in this image.
@@ -396,8 +464,12 @@ class RHCOSBuildInspector:
         enabled_repos = enabled_repos.primitive()
         group_repos = self.runtime.repos
         arch = self.brew_arch
-        logger.info("Fetching repodatas for enabled repos %s", ", ".join(f"{repo_name}-{arch}" for repo_name in enabled_repos))
-        repodatas: List[Repodata] = await asyncio.gather(*[group_repos[repo_name].get_repodata_threadsafe(arch) for repo_name in enabled_repos])
+        logger.info(
+            "Fetching repodatas for enabled repos %s", ", ".join(f"{repo_name}-{arch}" for repo_name in enabled_repos)
+        )
+        repodatas: List[Repodata] = await asyncio.gather(
+            *[group_repos[repo_name].get_repodata_threadsafe(arch) for repo_name in enabled_repos]
+        )
 
         # Get all installed rpms
         rpms_to_check = [
@@ -407,8 +479,9 @@ class RHCOSBuildInspector:
                 "version": version,
                 "release": release,
                 "arch": arch,
-                "nvr": f"{name}-{version}-{release}"
-            } for name, epoch, version, release, arch in self.get_os_metadata_rpm_list()
+                "nvr": f"{name}-{version}-{release}",
+            }
+            for name, epoch, version, release, arch in self.get_os_metadata_rpm_list(exclude_rhel)
         ]
 
         logger.info("Determining outdated rpms...")

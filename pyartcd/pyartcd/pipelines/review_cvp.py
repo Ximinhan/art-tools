@@ -6,17 +6,16 @@ from pathlib import Path
 from typing import Dict
 
 import click
+from artcommonlib import exectools
+from artcommonlib.util import new_roundtrip_yaml_handler
 from ghapi.all import GhApi
-from pyartcd import exectools, jenkins, constants
+
+from pyartcd import constants, jenkins
 from pyartcd.cli import cli, click_coroutine, pass_runtime
 from pyartcd.git import GitRepository
 from pyartcd.runtime import Runtime
-from ruamel.yaml import YAML
 
-yaml = YAML(typ="rt")
-yaml.default_flow_style = False
-yaml.preserve_quotes = True
-yaml.width = 4096
+yaml = new_roundtrip_yaml_handler()
 
 
 class ReviewCVPPipeline:
@@ -59,8 +58,14 @@ class ReviewCVPPipeline:
         sanity_test_optional_checks = cvp_report.get("sanity_test_optional_checks")
         passed_optional, failed_optional, missing_optional = {}, {}, {}
         if sanity_test_optional_checks:
-            passed_optional, failed_optional, missing_optional = sanity_test_optional_checks["passed"], sanity_test_optional_checks["failed"], sanity_test_optional_checks["missing"]
-            messages.append(f"CVP sanity_test_optional_checks - PASSED: {len(passed_optional)}, FAILED: {len(failed_optional)}, MISSING: {len(missing_optional)}")
+            passed_optional, failed_optional, missing_optional = (
+                sanity_test_optional_checks["passed"],
+                sanity_test_optional_checks["failed"],
+                sanity_test_optional_checks["missing"],
+            )
+            messages.append(
+                f"CVP sanity_test_optional_checks - PASSED: {len(passed_optional)}, FAILED: {len(failed_optional)}, MISSING: {len(missing_optional)}"
+            )
             self._logger.info(messages[-1])
             if failed_optional:
                 # Clone ocp-build-data,
@@ -79,12 +84,23 @@ class ReviewCVPPipeline:
                 if pushed:
                     match = re.search(r"github\.com[:/](.+)/(.+)(?:.git)?", ocp_build_data_repo_push_url)
                     if not match:
-                        raise ValueError(f"Couldn't create a pull request: {ocp_build_data_repo_push_url} is not a valid github repo")
+                        raise ValueError(
+                            f"Couldn't create a pull request: {ocp_build_data_repo_push_url} is not a valid github repo"
+                        )
                     pr_head = f"{match[1]}:{branch}"
-                    result = await self._create_or_update_pull_request(owner=constants.GITHUB_OWNER, repo="ocp-build-data", base=self.group, head=pr_head, title=title, body=body)
+                    result = await self._create_or_update_pull_request(
+                        owner=constants.GITHUB_OWNER,
+                        repo="ocp-build-data",
+                        base=self.group,
+                        head=pr_head,
+                        title=title,
+                        body=body,
+                    )
                     pr_html_url = result.html_url
                     messages.append("")
-                    messages.append(f"A PR has been created/updated to fix common CVP content_set_check failures: {pr_html_url}")
+                    messages.append(
+                        f"A PR has been created/updated to fix common CVP content_set_check failures: {pr_html_url}"
+                    )
                     self._logger.info(messages[-1])
 
         if not failed and not failed_optional:
@@ -100,7 +116,9 @@ class ReviewCVPPipeline:
                 self._logger.info(messages[-1])
 
         messages.append("")
-        messages.append(f"""Check <{jenkins.get_build_url()}/consoleFull|build logs> and <{jenkins.get_build_url()}/artifact/artcd_working/cvp-test-results.yaml/*view*/|cvp-test-results.yaml> for detailed CVP test results.""")
+        messages.append(
+            f"""Check <{jenkins.get_build_url()}/consoleFull|build logs> and <{jenkins.get_build_url()}/artifact/artcd_working/cvp-test-results.yaml/*view*/|cvp-test-results.yaml> for detailed CVP test results."""
+        )
         self._logger.info(messages[-1])
 
         messages.append("""For more information about content_set_check, see https://docs.engineering.redhat.com/x/a05iEQ.
@@ -121,7 +139,7 @@ If you have any questions or encounter a CVP bug, drop a message to CVP gchat ch
             "--all",
             "--include-content-set-check",
             "-o",
-            "json"
+            "json",
         ]
         _, out, _ = await exectools.cmd_gather_async(cmd, env=self._elliott_env_vars, stderr=None)
         result = json.loads(out)
@@ -138,7 +156,13 @@ If you have any questions or encounter a CVP bug, drop a message to CVP gchat ch
 
     async def _create_or_update_pull_request(self, owner: str, repo: str, base: str, head: str, title: str, body: str):
         if self.runtime.dry_run:
-            self._logger.warning("[DRY RUN] Would have created pull-request with head '%s', base '%s' title '%s', body '%s'", head, base, title, body)
+            self._logger.warning(
+                "[DRY RUN] Would have created pull-request with head '%s', base '%s' title '%s', body '%s'",
+                head,
+                base,
+                title,
+                body,
+            )
             d = {"html_url": "https://github.example.com/foo/bar/pull/1234", "number": 1234}
             result = namedtuple('pull_request', d.keys())(*d.values())
             return result
@@ -188,34 +212,52 @@ If you have any questions or encounter a CVP bug, drop a message to CVP gchat ch
                             repos = action.get("value", [])
                             enabled_repos = set(image_config.get("enabled_repos", []))
                             new_enabled_repos = enabled_repos - set(repos)
-                            image_config = self.update_repos("enabled_repos", image_config, dg_key, enabled_repos, new_enabled_repos)
+                            image_config = self.update_repos(
+                                "enabled_repos", image_config, dg_key, enabled_repos, new_enabled_repos
+                            )
 
                             non_shipping_repos = set(image_config.get("non_shipping_repos", []))
                             new_non_shipping_repos = non_shipping_repos - set(repos)
-                            image_config = self.update_repos("non_shipping_repos", image_config, dg_key, non_shipping_repos, new_non_shipping_repos)
+                            image_config = self.update_repos(
+                                "non_shipping_repos", image_config, dg_key, non_shipping_repos, new_non_shipping_repos
+                            )
                         elif action_name == "add_non_shipping_repos":
                             repos = action.get("value", [])
                             enabled_repos = set(image_config.get("enabled_repos", []))
                             new_enabled_repos = enabled_repos | set(repos)
-                            image_config = self.update_repos("enabled_repos", image_config, dg_key, enabled_repos, new_enabled_repos)
+                            image_config = self.update_repos(
+                                "enabled_repos", image_config, dg_key, enabled_repos, new_enabled_repos
+                            )
 
                             non_shipping_repos = set(image_config.get("non_shipping_repos", []))
                             new_non_shipping_repos = non_shipping_repos | set(repos)
-                            image_config = self.update_repos("non_shipping_repos", image_config, dg_key, non_shipping_repos, new_non_shipping_repos)
+                            image_config = self.update_repos(
+                                "non_shipping_repos", image_config, dg_key, non_shipping_repos, new_non_shipping_repos
+                            )
                         elif action_name == "add_repos":
                             repos = action.get("value", [])
                             enabled_repos = set(image_config.get("enabled_repos", []))
                             new_enabled_repos = enabled_repos | set(repos)
-                            image_config = self.update_repos("enabled_repos", image_config, dg_key, enabled_repos, new_enabled_repos)
+                            image_config = self.update_repos(
+                                "enabled_repos", image_config, dg_key, enabled_repos, new_enabled_repos
+                            )
 
                             non_shipping_repos = set(image_config.get("non_shipping_repos", []))
                             new_non_shipping_repos = non_shipping_repos - set(repos)
-                            image_config = self.update_repos("non_shipping_repos", image_config, dg_key, non_shipping_repos, new_non_shipping_repos)
+                            image_config = self.update_repos(
+                                "non_shipping_repos", image_config, dg_key, non_shipping_repos, new_non_shipping_repos
+                            )
                         elif action_name == "see_parent_builds":
                             builds = action.get("value", [])
                             for b in builds:
                                 build_url = f"https://brewweb.devel.redhat.com/buildinfo?buildID={b['id']}"
-                                self._logger.warning("[%s]See CVP test result for parent build %s (dg_key: %s): %s ", dg_key, b["nvr"], b.get("dg_key", "?"), build_url)
+                                self._logger.warning(
+                                    "[%s]See CVP test result for parent build %s (dg_key: %s): %s ",
+                                    dg_key,
+                                    b["nvr"],
+                                    b.get("dg_key", "?"),
+                                    build_url,
+                                )
                         elif action_name == "warn":
                             detail = action.get("value", {})
                             warning = f'*{dg_key}* {action.get("note")}: {detail}'
@@ -229,10 +271,14 @@ If you have any questions or encounter a CVP bug, drop a message to CVP gchat ch
 
 
 @cli.command("review-cvp")
-@click.option("-g", "--group", metavar='NAME', required=True,
-              help="The group of components on which to operate. e.g. openshift-4.9")
-@click.option("--assembly", metavar="ASSEMBLY_NAME", required=True,
-              help="The name of an assembly. e.g. 4.9.1")
+@click.option(
+    "-g",
+    "--group",
+    metavar='NAME',
+    required=True,
+    help="The group of components on which to operate. e.g. openshift-4.9",
+)
+@click.option("--assembly", metavar="ASSEMBLY_NAME", required=True, help="The name of an assembly. e.g. 4.9.1")
 @pass_runtime
 @click_coroutine
 async def reivew_cvp(runtime: Runtime, group: str, assembly: str):

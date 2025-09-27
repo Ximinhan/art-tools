@@ -14,35 +14,24 @@ spec:
     - env:
         - name: DOCKER_CONFIG
           value: /tmp/.docker
-      image: default-route-openshift-image-registry.apps.artc2023.pc3z.p1.openshiftapps.com/art-cd/art-cd:base
+        - name: SLACK_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: api-token
+              name: slack-bot-creds
+      image: default-route-openshift-image-registry.apps.artc2023.pc3z.p1.openshiftapps.com/art-cd/art-cd:latest
       name: run-script
       resources: {}
       script: |
         #!/usr/bin/env bash
 
         set -e
-
-        mkdir -p workspace 
-        cd workspace
-
-        arches=(x86_64 s390x ppc64le aarch64 multi)
-
-        for arch in "${arches[@]}"; do
-            path=$(params.major)/$(params.version)/$arch
-            command="oc adm release mirror quay.io/openshift-release-dev/ocp-release:$(params.version)-$arch --keep-manifest-list --to-dir=$path"
-            echo "Running command: $command"
-            $command
-            sleep 5
-
-            awscommand="aws s3 sync $path s3://ocp-doomsday-registry/release-image/$path"
-            echo Running aws command: $awscommand
-            $awscommand
-            sleep 5
-
-
-            echo "Cleaning dir: $(params.major)/$(params.version)"
-            rm -rf $path
-        done
+        
+        pip install stomp.py==8.1.0
+        pip install setuptools==70.0.0
+        
+        touch artcd.toml	
+        artcd -vv --config artcd.toml quay-doomsday-backup --version $(params.version)
       securityContext:
         runAsGroup: 0
         runAsUser: 0

@@ -2,32 +2,35 @@
 Utility functions and object abstractions for general interactions
 with BugTrackers
 """
+
 import asyncio
 import itertools
+import os
 import re
 import urllib.parse
 import xmlrpc.client
-import bugzilla
-import os
-import requests
-from requests_gssapi import HTTPSPNEGOAuth
 from datetime import datetime, timezone
+from functools import cached_property
 from time import sleep
 from typing import Dict, Iterable, List, Optional
-from jira import JIRA, Issue
+
+import bugzilla
+import requests
+from artcommonlib import logutil
+from artcommonlib.assembly import AssemblyTypes
 from errata_tool import Erratum
-from errata_tool.jira_issue import JiraIssue as ErrataJira
 from errata_tool.bug import Bug as ErrataBug
-from bugzilla.bug import Bug
+from errata_tool.jira_issue import JiraIssue as ErrataJira
+from jira import JIRA, Issue, JIRAError
 from koji import ClientSession
+from requests_gssapi import HTTPSPNEGOAuth
 from tenacity import retry, stop_after_attempt, wait_fixed
 
-from artcommonlib import logutil, exectools
-from elliottlib import constants, exceptions, errata, util
+from elliottlib import constants, errata, exceptions, util
 from elliottlib.cli import cli_opts
 from elliottlib.errata_async import AsyncErrataAPI
 from elliottlib.metadata import Metadata
-from elliottlib.util import isolate_timestamp_in_release, chunk
+from elliottlib.util import chunk, isolate_timestamp_in_release
 
 logger = logutil.get_logger(__name__)
 
@@ -47,6 +50,12 @@ def get_jira_bz_bug_ids(bug_ids):
 class Bug:
     def __init__(self, bug_obj):
         self.bug = bug_obj
+
+    def __str__(self):
+        return str(self.id)
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}:{self.id}'
 
     @property
     def id(self):
@@ -77,7 +86,41 @@ class Bug:
         raise NotImplementedError
 
     def is_flaw_bug(self):
+        if self.product == "Security Response" and self.component == "vulnerability-draft":
+            raise ValueError(f'{self.id} has Component "vulnerability-draft". Consult ProdSec on how to proceed.')
         return self.product == "Security Response" and self.component == "vulnerability"
+
+    def make_summary_with_target_version(self, major_version: int, minor_version: int) -> str:
+        """Given an OCPBUGS bug summary and the major and minor version numbers,
+        ensure that the summary starts/ends with the correct target version.
+        :param summary: The bug summary string
+        :param major_version: The major version number (e.g., 4 for 4.18)
+        :param minor_version: The minor version number (e.g., 18 for 4.18)
+        :return: The summary with the correct version prefix/suffix
+        """
+        if self.has_valid_target_version_in_summary(major_version, minor_version):
+            # If the summary already has the correct version, return it as is
+            return self.summary
+        expected_suffix = f"[openshift-{major_version}.{minor_version}]"
+        version_suffix_pattern = r"\[openshift[^\]]*\]"
+        if m := re.search(version_suffix_pattern, self.summary):
+            found = m.group(0)
+            new_s = self.summary.replace(found, expected_suffix)
+        else:
+            new_s = f"{self.summary} {expected_suffix}"
+        return new_s
+
+    def has_valid_target_version_in_summary(self, major_version: int, minor_version: int):
+        """Check if the bug summary has the correct OCP version."""
+        accepted_tags = [
+            f"[openshift-{major_version}.{minor_version}]",
+            f"[openshift-{major_version}.{minor_version}.z]",
+            f"[openshift-{major_version}.{minor_version}.0]",
+        ]
+        for tag in accepted_tags:
+            if self.summary.endswith(tag) or self.summary.startswith(tag):
+                return True
+        return False
 
     def is_ocp_bug(self):
         raise NotImplementedError
@@ -100,43 +143,59 @@ class Bug:
         return None
 
     @staticmethod
-    def get_target_release(bugs: List[Bug]) -> str:
+    def get_target_release(bugs: List) -> str:
         """
         Pass in a list of bugs and get their target release version back.
-        Raises exception if they have different target release versions set.
+        Raises exception if different MAJOR.MINOR target releases are found.
 
         :param bugs: List[Bug] instance
         """
         invalid_bugs = []
+
+        # capture target_release -> bug ids
         target_releases = dict()
+
+        # There can be multiple target_release values for a MAJOR.MINOR
+        # so capture unique MAJOR.MINOR versions found
+        target_release_versions = set()
 
         if not bugs:
             raise ValueError("bugs should be a non empty list")
 
         for bug in bugs:
             # make sure it's a list with a valid str value
-            valid_target_rel = isinstance(bug.target_release, list) and len(bug.target_release) > 0 and \
-                re.match(r'(\d+.\d+.[0|z])', bug.target_release[0])
-            if not valid_target_rel:
+            field_exists = isinstance(bug.target_release, list) and len(bug.target_release) > 0
+            if not field_exists:
                 invalid_bugs.append(bug)
-            else:
-                tr = bug.target_release[0]
-                if tr not in target_releases:
-                    target_releases[tr] = set()
-                target_releases[tr].add(bug.id)
+                continue
+
+            target_rel = re.match(r'(\d+\.\d+)(?:\.[0|z])?', bug.target_release[0])
+            if not target_rel:
+                invalid_bugs.append(bug)
+                continue
+
+            # capture the MAJOR.MINOR version
+            target_release_versions.add(target_rel.group(1))
+
+            tr = bug.target_release[0]
+            if tr not in target_releases:
+                target_releases[tr] = set()
+            target_releases[tr].add(bug.id)
 
         if invalid_bugs:
-            err = 'target_release should be a list with a string matching regex (digit+.digit+.[0|z])'
+            err = 'target_release should be a list with a string matching regex (digit+.digit+(.[0|z])?)'
             for b in invalid_bugs:
                 err += f'\n bug: {b.id}, target_release: {b.target_release} '
             raise ValueError(err)
 
-        if len(target_releases) != 1:
-            err = f'Found different target_release values for bugs: {target_releases}. ' \
-                'There should be only 1 target release for all bugs. Fix the offending bug(s) and try again.'
+        if len(target_release_versions) != 1:
+            err = (
+                f'Found target_releases for different MAJOR.MINOR versions: {target_releases}. '
+                'There should be only 1 MAJOR.MINOR version for all bugs. Fix the offending bug(s) and try again.'
+            )
             raise ValueError(err)
 
-        return list(target_releases.keys())[0]
+        return sorted(target_releases.keys())[0]
 
 
 class BugzillaBug(Bug):
@@ -254,6 +313,8 @@ class JIRABug(Bug):
             return None
 
     def is_tracker_bug(self):
+        if self.is_type_vulnerability():
+            return True
         has_keywords = set(constants.TRACKER_BUG_KEYWORDS).issubset(set(self.keywords))
         has_whiteboard_component = bool(self.whiteboard_component)
         has_linked_flaw = bool(self.corresponding_flaw_bug_ids)
@@ -280,6 +341,14 @@ class JIRABug(Bug):
     def summary(self):
         return self.bug.fields.summary
 
+    def update_summary(self, new_summary, noop=False):
+        if noop:
+            logger.info(f"Would have updated summary: {new_summary}")
+            return
+        else:
+            # Update summary field
+            self.bug.update(fields={"summary": new_summary})
+
     @property
     def blocks(self):
         return self._get_blocks()
@@ -303,20 +372,19 @@ class JIRABug(Bug):
         return [x.name for x in self.bug.fields.versions]
 
     @property
-    def blocked_by_bz(self):
-        url = getattr(self.bug.fields, JIRABugTracker.field_blocked_by_bz)
-        if not url:
-            return None
-        bug_id = re.search(r"id=(\d+)", url)
-        if not bug_id:
-            return None
-        return int(bug_id.groups()[0])
-
-    @property
     def target_release(self):
         tr_field = getattr(self.bug.fields, JIRABugTracker.field_target_version)
         if not tr_field:
             raise ValueError(f'bug {self.id} does not have `Target Version` field set')
+        if len(tr_field) > 1:
+            # Some bugs (e.g. OCPBUGS-39183) have multiple target versions set. This is not expected.
+            # Usually when this happens, we edit the bug to remove the incorrect target versions.
+            # However in some cases, those incorrect target versions have the archived flag set to True,
+            # which means we can't remove them.
+            # To work around this, we'll filter out the archived target versions.
+            active_target_versions = [x.name for x in tr_field if not x.archived]
+            if active_target_versions:
+                return active_target_versions
         return [x.name for x in tr_field]
 
     @property
@@ -333,11 +401,7 @@ class JIRABug(Bug):
 
     @property
     def depends_on(self):
-        depends_on = self._get_depends()
-        depends_on_bz = self.blocked_by_bz
-        if depends_on_bz:
-            depends_on.append(depends_on_bz)
-        return depends_on
+        return self._get_depends()
 
     @property
     def release_blocker(self):
@@ -352,30 +416,54 @@ class JIRABug(Bug):
         return self.bug.fields.project.key
 
     @property
+    def cve_id(self):
+        if self.is_type_vulnerability():
+            return getattr(self.bug.fields, JIRABugTracker.field_cve_id)
+        if not (self.is_tracker_bug() or self.is_flaw_bug()):
+            return None
+        cve_id = re.search(r'CVE-\d+-\d+', self.summary)
+        if cve_id:
+            return cve_id.group()
+        return None
+
+    @property
     def alias(self):
         # TODO: See usage. this can be correct or incorrect based in usage.
         return self.bug.fields.labels
 
-    @property
+    _ART_PSCOMPONENT_RE = re.compile(r'art:pscomponent:\s*(\S+)')
+    _PSCOMPONENT_RE = re.compile(r'pscomponent:\s*(\S+)')
+
+    @cached_property
     def whiteboard_component(self):
         """Get whiteboard component value of a bug.
 
-        An OCP cve tracker has a label "pscomponent:<component_name>"
+        An OCP cve tracker uses custom field "Downstream Component Name"
+        or a label "pscomponent:<component_name>"
         to indicate which component the bug belongs to.
 
         Note ART has the ability to overwrite this field for ART's build pipeline
-        with label "art:pscomponent:<component_name>.
+        with label "art:pscomponent:<component_name>".
 
         :returns: a string if a value is found, otherwise None
         """
-        markers = [r'^art:pscomponent:\s*(\S+)', r'^pscomponent:\s*(\S+)']
-        for label in self.bug.fields.labels:
-            for marker in markers:
-                tmp = re.search(marker, label)
-                if tmp and len(tmp.groups()) == 1:
-                    component_name = tmp.groups()[0]
-                    return component_name
-        return None
+        # If label "art:pscomponent:<component_name>" is set,
+        # return the component name from the label
+        pscomponent = next(
+            (m.group(1) for label in self.bug.fields.labels if (m := self._ART_PSCOMPONENT_RE.match(label))), None
+        )
+        if pscomponent:
+            return pscomponent
+        # If this bug is of type vulnerability, return the component name from the custom "Downstream Component Name" field
+        if self.is_type_vulnerability() and (
+            pscomponent := getattr(self.bug.fields, JIRABugTracker.field_cve_component)
+        ):
+            return pscomponent
+        # Fall back to the label "pscomponent:<component_name>"
+        pscomponent = next(
+            (m.group(1) for label in self.bug.fields.labels if (m := self._PSCOMPONENT_RE.match(label))), None
+        )
+        return pscomponent
 
     def _get_release_blocker(self):
         # release blocker can be ['None','Approved'=='+','Proposed'=='?','Rejected'=='-']
@@ -411,6 +499,9 @@ class JIRABug(Bug):
 
     def is_ocp_bug(self):
         return self.bug.fields.project.key == "OCPBUGS" and not self.is_placeholder_bug()
+
+    def is_type_vulnerability(self):
+        return self.bug.fields.issuetype.name == "Vulnerability"
 
     def is_placeholder_bug(self):
         return ('Placeholder' in self.summary) and (self.component == 'Release') and ('Automation' in self.keywords)
@@ -482,8 +573,7 @@ class BugTracker:
     def remove_bugs(self, advisory_obj, bugids: List, noop=False):
         raise NotImplementedError
 
-    def attach_bugs(self, bugids: List, advisory_id: int = 0, advisory_obj: Erratum = None, noop=False,
-                    verbose=False):
+    def attach_bugs(self, bugids: List, advisory_id: int = 0, advisory_obj: Erratum = None, noop=False, verbose=False):
         raise NotImplementedError
 
     def add_comment(self, bugid, comment: str, private: bool, noop=False):
@@ -510,9 +600,10 @@ class BugTracker:
     def create_textonly(self, bug_title, bug_description, noop=False):
         return self.create_bug(bug_title, bug_description, "VERIFIED", [], noop)
 
-    def update_bug_status(self, bug: Bug, target_status: str,
-                          comment: Optional[str] = None, log_comment: bool = True, noop=False):
-        """ Update bug status and optionally leave a comment
+    def update_bug_status(
+        self, bug: Bug, target_status: str, comment: Optional[str] = None, log_comment: bool = True, noop=False
+    ):
+        """Update bug status and optionally leave a comment
         :return: True if but status has been actually updated
         """
         current_status = bug.status
@@ -536,8 +627,9 @@ class BugTracker:
         return True
 
     @staticmethod
-    def get_corresponding_flaw_bugs(tracker_bugs: List[Bug], flaw_bug_tracker, brew_api,
-                                    strict: bool = True, verbose: bool = False) -> (Dict, Dict):
+    def get_corresponding_flaw_bugs(
+        tracker_bugs: List[Bug], flaw_bug_tracker, strict: bool = True, verbose: bool = False
+    ) -> (Dict, Dict):
         """Get corresponding flaw bug objects for given list of tracker bug objects.
         flaw_bug_tracker object to fetch flaw bugs from
 
@@ -547,10 +639,9 @@ class BugTracker:
         bug_tracker = flaw_bug_tracker
         flaw_bugs = bug_tracker.get_flaw_bugs(
             list(set(sum([t.corresponding_flaw_bug_ids for t in tracker_bugs], []))),
-            verbose=verbose
+            verbose=verbose,
         )
-        flaw_tracker_map = {bug.id: {'bug': bug, 'trackers': []}
-                            for bug in flaw_bugs}
+        flaw_tracker_map = {bug.id: {'bug': bug, 'trackers': []} for bug in flaw_bugs}
 
         # Validate that each tracker has a corresponding flaw bug
         # and a whiteboard component
@@ -559,12 +650,6 @@ class BugTracker:
         for t in tracker_bugs:
             component = t.whiteboard_component
             if not component:
-                trackers_with_invalid_components.add(t.id)
-                continue
-
-            # is this component a valid package name in brew?
-            if not brew_api.getPackageID(component):
-                logger.info(f'package `{component}` not found in brew')
                 trackers_with_invalid_components.add(t.id)
                 continue
 
@@ -578,12 +663,15 @@ class BugTracker:
 
         error_msg = ''
         if trackers_with_no_flaws:
-            error_msg += 'Cannot find any corresponding flaw bugs for these trackers: ' \
-                         f'{sorted(trackers_with_no_flaws)}. '
+            error_msg += (
+                f'Cannot find any corresponding flaw bugs for these trackers: {sorted(trackers_with_no_flaws)}. '
+            )
 
         if trackers_with_invalid_components:
-            error_msg += "These trackers do not have a valid whiteboard component value:" \
-                         f" {sorted(trackers_with_invalid_components)}."
+            error_msg += (
+                "These trackers do not have a valid whiteboard component value:"
+                f" {sorted(trackers_with_invalid_components)}."
+            )
 
         if error_msg:
             if strict:
@@ -594,7 +682,8 @@ class BugTracker:
         invalid_trackers = trackers_with_no_flaws | trackers_with_invalid_components
         tracker_flaws = {
             t.id: [b for b in t.corresponding_flaw_bug_ids if b in flaw_tracker_map]
-            for t in tracker_bugs if t.id not in invalid_trackers
+            for t in tracker_bugs
+            if t.id not in invalid_trackers
         }
         return tracker_flaws, flaw_tracker_map
 
@@ -610,17 +699,16 @@ class JIRABugTracker(BugTracker):
 
     # There are several @property function defined, which requires the values to be available at compile time
     # We later override them at runtime, so that if the field name changes, we'll still get the updated one
-    field_blocked_by_bz = 'customfield_12322152'  # "Blocked by Bugzilla Bug"
     field_target_version = 'customfield_12319940'  # "Target Version"
     field_release_blocker = 'customfield_12319743'  # "Release Blocker"
     field_blocked_reason = 'customfield_12316544'  # "Blocked Reason"
     field_severity = 'customfield_12316142'  # "Severity"
+    field_cve_id = 'customfield_12324749'  # "CVE ID"
+    field_cve_component = 'customfield_12324752'  # "Downstream Component Name"
+    field_cve_is_embargo = 'customfield_12324750'  # "Embargo Status"
 
     @staticmethod
     def get_config(runtime) -> Dict:
-        major, minor = runtime.get_major_minor()
-        if major == 4 and minor < 6:
-            raise ValueError("ocp-build-data/bug.yml is not expected to be available for 4.X versions < 4.6")
         bug_config = runtime.gitdata.load_data(key='bug').data
         # construct config so that all jira_config keys become toplevel keys
         jira_config = bug_config.pop('jira_config')
@@ -638,13 +726,9 @@ class JIRABugTracker(BugTracker):
         client = JIRA(self._server, token_auth=token_auth)
         return client
 
-    def __init__(self, config):
-        super().__init__(config, 'jira')
-        self._project = self.config.get('project', '')
-        self._client: JIRA = self.login()
+    @retry(reraise=True, stop=stop_after_attempt(10), wait=wait_fixed(30))
+    def _init_fields(self):
         for f in self._client.fields():
-            if f['name'] == 'Blocked by Bugzilla Bug':
-                self.field_blocked_by_bz = f['id']
             if f['name'] == 'Target Version':
                 self.field_target_version = f['id']
             if f['name'] == 'Release Blocker':
@@ -654,12 +738,18 @@ class JIRABugTracker(BugTracker):
             if f['name'] == 'Severity':
                 self.field_severity = f['id']
 
+    def __init__(self, config):
+        super().__init__(config, 'jira')
+        self._project = self.config.get('project', '')
+        self._client: JIRA = self.login()
+        self._init_fields()
+
     @property
     def product(self):
         return self._project
 
     def looks_like_a_jira_project_bug(self, bug_id) -> bool:
-        pattern = re.compile(fr'{self._project}-\d+')
+        pattern = re.compile(rf'{self._project}-\d+')
         return bool(pattern.match(str(bug_id)))
 
     def get_bug(self, bugid: str, **kwargs) -> JIRABug:
@@ -668,8 +758,9 @@ class JIRABugTracker(BugTracker):
     def get_bugs(self, bugids: List[str], permissive=False, verbose=False, **kwargs) -> List[JIRABug]:
         invalid_bugs = [b for b in bugids if not self.looks_like_a_jira_project_bug(b)]
         if invalid_bugs:
-            logger.warn(f"Cannot fetch bugs from a different project (current project: {self._project}):"
-                        f" {invalid_bugs}")
+            logger.warn(
+                f"Cannot fetch bugs from a different project (current project: {self._project}): {invalid_bugs}"
+            )
         bugids = [b for b in bugids if self.looks_like_a_jira_project_bug(b)]
         if not bugids:
             return []
@@ -700,8 +791,9 @@ class JIRABugTracker(BugTracker):
                 link_dict[link.relationship] = link.object.url
         return link_dict
 
-    def create_bug(self, bug_title: str, bug_description: str, target_status: str, keywords: List, noop=False) -> \
-            JIRABug:
+    def create_bug(
+        self, bug_title: str, bug_description: str, target_status: str, keywords: List, noop=False
+    ) -> JIRABug:
         fields = {
             'project': {'key': self._project},
             'issuetype': {'name': 'Bug'},
@@ -710,7 +802,7 @@ class JIRABugTracker(BugTracker):
             self.field_target_version: [{'name': self.config.get('target_release')[0]}],  # Target Version
             'summary': bug_title,
             'labels': keywords,
-            'description': bug_description
+            'description': bug_description,
         }
         if noop:
             logger.info(f"Would have created JIRA Issue with status={target_status} and fields={fields}")
@@ -731,15 +823,17 @@ class JIRABugTracker(BugTracker):
         else:
             self._client.add_comment(bugid, comment)
 
-    def _query(self, bugids: Optional[List] = None,
-               status: Optional[List] = None,
-               target_release: Optional[List] = None,
-               include_labels: Optional[List] = None,
-               exclude_labels: Optional[List] = None,
-               with_target_release: bool = True,
-               search_filter: str = None,
-               custom_query: str = None) -> str:
-
+    def _query(
+        self,
+        bugids: Optional[List] = None,
+        status: Optional[List] = None,
+        target_release: Optional[List] = None,
+        include_labels: Optional[List] = None,
+        exclude_labels: Optional[List] = None,
+        with_target_release: bool = True,
+        search_filter: str = None,
+        custom_query: str = None,
+    ) -> str:
         if target_release and with_target_release:
             raise ValueError("cannot use target_release and with_target_release together")
         if not target_release and with_target_release:
@@ -770,10 +864,22 @@ class JIRABugTracker(BugTracker):
             query += custom_query
         return query
 
+    @retry(reraise=True, stop=stop_after_attempt(3), wait=wait_fixed(5))
     def _search(self, query, verbose=False) -> List[JIRABug]:
         if verbose:
             logger.info(query)
-        results = self._client.search_issues(query, maxResults=0)
+        try:
+            # Setting maxResults=0 retrieves all matching issues from the JIRA API.
+            results = self._client.search_issues(query, maxResults=0)
+        except JIRAError as e:
+            # a lot of times we get JIRAError with massive HTML dump in the error text
+            # do not dump full html in the logs
+            if "<html>" in e.text:
+                e.text = e.text.strip()[:100] + '...[truncated html]'
+            raise e
+
+        if results is None:
+            return []
         return [JIRABug(j) for j in results]
 
     def blocker_search(self, status, search_filter='default', verbose=False, **kwargs):
@@ -781,14 +887,14 @@ class JIRABugTracker(BugTracker):
             status=status,
             with_target_release=True,
             search_filter=search_filter,
-            custom_query='and "Release Blocker" = "Approved"'
+            custom_query='and "Release Blocker" = "Approved"',
         )
         return self._search(query, verbose=verbose, **kwargs)
 
     def search(self, status, search_filter='default', verbose=False):
         query = self._query(
             status=status,
-            search_filter=search_filter
+            search_filter=search_filter,
         )
         return self._search(query, verbose=verbose)
 
@@ -807,19 +913,17 @@ class JIRABugTracker(BugTracker):
         advisory_obj.removeJIRAIssues(bugids)
         advisory_obj.commit()
 
-    def attach_bugs(self, bugids: List, advisory_id: int = 0, advisory_obj: Erratum = None, noop=False,
-                    verbose=False):
+    def attach_bugs(self, bugids: List, advisory_id: int = 0, advisory_obj: Erratum = None, noop=False, verbose=False):
         if not advisory_obj:
             advisory_obj = Erratum(errata_id=advisory_id)
         return errata.add_jira_bugs_with_retry(advisory_obj, bugids, noop=noop)
 
-    def filter_bugs_by_cutoff_event(self, bugs: Iterable, desired_statuses: Iterable[str],
-                                    sweep_cutoff_timestamp: float, verbose=False) -> List:
+    def filter_bugs_by_cutoff_event(
+        self, bugs: Iterable, desired_statuses: Iterable[str], sweep_cutoff_timestamp: float, verbose=False
+    ) -> List:
         dt = datetime.utcfromtimestamp(sweep_cutoff_timestamp).strftime("%Y/%m/%d %H:%M")
         val = ','.join(f'"{s}"' for s in desired_statuses)
-        query = f"issue in ({','.join([b.id for b in bugs])}) " \
-                f"and status was in ({val}) " \
-                f'on("{dt}")'
+        query = f"issue in ({','.join([b.id for b in bugs])}) and status was in ({val}) on(\"{dt}\")"
         return self._search(query, verbose=verbose)
 
     async def filter_attached_bugs(self, bugs: Iterable):
@@ -848,9 +952,6 @@ class JIRABugTracker(BugTracker):
 class BugzillaBugTracker(BugTracker):
     @staticmethod
     def get_config(runtime):
-        major, minor = runtime.get_major_minor()
-        if major == 4 and minor < 5:
-            raise ValueError("ocp-build-data/bug.yml is not expected to be available for 4.X versions < 4.5")
         bug_config = runtime.gitdata.load_data(key='bug').data
         # construct config so that all bugzilla_config keys become toplevel keys
         bz_config = bug_config.pop('bugzilla_config')
@@ -863,8 +964,9 @@ class BugzillaBugTracker(BugTracker):
     def login(self):
         client = bugzilla.Bugzilla(self._server)
         if not client.logged_in:
-            raise ValueError(f"elliott requires cached login credentials for {self._server}. Login using 'bugzilla "
-                             "login --api-key")
+            raise ValueError(
+                f"elliott requires cached login credentials for {self._server}. Login using 'bugzilla login --api-key"
+            )
         return client
 
     def __init__(self, config):
@@ -884,7 +986,7 @@ class BugzillaBugTracker(BugTracker):
         bugs = [BugzillaBug(b) for b in self._client.getbugs(bugids, permissive=permissive, **kwargs)]
         if len(bugs) < len(bugids):
             bugids_not_found = set(bugids) - {b.id for b in bugs}
-            msg = f"Some bugs could not be fetched ({len(bugids)-len(bugs)}): {bugids_not_found}"
+            msg = f"Some bugs could not be fetched ({len(bugids) - len(bugs)}): {bugids_not_found}"
             if permissive:
                 print(msg)
         return bugs
@@ -930,7 +1032,8 @@ class BugzillaBugTracker(BugTracker):
             component="Release",
             summary=title,
             keywords=keywords,
-            description=description)
+            description=description,
+        )
         if noop:
             logger.info(f"Would have created BugzillaBug with status={target_status} and fields={create_info}")
             return
@@ -948,16 +1051,18 @@ class BugzillaBugTracker(BugTracker):
 
     def _update_bug_status(self, bugid, target_status):
         if target_status == 'CLOSED':
-            return self._client.update_bugs([bugid], self._client.build_update(status=target_status,
-                                                                               resolution='WONTFIX'))
+            return self._client.update_bugs(
+                [bugid], self._client.build_update(status=target_status, resolution='WONTFIX')
+            )
         return self._client.update_bugs([bugid], self._client.build_update(status=target_status))
 
     def add_comment(self, bugid, comment: str, private, noop=False):
         self._client.update_bugs([bugid], self._client.build_update(comment=comment, comment_private=private))
 
-    def filter_bugs_by_cutoff_event(self, bugs: Iterable, desired_statuses: Iterable[str],
-                                    sweep_cutoff_timestamp: float, verbose=False) -> List:
-        """ Given a list of bugs, finds those that have changed to one of the desired statuses before the given timestamp.
+    def filter_bugs_by_cutoff_event(
+        self, bugs: Iterable, desired_statuses: Iterable[str], sweep_cutoff_timestamp: float, verbose=False
+    ) -> List:
+        """Given a list of bugs, finds those that have changed to one of the desired statuses before the given timestamp.
 
         According to @jupierce:
 
@@ -987,7 +1092,8 @@ class BugzillaBugTracker(BugTracker):
         before_cutoff_bugs = [bug for bug in bugs if to_timestamp(bug.creation_time) <= sweep_cutoff_timestamp]
         if len(before_cutoff_bugs) < len(bugs):
             logger.info(
-                f"{len(bugs) - len(before_cutoff_bugs)} of {len(bugs)} bugs are ignored because they were created after the sweep cutoff timestamp {sweep_cutoff_timestamp} ({datetime.utcfromtimestamp(sweep_cutoff_timestamp)})")
+                f"{len(bugs) - len(before_cutoff_bugs)} of {len(bugs)} bugs are ignored because they were created after the sweep cutoff timestamp {sweep_cutoff_timestamp} ({datetime.utcfromtimestamp(sweep_cutoff_timestamp)})"
+            )
 
         # Queries bug history
         bugs_history = self._client.bugs_history_raw([bug.id for bug in before_cutoff_bugs])
@@ -1000,7 +1106,7 @@ class BugzillaBugTracker(BugTracker):
 
             @classmethod
             def from_history_ent(cls, history):
-                """ Converts from bug history dict returned from Bugzilla to BugStatusChange object.
+                """Converts from bug history dict returned from Bugzilla to BugStatusChange object.
                 The history dict returned from Bugzilla includes bug changes on all fields, but we are only interested in the "status" field change.
                 :return: BugStatusChange object, or None if the history doesn't include a "status" field change.
                 """
@@ -1010,36 +1116,43 @@ class BugzillaBugTracker(BugTracker):
                 return cls(to_timestamp(history["when"]), status_change["removed"], status_change["added"])
 
         for bug, bug_history in zip(before_cutoff_bugs, bugs_history["bugs"]):
-            assert bug.id == bug_history[
-                "id"]  # `bugs_history["bugs"]` returned from Bugzilla API should have the same order as `before_cutoff_bugs`, but be safe
+            assert (
+                bug.id == bug_history["id"]
+            )  # `bugs_history["bugs"]` returned from Bugzilla API should have the same order as `before_cutoff_bugs`, but be safe
 
             # We are only interested in "status" field changes
             status_changes = filter(None, map(BugStatusChange.from_history_ent, bug_history["history"]))
 
             # status changes after the cutoff event
             after_cutoff_status_changes = list(
-                itertools.dropwhile(lambda change: change.timestamp <= sweep_cutoff_timestamp, status_changes))
+                itertools.dropwhile(lambda change: change.timestamp <= sweep_cutoff_timestamp, status_changes)
+            )
 
             # determines the status of the bug at the moment of the sweep cutoff event
             if not after_cutoff_status_changes:
                 sweep_cutoff_status = bug.status  # no status change after the cutoff event; use current status
             else:
                 sweep_cutoff_status = after_cutoff_status_changes[
-                    0].old  # sweep_cutoff_status should be the old status of the first status change after the sweep cutoff event
+                    0
+                ].old  # sweep_cutoff_status should be the old status of the first status change after the sweep cutoff event
 
             if sweep_cutoff_status not in desired_statuses:
                 logger.info(
-                    f"BZ {bug.id} is ignored because its status was {sweep_cutoff_status} at the moment of sweep cutoff ({datetime.utcfromtimestamp(sweep_cutoff_timestamp)})")
+                    f"BZ {bug.id} is ignored because its status was {sweep_cutoff_status} at the moment of sweep cutoff ({datetime.utcfromtimestamp(sweep_cutoff_timestamp)})"
+                )
                 continue
 
             # Per @Justin Pierce: If a BZ seems to qualify for a sweep currently and at the sweep cutoff event, then all state changes after the sweep cutoff event must be to a greater than the state which qualified the BZ at the sweep cutoff event.
-            regressed_changes = [change.new for change in after_cutoff_status_changes if
-                                 constants.VALID_BUG_STATES.index(change.new) <= constants.VALID_BUG_STATES.index(
-                                     sweep_cutoff_status)]
+            regressed_changes = [
+                change.new
+                for change in after_cutoff_status_changes
+                if constants.VALID_BUG_STATES.index(change.new) <= constants.VALID_BUG_STATES.index(sweep_cutoff_status)
+            ]
             if regressed_changes:
                 logger.warning(
                     f"BZ {bug.id} is ignored because its status was {sweep_cutoff_status} at the moment of sweep cutoff ({datetime.utcfromtimestamp(sweep_cutoff_timestamp)})"
-                    f", however its status changed back to {regressed_changes} afterwards")
+                    f", however its status changed back to {regressed_changes} afterwards"
+                )
                 continue
 
             qualified_bugs.append(bug)
@@ -1064,13 +1177,19 @@ class BugzillaBugTracker(BugTracker):
 
     def get_tracker_bugs(self, bug_ids: List, strict: bool = False, verbose: bool = False):
         fields = ["target_release", "blocks", 'whiteboard', 'keywords']
-        return [b for b in self.get_bugs(bug_ids, permissive=not strict, include_fields=fields, verbose=verbose) if
-                b.is_tracker_bug()]
+        return [
+            b
+            for b in self.get_bugs(bug_ids, permissive=not strict, include_fields=fields, verbose=verbose)
+            if b.is_tracker_bug()
+        ]
 
     def get_flaw_bugs(self, bug_ids: List, strict: bool = True, verbose: bool = False):
         fields = ["product", "component", "depends_on", "alias", "severity", "summary"]
-        return [b for b in self.get_bugs(bug_ids, permissive=not strict, include_fields=fields, verbose=verbose) if
-                b.is_flaw_bug()]
+        return [
+            b
+            for b in self.get_bugs(bug_ids, permissive=not strict, include_fields=fields, verbose=verbose)
+            if b.is_flaw_bug()
+        ]
 
 
 def get_highest_impact(trackers, tracker_flaws_map):
@@ -1101,7 +1220,7 @@ def get_highest_impact(trackers, tracker_flaws_map):
 
 
 def is_viable_bug(bug_obj):
-    """ Check if a bug is viable to attach to an advisory.
+    """Check if a bug is viable to attach to an advisory.
 
     A viable bug must be in one of MODIFIED and VERIFIED status. We accept ON_QA
     bugs as viable as well, as they will be shortly moved to MODIFIED while attaching.
@@ -1114,11 +1233,22 @@ def is_viable_bug(bug_obj):
 
 def _construct_query_url(config, status, search_filter='default', flag=None):
     query_url = SearchURL(config)
-    query_url.fields = ['id', 'status', 'summary', 'creation_time', 'cf_pm_score', 'component',
-                        # the api expects "sub_components" for the field "sub_component"
-                        # https://github.com/python-bugzilla/python-bugzilla/blob/main/bugzilla/base.py#L321
-                        'sub_components',
-                        'external_bugs', 'whiteboard', 'keywords', 'target_release', 'depends_on']
+    query_url.fields = [
+        'id',
+        'status',
+        'summary',
+        'creation_time',
+        'cf_pm_score',
+        'component',
+        # the api expects "sub_components" for the field "sub_component"
+        # https://github.com/python-bugzilla/python-bugzilla/blob/main/bugzilla/base.py#L321
+        'sub_components',
+        'external_bugs',
+        'whiteboard',
+        'keywords',
+        'target_release',
+        'depends_on',
+    ]
 
     filter_list = []
     if config.get('filter'):
@@ -1186,12 +1316,14 @@ class SearchFilter(object):
 
     def tostring(self, number):
         return SearchFilter.pattern.format(
-            number, self.field, self.operator, urllib.parse.quote(self.value)
+            number,
+            self.field,
+            self.operator,
+            urllib.parse.quote(self.value),
         )
 
 
 class SearchURL(object):
-
     url_format = "https://{}/buglist.cgi?"
 
     def __init__(self, config):
@@ -1258,20 +1390,24 @@ class SearchURL(object):
 
 
 def to_timestamp(dt: xmlrpc.client.DateTime):
-    """ Converts xmlrpc.client.DateTime to timestamp """
+    """Converts xmlrpc.client.DateTime to timestamp"""
     return datetime.strptime(dt.value, "%Y%m%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
 
 
 async def approximate_cutoff_timestamp(basis_event: int, koji_api: ClientSession, metas: Iterable[Metadata]) -> float:
-    """ Calculate an approximate sweep cutoff timestamp from the given basis event
-    """
+    """Calculate an approximate sweep cutoff timestamp from the given basis event"""
     basis_timestamp = koji_api.getEvent(basis_event)["ts"]
-    builds: List[Dict] = await asyncio.gather(*[exectools.to_thread(meta.get_latest_build, default=None, complete_before_event=basis_event, honor_is=False) for meta in metas])
+    tasks = [meta.get_latest_build(default=None, complete_before_event=basis_event, honor_is=False) for meta in metas]
+    builds: List[Dict] = await asyncio.gather(*tasks)
     nvrs = [b["nvr"] for b in builds if b]
-    rebase_timestamp_strings = filter(None, [isolate_timestamp_in_release(nvr) for nvr in nvrs])  # the timestamp in the release field of NVR is the approximate rebase time
+    rebase_timestamp_strings = filter(
+        None, [isolate_timestamp_in_release(nvr) for nvr in nvrs]
+    )  # the timestamp in the release field of NVR is the approximate rebase time
     # convert to UNIX timestamps
-    rebase_timestamps = [datetime.strptime(ts, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).timestamp()
-                         for ts in rebase_timestamp_strings]
+    rebase_timestamps = [
+        datetime.strptime(ts, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).timestamp()
+        for ts in rebase_timestamp_strings
+    ]
     return min(basis_timestamp, max(rebase_timestamps, default=basis_timestamp))
 
 
@@ -1291,20 +1427,21 @@ def sort_cve_bugs(bugs):
         impact = constants.security_impact_map[get_highest_security_impact([bug])]
         year, num = bug.alias[0].split("-")[1:]
         return impact, -int(year), -int(num)
+
     return sorted(bugs, key=cve_sort_key, reverse=True)
 
 
-def is_first_fix_any(flaw_bug: BugzillaBug, tracker_bugs: Iterable[Bug], current_target_release: str):
-    # all z stream bugs are considered first fix
-    if current_target_release[-1] != '0':
-        return True
-
+def is_first_fix_any(flaw_bug: BugzillaBug, tracker_bugs: Iterable[Bug], assembly: str):
     if not tracker_bugs:
         # This shouldn't happen
         raise ValueError(f'flaw bug {flaw_bug.id} does not seem to have trackers')
 
     if not (hasattr(flaw_bug, 'alias') and flaw_bug.alias):
-        raise ValueError(f'flaw bug {flaw_bug.id} does not have an alias')
+        raise ValueError(
+            f'Flaw bug {flaw_bug.id} does not have a CVE alias. Is it a CVE bug? These trackers '
+            f'reference the bug: {sorted([b.id for b in tracker_bugs])}. If it is not a valid flaw bug'
+            'please remove references from the tracker bugs.'
+        )
 
     alias = flaw_bug.alias[0]
     cve_url = f"https://access.redhat.com/hydra/rest/securitydata/cve/{alias}.json"
@@ -1312,11 +1449,13 @@ def is_first_fix_any(flaw_bug: BugzillaBug, tracker_bugs: Iterable[Bug], current
     response.raise_for_status()
     data = response.json()
 
-    major, minor = util.minor_version_tuple(current_target_release)
+    major, _ = util.minor_version_tuple(assembly)
     ocp_product_name = f"Red Hat OpenShift Container Platform {major}"
     components_not_yet_fixed = []
-    pyxis_base_url = "https://pyxis.engineering.redhat.com/v1/repositories/registry/registry.access.redhat.com" \
-                     "/repository/{pkg_name}/images?page_size=1&include=data.brew"
+    pyxis_base_url = (
+        "https://pyxis.engineering.redhat.com/v1/repositories/registry/registry.access.redhat.com"
+        "/repository/{pkg_name}/images?page_size=1&include=data.brew"
+    )
 
     if 'package_state' not in data:
         logger.info(f'{flaw_bug.id} ({alias}) not considered a first-fix because no unfixed components were found')
@@ -1349,13 +1488,61 @@ def is_first_fix_any(flaw_bug: BugzillaBug, tracker_bugs: Iterable[Bug], current
         component = t.whiteboard_component
         if component in components_not_yet_fixed:
             first_fix_components.append((component, t.id))
+            logger.info(f'Component {component} for CVE {alias} has a first-fix with {t.id}')
+        else:
+            logger.info(f'Component {component} for CVE {alias} has been fixed before {t.id}')
 
     if first_fix_components:
-        logger.info(f'{flaw_bug.id} ({alias}) considered first-fix for these (component, tracker):'
-                    f' {first_fix_components}')
+        logger.info(
+            f'{flaw_bug.id} ({alias}) considered first-fix for these (component, tracker): {first_fix_components}'
+        )
         return True
 
-    logger.info(f'{flaw_bug.id} ({alias}) not considered a first-fix because newly fixed trackers '
-                f'components {[t.whiteboard_component for t in tracker_bugs]}, were not found in unfixed components '
-                f'{components_not_yet_fixed}')
+    logger.info(
+        f'{flaw_bug.id} ({alias}) not considered a first-fix because newly fixed trackers '
+        f'components {[t.whiteboard_component for t in tracker_bugs]}, were not found in unfixed components '
+        f'{components_not_yet_fixed}'
+    )
     return False
+
+
+def get_flaws(
+    flaw_bug_tracker: BugTracker, tracker_bugs: List[Bug], assembly_type: AssemblyTypes, assembly: str
+) -> (Dict, List):
+    # validate and get target_release
+    if not tracker_bugs:
+        return {}, []  # Bug.get_target_release will panic on empty array
+
+    tracker_flaws, flaw_tracker_map = BugTracker.get_corresponding_flaw_bugs(
+        tracker_bugs,
+        flaw_bug_tracker,
+    )
+    logger.info(
+        f'Found {len(flaw_tracker_map)} {flaw_bug_tracker.type} corresponding flaw bugs:'
+        f' {sorted(flaw_tracker_map.keys())}'
+    )
+
+    # Note: preview and candidate preGA assemblies.
+    # Although we do not process trackers and flaws at preGA time,
+    # if explicitly requested, proceed with first-fix filtering
+    is_prega = assembly_type in [AssemblyTypes.PREVIEW, AssemblyTypes.CANDIDATE]
+    is_ga_assembly = assembly_type == AssemblyTypes.STANDARD and assembly.endswith(".0")
+    is_for_ga = is_prega or is_ga_assembly
+
+    # if current_target_release is GA then run first-fix bug filtering
+    # for GA not every flaw bug is considered first-fix
+    # for z-stream every flaw bug is considered first-fix
+    # https://docs.engineering.redhat.com/display/PRODSEC/Security+errata+-+First+fix
+    if not is_for_ga:
+        logger.info(f"Detected z-stream target release ({assembly}), every flaw bug is considered first-fix")
+        first_fix_flaw_bugs = [f['bug'] for f in flaw_tracker_map.values()]
+    else:
+        logger.info(f"Detected GA target release ({assembly}), applying first-fix filtering..")
+        first_fix_flaw_bugs = [
+            flaw_bug_info['bug']
+            for flaw_bug_info in flaw_tracker_map.values()
+            if is_first_fix_any(flaw_bug_info['bug'], flaw_bug_info['trackers'], assembly)
+        ]
+
+    logger.info(f'{len(first_fix_flaw_bugs)} out of {len(flaw_tracker_map)} flaw bugs considered "first-fix"')
+    return tracker_flaws, first_fix_flaw_bugs

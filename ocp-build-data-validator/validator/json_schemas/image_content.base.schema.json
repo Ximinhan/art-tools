@@ -72,6 +72,10 @@
                     "stream": {
                       "type": "string",
                       "minLength": 1
+                    },
+                    "member": {
+                      "type": "string",
+                      "minLength": 1
                     }
                   },
                   "additionalProperties": false
@@ -191,7 +195,24 @@
             "upstream_image_base!": {
               "$ref": "#/properties/source/properties/ci_alignment/properties/upstream_image_base"
             },
-            "upstream_image_base-": {}
+            "upstream_image_base-": {},
+            "upstream_image_mirror": {
+              "description": "Additional locations to push the image to",
+              "type": "array",
+              "items": {
+                  "type": "string",
+                  "minLength": 1
+              }
+            },
+            "upstream_image_mirror-": {
+              "$ref": "#/properties/source/properties/ci_alignment/properties/upstream_image_mirror"
+            },
+            "upstream_image_mirror!": {
+              "$ref": "#/properties/source/properties/ci_alignment/properties/upstream_image_mirror"
+            },
+            "upstream_image_mirror?": {
+              "$ref": "#/properties/source/properties/ci_alignment/properties/upstream_image_mirror"
+            }
           },
           "additionalProperties": false
         },
@@ -202,6 +223,110 @@
           "$ref": "#/properties/source/properties/ci_alignment"
         },
         "ci_alignment-": {},
+
+        "okd_alignment": {
+          "type": "object",
+          "properties": {
+            "tag_name": {
+              "description": "Used when generating ci-operator configuration. Overrides the default tag name into which the image will be promoted into the OKD imagestream. If not specified, the OCP release payload tag will be used.",
+              "type": "string",
+              "minLength": 1
+            },
+            "run_if_changed": {
+              "description": "Used when generating ci-operator configuration. Overrides the default skip_if_only_changed.",
+              "type": "string",
+              "minLength": 1
+            },
+            "skip_if_only_changed": {
+              "description": "Used when generating ci-operator configuration. Overrides the default skip_if_only_changed.",
+              "type": "string",
+              "minLength": 1
+            },
+            "resources": {
+              "description": "Used when generating ci-operator configuration. Dict will merge directly with resources.",
+              "type": "object",
+              "additionalProperties": true
+            },
+            "dockerfile": {
+              "description": "Used when generating ci-operator configuration. Overrides the dockerfile used by OKD builds.",
+              "type": "string",
+              "minLength": 1
+            },
+            "path": {
+              "description": "Used when generating ci-operator configuration. Overrides the dockerfile path to use for OKD builds.",
+              "type": "string",
+              "minLength": 0
+            },
+            "context_dir": {
+              "description": "Used when generating ci-operator configuration. Generates a prow configuration with a context_dir specified. Subtracts from path value.",
+              "type": "string",
+              "minLength": 1
+            },
+            "inject_rpm_repositories": {
+              "type": "array",
+              "description": "Instructs OKD reconciliation to add repo definitions to the built image.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "description": "The repository ID.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "baseurl": {
+                    "description": "The baseurl to use for the repository definition.",
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            },
+            "build_args": {
+              "type": "array",
+              "description": "Additional ci-operator configuration build_args to pass into the build.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "description": "The name of the argument",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "value": {
+                    "description": "The value to pass for the argument.",
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            },
+            "resolve_as": {
+              "type": "object",
+              "description": "Instructs OKD reconciliation to NOT try to build this image with a ci-operator configuration but instead point dependents of this image to a different source for its content. That source must be provided by a separate system or pipeline.",
+
+              "properties": {
+                "image": {
+                  "description": "This literal pullspec will be used in place of building a non payload image for OKD.",
+                  "type": "string",
+                  "minLength": 1
+                },
+
+                "stream": {
+                  "description": "Resolve to the pullspec of this streams.yml stream name.",
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "run_if_changed": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Regular expression of file paths that trigger the okd alignment"
+            }
+          },
+          "additionalProperties": false
+        },
+
         "dockerfile": {
           "type": "string",
           "minLength": 1
@@ -210,6 +335,16 @@
           "$ref": "#/properties/source/properties/dockerfile"
         },
         "dockerfile!": {
+          "$ref": "#/properties/source/properties/dockerfile"
+        },
+        "dockerfile_fallback": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dockerfile_fallback?": {
+          "$ref": "#/properties/source/properties/dockerfile"
+        },
+        "dockerfile_fallback!": {
           "$ref": "#/properties/source/properties/dockerfile"
         },
         "dockerfile-": {},

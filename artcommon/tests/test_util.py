@@ -1,57 +1,106 @@
+import asyncio
+import os
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import yaml
-
-from artcommonlib import util, build_util, release_util
-from artcommonlib.model import Model, MissingModel
+from artcommonlib import build_util, release_util, util
+from artcommonlib.model import Model
+from artcommonlib.release_util import SoftwareLifecyclePhase
 from artcommonlib.util import deep_merge, isolate_major_minor_in_group
 
 
 class TestUtil(unittest.TestCase):
     def test_convert_remote_git_to_https(self):
         # git@ to https
-        self.assertEqual(util.convert_remote_git_to_https('git@github.com:openshift/aos-cd-jobs.git'),
-                         'https://github.com/openshift/aos-cd-jobs')
+        self.assertEqual(
+            util.convert_remote_git_to_https('git@github.com:openshift/aos-cd-jobs.git'),
+            'https://github.com/openshift/aos-cd-jobs',
+        )
 
         # https to https (no-op)
-        self.assertEqual(util.convert_remote_git_to_https('https://github.com/openshift/aos-cd-jobs'),
-                         'https://github.com/openshift/aos-cd-jobs')
+        self.assertEqual(
+            util.convert_remote_git_to_https('https://github.com/openshift/aos-cd-jobs'),
+            'https://github.com/openshift/aos-cd-jobs',
+        )
 
         # https to https, remove suffix
-        self.assertEqual(util.convert_remote_git_to_https('https://github.com/openshift/aos-cd-jobs.git'),
-                         'https://github.com/openshift/aos-cd-jobs')
+        self.assertEqual(
+            util.convert_remote_git_to_https('https://github.com/openshift/aos-cd-jobs.git'),
+            'https://github.com/openshift/aos-cd-jobs',
+        )
 
         # ssh to https
-        self.assertEqual(util.convert_remote_git_to_https('ssh://ocp-build@github.com/openshift/aos-cd-jobs.git'),
-                         'https://github.com/openshift/aos-cd-jobs')
+        self.assertEqual(
+            util.convert_remote_git_to_https('ssh://ocp-build@github.com/openshift/aos-cd-jobs.git'),
+            'https://github.com/openshift/aos-cd-jobs',
+        )
 
     def test_convert_remote_git_to_ssh(self):
         # git@ to https
-        self.assertEqual(util.convert_remote_git_to_ssh('https://github.com/openshift/aos-cd-jobs'),
-                         'git@github.com:openshift/aos-cd-jobs.git')
+        self.assertEqual(
+            util.convert_remote_git_to_ssh('https://github.com/openshift/aos-cd-jobs'),
+            'git@github.com:openshift/aos-cd-jobs.git',
+        )
 
         # https to https (no-op)
-        self.assertEqual(util.convert_remote_git_to_ssh('https://github.com/openshift/aos-cd-jobs'),
-                         'git@github.com:openshift/aos-cd-jobs.git')
+        self.assertEqual(
+            util.convert_remote_git_to_ssh('https://github.com/openshift/aos-cd-jobs'),
+            'git@github.com:openshift/aos-cd-jobs.git',
+        )
 
         # https to https, remove suffix
-        self.assertEqual(util.convert_remote_git_to_ssh('https://github.com/openshift/aos-cd-jobs'),
-                         'git@github.com:openshift/aos-cd-jobs.git')
+        self.assertEqual(
+            util.convert_remote_git_to_ssh('https://github.com/openshift/aos-cd-jobs'),
+            'git@github.com:openshift/aos-cd-jobs.git',
+        )
 
         # ssh to https
-        self.assertEqual(util.convert_remote_git_to_ssh('ssh://ocp-build@github.com/openshift/aos-cd-jobs.git'),
-                         'git@github.com:openshift/aos-cd-jobs.git')
+        self.assertEqual(
+            util.convert_remote_git_to_ssh('ssh://ocp-build@github.com/openshift/aos-cd-jobs.git'),
+            'git@github.com:openshift/aos-cd-jobs.git',
+        )
 
     def test_find_latest_builds(self):
         builds = [
-            {"id": 13, "name": "a-container", "version": "v1.2.3", "release": "3.assembly.stream.el8", "tag_name": "tag1"},
-            {"id": 12, "name": "a-container", "version": "v1.2.3", "release": "2.assembly.hotfix_a.el9", "tag_name": "tag1"},
-            {"id": 11, "name": "a-container", "version": "v1.2.3", "release": "1.assembly.hotfix_a", "tag_name": "tag1"},
+            {
+                "id": 13,
+                "name": "a-container",
+                "version": "v1.2.3",
+                "release": "3.assembly.stream.el8",
+                "tag_name": "tag1",
+            },
+            {
+                "id": 12,
+                "name": "a-container",
+                "version": "v1.2.3",
+                "release": "2.assembly.hotfix_a.el9",
+                "tag_name": "tag1",
+            },
+            {
+                "id": 11,
+                "name": "a-container",
+                "version": "v1.2.3",
+                "release": "1.assembly.hotfix_a",
+                "tag_name": "tag1",
+            },
             {"id": 23, "name": "b-container", "version": "v1.2.3", "release": "3.assembly.test", "tag_name": "tag1"},
-            {"id": 22, "name": "b-container", "version": "v1.2.3", "release": "2.assembly.hotfix_b", "tag_name": "tag1"},
+            {
+                "id": 22,
+                "name": "b-container",
+                "version": "v1.2.3",
+                "release": "2.assembly.hotfix_b",
+                "tag_name": "tag1",
+            },
             {"id": 21, "name": "b-container", "version": "v1.2.3", "release": "1.assembly.stream", "tag_name": "tag1"},
             {"id": 33, "name": "c-container", "version": "v1.2.3", "release": "3", "tag_name": "tag1"},
-            {"id": 32, "name": "c-container", "version": "v1.2.3", "release": "2.assembly.hotfix_b", "tag_name": "tag1"},
+            {
+                "id": 32,
+                "name": "c-container",
+                "version": "v1.2.3",
+                "release": "2.assembly.hotfix_b",
+                "tag_name": "tag1",
+            },
             {"id": 31, "name": "c-container", "version": "v1.2.3", "release": "1", "tag_name": "tag1"},
         ]
         actual = build_util.find_latest_builds(builds, "stream")
@@ -80,7 +129,7 @@ class TestUtil(unittest.TestCase):
             ('1.2.3-y.p.p1.assembly.4.9.el700.hi', '4.9'),
             ('1.2.3-y.p.p1.assembly.art12398.el10', 'art12398'),
             ('1.2.3-y.p.p1.assembly.art12398.el10', 'art12398'),
-            ('1.2.3-y.el9.p1.assembly.test', 'test')
+            ('1.2.3-y.el9.p1.assembly.test', 'test'),
         ]
 
         for t in test_cases:
@@ -96,7 +145,7 @@ class TestUtil(unittest.TestCase):
             ('1.2.3-y.p.p1.assembly.4.9.el7', 7),
             ('1.2.3-y.p.p1.assembly.art12398.el199', 199),
             ('1.2.3-y.p.p1.assembly.art12398', None),
-            ('1.2.3-y.p.p1.assembly.4.7.e.8', None)
+            ('1.2.3-y.p.p1.assembly.4.7.e.8', None),
         ]
 
         for t in test_cases:
@@ -176,3 +225,83 @@ alternative_upstream:
         major, minor = isolate_major_minor_in_group('openshift-invalid.16')
         self.assertEqual(major, None)
         self.assertEqual(minor, None)
+
+
+class TestSoftwareLifecyclePhase(unittest.TestCase):
+    def test_from_name_valid(self):
+        self.assertEqual(SoftwareLifecyclePhase.from_name('eol'), SoftwareLifecyclePhase.EOL)
+        self.assertEqual(SoftwareLifecyclePhase.from_name('pre-release'), SoftwareLifecyclePhase.PRE_RELEASE)
+        self.assertEqual(SoftwareLifecyclePhase.from_name('signing'), SoftwareLifecyclePhase.SIGNING)
+        self.assertEqual(SoftwareLifecyclePhase.from_name('release'), SoftwareLifecyclePhase.RELEASE)
+
+    def test_from_name_invalid(self):
+        with self.assertRaises(ValueError):
+            SoftwareLifecyclePhase.from_name('invalid')
+
+    def test_lt(self):
+        self.assertTrue(SoftwareLifecyclePhase.PRE_RELEASE < SoftwareLifecyclePhase.SIGNING)
+        self.assertTrue(SoftwareLifecyclePhase.SIGNING < SoftwareLifecyclePhase.RELEASE)
+        self.assertTrue(SoftwareLifecyclePhase.RELEASE < SoftwareLifecyclePhase.EOL)
+        self.assertTrue(SoftwareLifecyclePhase.EOL < 101)
+        self.assertTrue(SoftwareLifecyclePhase.PRE_RELEASE < 1)
+
+    def test_gt(self):
+        self.assertTrue(SoftwareLifecyclePhase.RELEASE > SoftwareLifecyclePhase.SIGNING)
+        self.assertTrue(SoftwareLifecyclePhase.SIGNING > SoftwareLifecyclePhase.PRE_RELEASE)
+        self.assertTrue(SoftwareLifecyclePhase.EOL > SoftwareLifecyclePhase.RELEASE)
+        self.assertTrue(SoftwareLifecyclePhase.RELEASE > 1)
+        self.assertTrue(SoftwareLifecyclePhase.SIGNING > 0)
+
+    def test_le(self):
+        self.assertTrue(SoftwareLifecyclePhase.EOL <= SoftwareLifecyclePhase.EOL)
+        self.assertTrue(SoftwareLifecyclePhase.PRE_RELEASE <= SoftwareLifecyclePhase.SIGNING)
+        self.assertTrue(SoftwareLifecyclePhase.SIGNING <= SoftwareLifecyclePhase.RELEASE)
+        self.assertTrue(SoftwareLifecyclePhase.EOL <= 100)
+        self.assertTrue(SoftwareLifecyclePhase.PRE_RELEASE <= 0)
+
+    def test_ge(self):
+        self.assertTrue(SoftwareLifecyclePhase.RELEASE >= SoftwareLifecyclePhase.RELEASE)
+        self.assertTrue(SoftwareLifecyclePhase.SIGNING >= SoftwareLifecyclePhase.PRE_RELEASE)
+        self.assertTrue(SoftwareLifecyclePhase.EOL >= SoftwareLifecyclePhase.PRE_RELEASE)
+        self.assertTrue(SoftwareLifecyclePhase.RELEASE >= 2)
+        self.assertTrue(SoftwareLifecyclePhase.SIGNING >= 1)
+
+    def test_eq(self):
+        self.assertEqual(SoftwareLifecyclePhase.RELEASE, 2)
+        self.assertEqual(SoftwareLifecyclePhase.RELEASE, SoftwareLifecyclePhase.RELEASE)
+        self.assertNotEqual(SoftwareLifecyclePhase.RELEASE, SoftwareLifecyclePhase.PRE_RELEASE)
+        self.assertEqual(SoftwareLifecyclePhase.SIGNING, 1)
+        self.assertEqual(SoftwareLifecyclePhase.PRE_RELEASE, 0)
+        self.assertEqual(SoftwareLifecyclePhase.EOL.value, 100)
+        self.assertNotEqual(SoftwareLifecyclePhase.EOL.value, 101)
+
+    def test_isolate_timestamp_in_release(self):
+        actual = release_util.isolate_timestamp_in_release("foo-4.7.0-202107021813.p0.g01c9f3f.el8")
+        expected = "202107021813"
+        self.assertEqual(actual, expected)
+
+        actual = release_util.isolate_timestamp_in_release("foo-container-v4.7.0-202107021907.p0.g8b4b094")
+        expected = "202107021907"
+        self.assertEqual(actual, expected)
+
+        actual = release_util.isolate_timestamp_in_release("foo-container-v4.7.0-202107021907.p0.g8b4b094")
+        expected = "202107021907"
+        self.assertEqual(actual, expected)
+
+        actual = release_util.isolate_timestamp_in_release(
+            "foo-container-v4.8.0-202106152230.p0.g25122f5.assembly.stream"
+        )
+        expected = "202106152230"
+        self.assertEqual(actual, expected)
+
+        actual = release_util.isolate_timestamp_in_release("foo-container-v4.7.0-1.p0.g8b4b094")
+        expected = None
+        self.assertEqual(actual, expected)
+
+        actual = release_util.isolate_timestamp_in_release("foo-container-v4.7.0-202199999999.p0.g8b4b094")
+        expected = None
+        self.assertEqual(actual, expected)
+
+        actual = release_util.isolate_timestamp_in_release("")
+        expected = None
+        self.assertEqual(actual, expected)

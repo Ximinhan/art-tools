@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import MagicMock, patch
+
 from doozerlib.comment_on_pr import CommentOnPr
 
 
@@ -11,9 +12,11 @@ class TestCommentOnPr(unittest.TestCase):
         self.nvr = "nvr"
         self.build_id = "build_id"
         self.distgit_name = "distgit_name"
-        self.comment = '**[ART PR BUILD NOTIFIER]**\n\nThis PR has been included in build ' \
-                       '[nvr](https://brewweb.engineering.redhat.com/brew/buildinfo?buildID=build_id) for ' \
-                       'distgit *distgit_name*. \n All builds following this will include this PR.'
+        self.comment = (
+            '**[ART PR BUILD NOTIFIER]**\n\nDistgit: distgit_name\nThis PR has been included in build '
+            '[nvr](https://brewweb.engineering.redhat.com/brew/buildinfo?buildID=build_id).\n'
+            'All builds following this will include this PR.'
+        )
 
     def test_list_comments(self):
         pr_no = 1
@@ -29,7 +32,7 @@ class TestCommentOnPr(unittest.TestCase):
     @patch.object(CommentOnPr, "list_comments")
     def test_check_if_comment_exist(self, mock_list_comments):
         api_mock = MagicMock()
-        api_mock.issues.list_comments.return_value = [{"body": "[ART PR BUILD NOTIFIER]"}]
+        api_mock.issues.list_comments.return_value = [{"body": "[ART PR BUILD NOTIFIER]\n\nDistgit: distgit_name"}]
         mock_list_comments.return_value = api_mock.issues.list_comments()
         comment_on_pr = CommentOnPr(self.distgit_dir, self.nvr, self.build_id, self.distgit_name)
         result = comment_on_pr.check_if_comment_exist()
@@ -68,9 +71,10 @@ class TestCommentOnPr(unittest.TestCase):
         api_mock = MagicMock()
         comment_on_pr = CommentOnPr(self.distgit_dir, self.nvr, self.build_id, self.distgit_name)
         comment_on_pr.gh_client = api_mock
-        api_mock.repos.list_pull_requests_associated_with_commit.return_value = [{"html_url": "test_url", "number": 1},
-                                                                                 {"html_url": "test_url_2",
-                                                                                  "number": 2}]
+        api_mock.repos.list_pull_requests_associated_with_commit.return_value = [
+            {"html_url": "test_url", "number": 1},
+            {"html_url": "test_url_2", "number": 2},
+        ]
         with self.assertRaises(Exception):
             comment_on_pr.set_pr_from_commit()
 
@@ -87,7 +91,7 @@ class TestCommentOnPr(unittest.TestCase):
         comment_on_pr = CommentOnPr(self.distgit_dir, self.nvr, self.build_id, self.distgit_name)
         # Mocking the labels dictionary of the DockerfileParser object
         mock_parser.return_value.labels = {
-            "io.openshift.build.commit.url": "https://github.com/openshift/origin/commit/660e0c785a2c9b1fd5fad33cbcffd77a6d84ccb5"
+            "io.openshift.build.commit.url": "https://github.com/openshift/origin/commit/660e0c785a2c9b1fd5fad33cbcffd77a6d84ccb5",
         }
 
         # Calling the get_source_details method

@@ -1,26 +1,34 @@
 import enum
 import logging
 from types import coroutine
-from tenacity import retry, retry_if_exception_type, wait_fixed, stop_after_attempt, TryAgain
 
 from aioredlock import Aioredlock, LockError
-
 from artcommonlib import redis
+from tenacity import TryAgain, retry, retry_if_exception_type, stop_after_attempt, wait_fixed
+
+from pyartcd import constants
 
 
 # Defines the pipeline locks managed by Redis
 class Lock(enum.Enum):
-    OLM_BUNDLE = 'lock:olm-bundle-{version}'
+    OLM_BUNDLE = 'lock:olm-bundle:{version}'
+    OLM_BUNDLE_KONFLUX = 'lock:olm-bundle-konflux:{version}'
     MIRRORING_RPMS = 'lock:mirroring-rpms:{version}'
     PLASHET = 'lock:compose:{assembly}:{version}'
     BUILD = 'lock:build:{version}'
+    BUILD_KONFLUX = 'lock:build-konflux:{version}'
     MASS_REBUILD = 'lock:mass-rebuild-serializer'
+    KONFLUX_MASS_REBUILD = 'lock:konflux-mass-rebuild-serializer'
     SIGNING = 'lock:signing:{signing_env}'
     BUILD_SYNC = 'lock:build-sync:{version}'
+    BUILD_SYNC_KONFLUX = 'lock:build-sync-konflux:{version}'
+    SCAN = 'lock:scan:{version}'
+    SCAN_KONFLUX = 'lock:scan-konflux:{version}'
 
 
 class Keys(enum.Enum):
-    MASS_REBUILD_QUEUE = 'appdata:mass-rebuild-queue'
+    BREW_MASS_REBUILD_QUEUE = 'appdata:brew:mass-rebuild-queue'
+    KONFLUX_MASS_REBUILD_QUEUE = 'appdata:konflux:mass-rebuild-queue'
 
 
 # Use a BIG timeout value so that locks do not silently expire.
@@ -37,37 +45,67 @@ LOCK_POLICY = {
     Lock.OLM_BUNDLE: {
         'retry_count': 36000,
         'retry_delay_min': 0.1,
-        'lock_timeout': DEFAULT_LOCK_TIMEOUT
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
+    },
+    Lock.OLM_BUNDLE_KONFLUX: {
+        'retry_count': 36000,
+        'retry_delay_min': 0.1,
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
     },
     Lock.MIRRORING_RPMS: {
         'retry_count': 36000,
         'retry_delay_min': 0.1,
-        'lock_timeout': DEFAULT_LOCK_TIMEOUT
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
     },
     Lock.PLASHET: {
         'retry_count': 36000,
         'retry_delay_min': 0.1,
-        'lock_timeout': DEFAULT_LOCK_TIMEOUT
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
     },
     Lock.BUILD: {
         'retry_count': 36000 * 1,
         'retry_delay_min': 0.1,
-        'lock_timeout': DEFAULT_LOCK_TIMEOUT
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
+    },
+    Lock.BUILD_KONFLUX: {
+        'retry_count': 36000 * 1,
+        'retry_delay_min': 0.1,
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
     },
     Lock.MASS_REBUILD: {
         'retry_count': 36000 * 8,
         'retry_delay_min': 0.1,
-        'lock_timeout': DEFAULT_LOCK_TIMEOUT
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
+    },
+    Lock.KONFLUX_MASS_REBUILD: {
+        'retry_count': 36000 * 8,
+        'retry_delay_min': 0.1,
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
     },
     Lock.SIGNING: {
         'retry_count': 36000,
         'retry_delay_min': 0.1,
-        'lock_timeout': DEFAULT_LOCK_TIMEOUT
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
     },
     Lock.BUILD_SYNC: {
         'retry_count': 36000,
         'retry_delay_min': 0.1,
-        'lock_timeout': DEFAULT_LOCK_TIMEOUT
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
+    },
+    Lock.BUILD_SYNC_KONFLUX: {
+        'retry_count': 36000,
+        'retry_delay_min': 0.1,
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
+    },
+    Lock.SCAN: {
+        'retry_count': 36000,
+        'retry_delay_min': 0.1,
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
+    },
+    Lock.SCAN_KONFLUX: {
+        'retry_count': 36000,
+        'retry_delay_min': 0.1,
+        'lock_timeout': DEFAULT_LOCK_TIMEOUT,
     },
 }
 
@@ -80,10 +118,7 @@ class LockManager(Aioredlock):
     @staticmethod
     def from_lock(lock: Lock, use_ssl=True):
         """
-        Builds and returns a new aioredlock.Aioredlock instance. Requires following env vars to be defined:
-        - REDIS_SERVER_PASSWORD: authentication token to the Redis server
-        - REDIS_HOST: hostname where Redis is deployed
-        - REDIS_PORT: port where Redis is exposed
+        Builds and returns a new aioredlock.Aioredlock instance. Requires REDIS_SERVER_PASSWORD env var to be defined.
 
         If use_ssl is set, we assume Redis server is using a secure connection, and the protocol will be rediss://
         Otherwise, it will fall back to the unsecure redis://
@@ -113,7 +148,7 @@ class LockManager(Aioredlock):
             [redis.redis_url(use_ssl)],
             internal_lock_timeout=lock_policy['lock_timeout'],
             retry_count=lock_policy['retry_count'],
-            retry_delay_min=lock_policy['retry_delay_min']
+            retry_delay_min=lock_policy['retry_delay_min'],
         )
 
     async def lock(self, resource, *args, **kwargs):
@@ -155,8 +190,9 @@ class LockManager(Aioredlock):
         return await redis.get_keys(pattern)
 
 
-async def enqueue_for_lock(coro: coroutine, lock: Lock, lock_name: str, lock_id: str,
-                           ocp_version: str, version_queue_name):
+async def enqueue_for_lock(
+    coro: coroutine, lock: Lock, lock_name: str, lock_id: str, ocp_version: str, version_queue_name
+):
     lock_manager = LockManager.from_lock(lock)
     return await _enqueue_for_lock(coro, lock_manager, lock, lock_name, lock_id, ocp_version, version_queue_name)
 
@@ -166,8 +202,9 @@ async def enqueue_for_lock(coro: coroutine, lock: Lock, lock_name: str, lock_id:
     stop=stop_after_attempt(600 * 24),  # wait for 24 hours
     retry=retry_if_exception_type(TryAgain),
 )
-async def _enqueue_for_lock(coro: coroutine, lock_manager, lock: Lock, lock_name: str, lock_id: str,
-                            ocp_version: str, version_queue_name):
+async def _enqueue_for_lock(
+    coro: coroutine, lock_manager, lock: Lock, lock_name: str, lock_id: str, ocp_version: str, version_queue_name
+):
     if not await lock_manager.is_locked(lock_name):
         # TODO: use a redis tx here
         # fetch the first element in the reverse sorted set by score (item with the max score)
@@ -199,7 +236,11 @@ async def run_with_lock(coro: coroutine, lock: Lock, lock_name: str, lock_id: st
 
     try:
         if skip_if_locked and await lock_manager.is_locked(lock_name):
-            lock_manager.logger.info('Looks like there is another task ongoing -- skipping for this run')
+            blocked_on_build_path = await lock_manager.get_lock_id(lock_name)
+            blocked_on_build_url = f'{constants.JENKINS_UI_URL}/{blocked_on_build_path}'
+            lock_manager.logger.info(
+                f'Cannot acquire {lock_name}, which is acquired by {blocked_on_build_url} -- skipping'
+            )
             coro.close()
             return
 

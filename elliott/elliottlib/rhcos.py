@@ -1,13 +1,13 @@
 import json
-from tenacity import retry, stop_after_attempt, wait_fixed
 from urllib import request
 
 from artcommonlib import exectools
 from artcommonlib.arch_util import brew_suffix_for_arch
 from artcommonlib.format_util import red_print
+from artcommonlib.rhcos import get_build_id_from_rhcos_pullspec, get_primary_container_name
+from tenacity import retry, stop_after_attempt, wait_fixed
+
 from elliottlib import constants
-from artcommonlib.rhcos import (get_primary_container_name,
-                                get_build_id_from_rhcos_pullspec)
 
 
 def release_url(runtime, version, arch="x86_64", private=False):
@@ -66,7 +66,7 @@ def _build_meta(runtime, build_id, version, arch="x86_64", private=False, meta_t
     meta_type is "meta" for the build record or "commitmeta" for its ostree content.
 
     @return  a "meta" build record e.g.:
-     https://releases-rhcos-art.apps.ocp-virt.prod.psi.redhat.com/storage/releases/rhcos-4.1/410.81.20200520.0/meta.json
+     https://releases-rhcos--prod-pipeline.apps.int.prod-stable-spoke1-dc-iad2.itup.redhat.com/storage/releases/rhcos-4.1/410.81.20200520.0/meta.json
      {
          "buildid": "410.81.20200520.0",
          ...

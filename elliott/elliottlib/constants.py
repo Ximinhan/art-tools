@@ -1,8 +1,8 @@
 """
 This file contains constants that are used to manage OCP Image and RPM builds
 """
-from artcommonlib.constants import RHCOS_RELEASES_BASE_URL, BREW_HUB, BREW_DOWNLOAD_URL
 
+from artcommonlib.constants import BREW_DOWNLOAD_URL, BREW_HUB, RHCOS_RELEASES_BASE_URL
 
 CINCINNATI_BASE_URL = "https://api.openshift.com/api/upgrades_info/v1/graph"
 BREW_DOWNLOAD_TEMPLATE = BREW_DOWNLOAD_URL + "/packages/{name}/{version}/{release}/files/{file_path}"
@@ -38,12 +38,12 @@ errata_active_advisory_labels = [
     "QE",
     "REL_PREP",
     "PUSH_READY",
-    "IN_PUSH"
+    "IN_PUSH",
 ]
 
 errata_inactive_advisory_labels = [
     "SHIPPED_LIVE",
-    "DROPPED_NO_SHIP"
+    "DROPPED_NO_SHIP",
 ]
 
 errata_states = errata_active_advisory_labels + errata_inactive_advisory_labels

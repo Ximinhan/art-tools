@@ -2,28 +2,31 @@ import asyncio
 import json
 import os
 import sys
+from typing import Dict, List, Optional, Set, Union
+
 import click
-from typing import Dict, List, Optional, Union, Set
+from artcommonlib import exectools
 from semver import VersionInfo
 
-from pyartcd.signatory import SigstoreSignatory
-from pyartcd import constants, exectools, util
+from pyartcd import constants, util
 from pyartcd.cli import cli, click_coroutine, pass_runtime
-from pyartcd.runtime import Runtime, GroupRuntime
-
+from pyartcd.runtime import GroupRuntime, Runtime
+from pyartcd.signatory import SigstoreSignatory
 
 CONCURRENCY_LIMIT = 100  # we run out of processes without a limit
 
 
 class SigstorePipeline:
-
     @classmethod
     async def create(cls, *args, **kwargs):
         self = cls(*args, **kwargs)
         doozer_data_path = os.environ.get("DOOZER_DATA_PATH") or constants.OCP_BUILD_DATA_URL
         self.group_runtime = await GroupRuntime.create(
-            self.runtime.config, self.runtime.working_dir,
-            self.group, self.assembly, doozer_data_path
+            self.runtime.config,
+            self.runtime.working_dir,
+            self.group,
+            self.assembly,
+            doozer_data_path,
         )
         self.releases_config = await util.load_releases_config(
             group=self.group,
@@ -31,10 +34,16 @@ class SigstorePipeline:
         )
         return self
 
-    def __init__(self, runtime: Runtime, group: str, assembly: str,
-                 multi: str, sign_release: str, verify_release: bool,
-                 pullspecs: Optional[List[str]]
-                 ) -> None:
+    def __init__(
+        self,
+        runtime: Runtime,
+        group: str,
+        assembly: str,
+        multi: str,
+        sign_release: str,
+        verify_release: bool,
+        pullspecs: Optional[List[str]],
+    ) -> None:
         self.runtime = runtime
         self.group = group
         self.assembly = assembly
@@ -50,7 +59,9 @@ class SigstorePipeline:
             logger=self._logger,
             dry_run=self.runtime.dry_run,
             signing_creds=os.environ.get("KMS_CRED_FILE", "dummy-file"),
-            signing_key_id=os.environ.get("KMS_KEY_ID", "dummy-key"),
+            # Allow AWS_KEY_ID to be a comma delimited list
+            signing_key_ids=os.environ.get("KMS_KEY_ID", "dummy-key").strip().split(','),
+            rekor_url=os.environ.get("REKOR_URL", ""),
             concurrency_limit=CONCURRENCY_LIMIT,
             sign_release=self.sign_release,
             sign_components=self.sign_components,
@@ -86,7 +97,9 @@ class SigstorePipeline:
         # Load group config and releases.yml
         logger.info("Loading build metadata...")
         if self.releases_config.get("releases", {}).get(self.assembly) is None:
-            raise ValueError(f"To sign this release, assembly {self.assembly} must be explicitly defined in releases.yml.")
+            raise ValueError(
+                f"To sign this release, assembly {self.assembly} must be explicitly defined in releases.yml."
+            )
 
         # Get release name
         release_name = util.get_release_name_for_assembly(self.group, self.releases_config, self.assembly)
@@ -138,26 +151,53 @@ class SigstorePipeline:
 
 
 @cli.command("sigstore-sign")
-@click.option("-g", "--group", metavar='NAME', required=True,
-              help="The group of components on which to operate. e.g. openshift-4.15")
-@click.option("-a", "--assembly", metavar="ASSEMBLY_NAME", required=True,
-              help="The name of an assembly to be signed. e.g. 4.15.1")
-@click.option("--multi", type=click.Choice(("yes", "no", "only")), default="yes",
-              help="Whether to sign multi-arch or arch-specific payloads.")
-@click.option("--sign-release", type=click.Choice(("yes", "no", "only")), default="no",
-              help="Whether to sign the release image or just component images.")
-@click.option("--verify-release", is_flag=True, default=False,
-              help="Verify that release images have a legacy signature before re-signing.")
+@click.option(
+    "-g",
+    "--group",
+    metavar='NAME',
+    required=True,
+    help="The group of components on which to operate. e.g. openshift-4.15",
+)
+@click.option(
+    "-a", "--assembly", metavar="ASSEMBLY_NAME", required=True, help="The name of an assembly to be signed. e.g. 4.15.1"
+)
+@click.option(
+    "--multi",
+    type=click.Choice(("yes", "no", "only")),
+    default="yes",
+    help="Whether to sign multi-arch or arch-specific payloads.",
+)
+@click.option(
+    "--sign-release",
+    type=click.Choice(("yes", "no", "only")),
+    default="yes",
+    help="Whether to sign the release image or just component images.",
+)
+@click.option(
+    "--verify-release",
+    is_flag=True,
+    default=False,
+    help="Verify that release images have a legacy signature before re-signing.",
+)
 @click.argument('pullspecs', nargs=-1, required=False)
 @pass_runtime
 @click_coroutine
 async def sigstore_sign_container(
-        runtime: Runtime, group: str, assembly: str,
-        multi: str, sign_release: str, verify_release: bool,
-        pullspecs: Optional[List[str]] = None):
+    runtime: Runtime,
+    group: str,
+    assembly: str,
+    multi: str,
+    sign_release: str,
+    verify_release: bool,
+    pullspecs: Optional[List[str]] = None,
+):
     pipeline = await SigstorePipeline.create(
-        runtime, group, assembly,
-        multi, sign_release, verify_release,
-        pullspecs
+        runtime,
+        group,
+        assembly,
+        multi,
+        sign_release,
+        verify_release,
+        pullspecs,
     )
     await pipeline.run()

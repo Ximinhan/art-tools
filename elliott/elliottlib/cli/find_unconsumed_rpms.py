@@ -1,17 +1,20 @@
 import asyncio
+import logging
 from typing import Dict, List, Optional
-import click
 
+import click
+import koji
 from artcommonlib import exectools
 from artcommonlib.arch_util import brew_arch_for_go_arch
-from artcommonlib.assembly import AssemblyTypes, assembly_type, assembly_rhcos_config
+from artcommonlib.assembly import AssemblyTypes, assembly_rhcos_config, assembly_type
+
 from elliottlib import brew, rhcos
 from elliottlib.build_finder import BuildFinder
-
 from elliottlib.cli.common import cli, click_coroutine
 from elliottlib.imagecfg import ImageMetadata
 from elliottlib.runtime import Runtime
-import koji
+
+LOGGER = logging.getLogger(__name__)
 
 
 class FindUnconsumedRpms:
@@ -20,7 +23,7 @@ class FindUnconsumedRpms:
 
     @staticmethod
     def _list_image_rpms(image_ids: List[int], session: koji.ClientSession) -> List[Optional[List[Dict]]]:
-        """ Retrieve RPMs in given images
+        """Retrieve RPMs in given images
         :param image_ids: image IDs list
         :param session: instance of Brew session
         :return: a list of Koji/Brew RPM lists
@@ -30,8 +33,10 @@ class FindUnconsumedRpms:
         return [task.result for task in tasks]
 
     @staticmethod
-    def _list_archives_by_builds(build_ids: List[int], build_type: str, session: koji.ClientSession) -> List[Optional[List[Dict]]]:
-        """ Retrieve information about archives by builds
+    def _list_archives_by_builds(
+        build_ids: List[int], build_type: str, session: koji.ClientSession
+    ) -> List[Optional[List[Dict]]]:
+        """Retrieve information about archives by builds
         :param build_ids: List of build IDs
         :param build_type: build type, such as "image"
         :param session: instance of Brew session
@@ -72,7 +77,9 @@ class FindUnconsumedRpms:
                 # for non-stream assemblies we expect explicit config for RHCOS
                 if runtime_assembly_type is not AssemblyTypes.STREAM:
                     if container_conf.primary:
-                        raise Exception(f'Assembly {self._runtime.assembly} is not type STREAM but no assembly.rhcos.{container_conf.name} image data for {brew_arch}; all RHCOS image data must be populated for this assembly to be valid')
+                        raise Exception(
+                            f'Assembly {self._runtime.assembly} is not type STREAM but no assembly.rhcos.{container_conf.name} image data for {brew_arch}; all RHCOS image data must be populated for this assembly to be valid'
+                        )
                     # require the primary container at least to be specified, but
                     # allow the edge case where we add an RHCOS container type and
                     # previous assemblies don't specify it
@@ -96,16 +103,18 @@ class FindUnconsumedRpms:
         return rpm_dicts
 
     async def run(self):
-        logger = self._runtime.logger
+        logger = LOGGER
         koji_api = self._runtime.build_retrying_koji_client(caching=True)
 
         # Get rpms in RHCOS builds
         rhcos_rpms = self._get_rhcos_rpms(koji_api)
 
         # Get image builds for the assembly
-        image_metas: List[ImageMetadata] = [image for image in self._runtime.image_metas() if not image.base_only and image.is_release]
+        image_metas: List[ImageMetadata] = [
+            image for image in self._runtime.image_metas() if not image.base_only and image.is_release
+        ]
         logger.info("Fetching Brew builds for %s component(s)...", len(image_metas))
-        brew_builds: List[Dict] = await asyncio.gather(*[exectools.to_thread(image.get_latest_build) for image in image_metas])
+        brew_builds: List[Dict] = await asyncio.gather(*[image.get_latest_build() for image in image_metas])
 
         logger.info("Retrieve RPMs in %s image build(s)...", len(brew_builds))
         build_archives = FindUnconsumedRpms._list_archives_by_builds([b["id"] for b in brew_builds], "image", koji_api)
@@ -118,13 +127,14 @@ class FindUnconsumedRpms:
         rpm_component_names = {b["name"] for b in rpm_builds}
 
         # Compare tagged rpms
-        replace_vars = self._runtime.group_config.vars.primitive() if self._runtime.group_config.vars else {}
-        et_data = self._runtime.get_errata_config(replace_vars=replace_vars)
+        et_data = self._runtime.get_errata_config()
         tag_pv_map = et_data.get('brew_tag_product_version_mapping')
         finder = BuildFinder(koji_api, logger=logger)
         extra_components = {}
         for tag in tag_pv_map.keys():
-            tagged_rpm_builds = finder.from_tag("rpm", tag, inherit=False, assembly=self._runtime.assembly, event=self._runtime.brew_event)
+            tagged_rpm_builds = finder.from_tag(
+                "rpm", tag, inherit=False, assembly=self._runtime.assembly, event=self._runtime.brew_event
+            )
             extra_components[tag] = sorted(tagged_rpm_builds.keys() - rpm_component_names)
 
         for tag, extras in extra_components.items():
@@ -137,7 +147,6 @@ class FindUnconsumedRpms:
 @click.pass_obj
 @click_coroutine
 async def find_unconsumed_rpms_cli(runtime: Runtime):
-    """ Finds rpms that are tagged into candidate brew tags but not used in images or RHCOS.
-    """
+    """Finds rpms that are tagged into candidate brew tags but not used in images or RHCOS."""
     runtime.initialize(mode="both")
     await FindUnconsumedRpms(runtime=runtime).run()

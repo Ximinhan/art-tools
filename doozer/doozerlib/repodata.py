@@ -1,21 +1,22 @@
 import asyncio
 import gzip
-import lzma
 import io
 import logging
+import lzma
+import re
 import xml.etree.ElementTree
-import defusedxml.ElementTree as ET
 from dataclasses import dataclass, field
 from logging import Logger
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 from urllib import parse
 
 import aiohttp
-from ruamel.yaml import YAML
-from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
-
+import defusedxml.ElementTree as ET
 from artcommonlib import logutil
-from doozerlib import rpm_utils
+from artcommonlib.exectools import cmd_gather_async
+from artcommonlib.rpm_utils import label_compare, parse_nvr
+from ruamel.yaml import YAML
+from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
 
 LOGGER = logutil.get_logger(__name__)
 NAMESPACES = {
@@ -30,6 +31,10 @@ class Rpm:
     name: str
     epoch: int
     version: str
+    checksum: str
+    size: int
+    location: str
+    sourcerpm: str
     release: str
     arch: str
 
@@ -44,7 +49,7 @@ class Rpm:
     def compare(self, another: "Rpm"):
         evr1 = (str(self.epoch), self.version, self.release)
         evr2 = (str(another.epoch), another.version, another.release)
-        return rpm_utils.labelCompare(evr1, evr2)
+        return label_compare(evr1, evr2)
 
     def __repr__(self) -> str:
         return self.nevra
@@ -54,6 +59,10 @@ class Rpm:
             "name": self.name,
             "epoch": str(self.epoch),
             "version": self.version,
+            "checksum": self.checksum,
+            "size": str(self.size),
+            "location": self.location,
+            "sourcerpm": self.sourcerpm,
             "release": self.release,
             "arch": self.arch,
             "nvr": self.nvr,
@@ -63,7 +72,7 @@ class Rpm:
     @staticmethod
     def from_nevra(nevra: str):
         nevr, arch = nevra.rsplit(".", maxsplit=1)  # foo-0:1.2.3-1.x86_64 => (foo-0:1.2.3-1, x86_64)
-        nvrea_dict = rpm_utils.parse_nvr(nevr)
+        nvrea_dict = parse_nvr(nevr)
         nvrea_dict["arch"] = arch
         return Rpm.from_dict(nvrea_dict)
 
@@ -76,6 +85,10 @@ class Rpm:
             version=nvrea_dict["version"],
             release=nvrea_dict["release"],
             arch=nvrea_dict["arch"],
+            checksum="",
+            size=0,
+            location="",
+            sourcerpm="",
         )
 
     @staticmethod
@@ -86,13 +99,34 @@ class Rpm:
         version = metadata.find("common:version", NAMESPACES)
         if version is None:
             raise ValueError("version is not set")
+        checksum = metadata.find("common:checksum", NAMESPACES)
+        if checksum is None or not checksum.text:
+            raise ValueError('checksum is not set')
+        size = metadata.find("common:size", NAMESPACES)
+        if size is None:
+            raise ValueError("size is not set")
+        location = metadata.find("common:location", NAMESPACES)
+        if location is None:
+            raise ValueError("location is not set")
         arch = metadata.find("common:arch", NAMESPACES)
         if arch is None or not arch.text:
             raise ValueError("arch is not set")
+
+        format_elem = metadata.find("common:format", NAMESPACES)
+        sourcerpm = ''
+        if format_elem is not None:
+            sourcerpm_elem = format_elem.find("rpm:sourcerpm", NAMESPACES)
+            if sourcerpm_elem is not None and sourcerpm_elem.text:
+                sourcerpm = sourcerpm_elem.text
+
         return Rpm(
             name=name.text,
             epoch=int(version.attrib["epoch"]),
             version=version.attrib["ver"],
+            checksum=f'{checksum.attrib["type"]}:{checksum.text}',
+            size=int(size.attrib["package"]),
+            location=location.attrib["href"],
+            sourcerpm=sourcerpm,
             release=version.attrib["rel"],
             arch=arch.text,
         )
@@ -142,9 +176,177 @@ class Repodata:
     primary_rpms: List[Rpm] = field(default_factory=list)
     modules: List[RpmModule] = field(default_factory=list)
 
+    def get_rpms(self, items: Union[str, Iterable[str]], arch: str) -> Tuple[list[Rpm], list[str]]:
+        """
+        Retrieve RPM packages based on names or NVRs with intelligent version filtering.
+
+        For package names: returns the latest available version.
+        For NVRs: returns the specific requested version plus the latest available version.
+
+        Args:
+            items: Package names (e.g., "wget") or NVRs (e.g., "nettle-3.9.1-1.el9") to resolve
+            arch: Target architecture (results include both arch-specific and noarch packages)
+
+        Returns:
+            Tuple of (found_rpms, not_found_items) where found_rpms contains resolved packages
+            and not_found_items lists items that couldn't be resolved
+        """
+        if isinstance(items, str):
+            items = {items}
+        else:
+            items = set(items)
+
+        found_rpms: list[Rpm] = []
+        not_found: list[str] = []
+
+        for item in items:
+            is_nvr, rpm_name = self._detect_nvr_vs_name(item)
+
+            matching_rpms = [
+                rpm for rpm in self.primary_rpms if rpm.name == rpm_name and (rpm.arch == arch or rpm.arch == 'noarch')
+            ]
+
+            if not matching_rpms:
+                not_found.append(item)
+                continue
+
+            if is_nvr:
+                filtered_rpms = self._filter_nvr_versions(item, matching_rpms, rpm_name)
+                found_rpms.extend(filtered_rpms)
+                # If specific version wasn't found, mark original NVR as not found
+                specific_rpm = self._find_specific_rpm(item, matching_rpms)
+                if not specific_rpm:
+                    not_found.append(item)
+            else:
+                # For package names, return only the latest version
+                latest_rpm = self._find_latest_rpm(matching_rpms)
+                if latest_rpm:
+                    found_rpms.append(latest_rpm)
+
+        return found_rpms, sorted(not_found)
+
+    def _detect_nvr_vs_name(self, item: str) -> Tuple[bool, str]:
+        """
+        Detect if input item is an NVR or a package name.
+
+        Args:
+            item: Input string that could be NVR like "foo-1.2.3-4.el9" or name like "foo"
+
+        Returns:
+            Tuple of (is_nvr: bool, package_name: str)
+        """
+        try:
+            parsed = parse_nvr(item)
+            extracted_name = parsed.get('name')
+            version = parsed.get('version')
+            release = parsed.get('release')
+
+            # Basic parsing succeeded, now validate components
+            if extracted_name and version and release:
+                # Validate version: should contain digits or dots (typical version patterns)
+                if re.search(r'[\d.]', version):
+                    # Validate release: should contain at least one digit (typical RPM release)
+                    if re.search(r'\d', release):
+                        return True, extracted_name
+        except Exception:
+            # If parsing fails, treat as package name
+            pass
+
+        # Default to treating as package name
+        return False, item
+
+    def _filter_nvr_versions(self, original_nvr: str, matching_rpms: list[Rpm], rpm_name: str) -> list[Rpm]:
+        """
+        Filter RPMs to return specific version from NVR + latest version.
+
+        Args:
+            original_nvr: The original NVR string provided by user
+            matching_rpms: All RPMs matching the package name and architecture
+            rpm_name: Extracted package name
+
+        Returns:
+            List containing specific RPM + latest RPM (deduplicated)
+        """
+        if not matching_rpms:
+            return []
+
+        result_rpms = []
+
+        # Find the specific RPM matching the original NVR
+        specific_rpm = self._find_specific_rpm(original_nvr, matching_rpms)
+        if specific_rpm:
+            result_rpms.append(specific_rpm)
+
+        # Find the latest RPM version
+        latest_rpm = self._find_latest_rpm(matching_rpms)
+        if latest_rpm:
+            # Only add latest if it's different from specific
+            if not specific_rpm or latest_rpm.nvr != specific_rpm.nvr:
+                result_rpms.append(latest_rpm)
+
+        return result_rpms
+
+    def _find_specific_rpm(self, original_nvr: str, matching_rpms: list[Rpm]) -> Optional[Rpm]:
+        """
+        Find the RPM that matches the specific NVR provided.
+
+        Args:
+            original_nvr: Original NVR string like "foo-1.2.3-4.el9"
+            matching_rpms: List of RPMs to search in
+
+        Returns:
+            RPM object matching the NVR, or None if not found
+        """
+        try:
+            parsed_original = parse_nvr(original_nvr)
+            target_version = parsed_original.get('version')
+            target_release = parsed_original.get('release')
+
+            if not target_version or not target_release:
+                return None
+
+            # Find RPM with matching version and release
+            for rpm in matching_rpms:
+                if rpm.version == target_version and rpm.release == target_release:
+                    return rpm
+
+        except Exception:
+            # If parsing fails, we can't match
+            pass
+
+        return None
+
+    def _find_latest_rpm(self, rpms: list[Rpm]) -> Optional[Rpm]:
+        """
+        Find the RPM with the latest version using RPM version comparison.
+
+        Args:
+            rpms: List of RPM objects to compare
+
+        Returns:
+            RPM with the highest version, or None if list is empty
+        """
+        if not rpms:
+            return None
+
+        if len(rpms) == 1:
+            return rpms[0]
+
+        # Start with first RPM as candidate
+        latest = rpms[0]
+
+        # Compare against all others using RPM's built-in comparison
+        for rpm in rpms[1:]:
+            if rpm.compare(latest) > 0:  # rpm is newer than current latest
+                latest = rpm
+
+        return latest
+
     @staticmethod
     def from_metadatas(name: str, primary: xml.etree.ElementTree.Element, modules_yaml: List[Dict]):
-        primary_rpms = [Rpm.from_metadata(metadata) for metadata in primary.findall("common:package[@type='rpm']", NAMESPACES)]
+        primary_rpms = [
+            Rpm.from_metadata(metadata) for metadata in primary.findall("common:package[@type='rpm']", NAMESPACES)
+        ]
         modules = [RpmModule.from_metadata(metadata) for metadata in modules_yaml if metadata['document'] == 'modulemd']
         repodata = Repodata(
             name=name,
@@ -174,16 +376,26 @@ class RepodataLoader:
         else:
             raise IOError(f'Unknown compression for: {url}')
 
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
     async def load(self, repo_name: str, repo_url: str):
         if not repo_url.endswith("/"):
             repo_url += "/"
         repomd_url = parse.urljoin(repo_url, "repodata/repomd.xml")
 
         timeout = aiohttp.ClientTimeout(total=60 * 10)
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=32, force_close=True), timeout=timeout) as session:
-            async with session.get(repomd_url) as resp:
-                resp.raise_for_status()
-                repomd_xml = ET.fromstring(await resp.text())
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=32, force_close=True), timeout=timeout
+        ) as session:
+            try:
+                async with session.get(repomd_url) as resp:
+                    resp.raise_for_status()
+                    repomd_xml = ET.fromstring(await resp.text())
+            except Exception as e:
+                LOGGER.warning('Failed fetching %s: %s', repomd_url, e)
+                curl_cmd = ['curl', '-v', repomd_url]
+                _, _, err = await cmd_gather_async(curl_cmd)
+                LOGGER.info('curl command stderr: %s', err)
+                raise
 
             primary_data_element = repomd_xml.find('repo:data[@type="primary"]', NAMESPACES)
             if primary_data_element is None:
@@ -201,9 +413,22 @@ class RepodataLoader:
                     raise ValueError("Couldn't find modules location in repodata")
                 modules_url = parse.urljoin(repo_url, modules_location.attrib['href'])
 
-            @retry(reraise=True, stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=10),
-                   retry=(retry_if_exception_type((aiohttp.ServerDisconnectedError, aiohttp.ClientResponseError, aiohttp.ClientPayloadError))),
-                   before_sleep=before_sleep_log(LOGGER, logging.WARNING))
+            @retry(
+                reraise=True,
+                stop=stop_after_attempt(5),
+                wait=wait_exponential(multiplier=1, min=1, max=10),
+                retry=(
+                    retry_if_exception_type(
+                        (
+                            aiohttp.ServerDisconnectedError,
+                            aiohttp.ClientResponseError,
+                            aiohttp.ClientPayloadError,
+                            aiohttp.ClientConnectionError,
+                        )
+                    )
+                ),
+                before_sleep=before_sleep_log(LOGGER, logging.WARNING),
+            )
             async def fetch_remote_compressed(url: Optional[str]):
                 return await self._fetch_remote_compressed(session, url)
 
@@ -216,21 +441,23 @@ class RepodataLoader:
         repodata = Repodata.from_metadatas(
             repo_name,
             ET.fromstring(primary_bytes),
-            list(yaml.load_all(modules_bytes) if modules_bytes else [])
+            list(yaml.load_all(modules_bytes) if modules_bytes else []),
         )
         return repodata
 
 
 class OutdatedRPMFinder:
-
     @staticmethod
     def _find_candidate_modular_rpms(all_modules, enabled_streams):
-        """ Finds all candidate modular rpms in enabled module streams
-        """
+        """Finds all candidate modular rpms in enabled module streams"""
         # Find the latest module versions for each enabled streams
-        latest_modules: Dict[str, Dict[str, Tuple[str, RpmModule]]] = {}  # module_stream => context => (repo_name, RpmModule)
+        latest_modules: Dict[
+            str, Dict[str, Tuple[str, RpmModule]]
+        ] = {}  # module_stream => context => (repo_name, RpmModule)
         for module_stream, allowed_contexts in enabled_streams.items():
-            module_versions = sorted(all_modules[module_stream].keys(), reverse=True)  # module versions are sorted from newest to oldest
+            module_versions = sorted(
+                all_modules[module_stream].keys(), reverse=True
+            )  # module versions are sorted from newest to oldest
             latest_modules[module_stream] = {}
             for version in module_versions:
                 for update_repo, update_module in all_modules[module_stream][version]:
@@ -253,7 +480,7 @@ class OutdatedRPMFinder:
 
     @staticmethod
     def _find_candidate_non_modular_rpms(all_non_modular_rpms):
-        """ Finds all candidate non-modular rpms.
+        """Finds all candidate non-modular rpms.
         For each non-modular rpm, if there is another candidate modular rpm with the same package name,
         the non-modular rpm will be exempt.
         """
@@ -265,7 +492,9 @@ class OutdatedRPMFinder:
                 candidate_non_modular_rpms[rpm.name] = (repo, rpm)
         return candidate_non_modular_rpms
 
-    def find_non_latest_rpms(self, rpms_to_check: List[Dict], repodatas: List[Repodata], logger: Optional[Logger] = None) -> List[Tuple[str, str, str]]:
+    def find_non_latest_rpms(
+        self, rpms_to_check: List[Dict], repodatas: List[Repodata], logger: Optional[Logger] = None
+    ) -> List[Tuple[str, str, str]]:
         """
         Finds non-latest rpms.
 
@@ -289,11 +518,17 @@ class OutdatedRPMFinder:
 
         logger.info("Determining which module streams are enabled")
         # Populate dicts to hold all modules and all modular rpms
-        all_modules: Dict[str, Dict[int, List[Tuple[str, RpmModule]]]] = {}  # module_name_stream => version => [(repo_name, module_object)]
-        all_modular_rpms: Dict[str, Dict[str, Dict[str, RpmModule]]] = {}  # rpm_nvera => repo_name => module_nsvca => module_object
+        all_modules: Dict[
+            str, Dict[int, List[Tuple[str, RpmModule]]]
+        ] = {}  # module_name_stream => version => [(repo_name, module_object)]
+        all_modular_rpms: Dict[
+            str, Dict[str, Dict[str, RpmModule]]
+        ] = {}  # rpm_nvera => repo_name => module_nsvca => module_object
         for repodata in repodatas:
             for module in repodata.modules:
-                all_modules.setdefault(module.name_stream, {}).setdefault(module.version, []).append((repodata.name, module))
+                all_modules.setdefault(module.name_stream, {}).setdefault(module.version, []).append(
+                    (repodata.name, module)
+                )
                 for nevra in module.rpms:
                     all_modular_rpms.setdefault(nevra, {}).setdefault(repodata.name, {})[module.nsvca] = module
 

@@ -1,7 +1,6 @@
 class ModelException(Exception):
-
     def __init__(self, msg, result=None, **kwargs):
-        super(self.__class__, self).__init__(msg)
+        super().__init__(msg)
         self.msg = msg
         self.result = result
         self.kwargs = kwargs
@@ -23,9 +22,8 @@ class ModelException(Exception):
 
 
 class MissingModel(dict):
-
     def __init__(self):
-        super(self.__class__, self).__init__()
+        super().__init__()
         pass
 
     def __getattr__(self, attr):
@@ -70,23 +68,28 @@ def to_model_or_val(v):
 
 
 class ListModel(list):
-
     def __init__(self, list_to_model):
-        super(self.__class__, self).__init__()
+        super().__init__()
         if isinstance(list_to_model, ListModel):
             list_to_model = list_to_model.primitive()
         if list_to_model is not None:
             self.extend(list_to_model)
 
     def __setitem__(self, key, value):
-        super(self.__class__, self).__setitem__(key, value)
+        super().__setitem__(key, value)
 
     def __delitem__(self, key):
-        super(self.__class__, self).__delitem__(key)
+        super().__delitem__(key)
 
     def __getitem__(self, index):
-        if super(self.__class__, self).__len__() > index:
-            v = super(self.__class__, self).__getitem__(index)
+        if isinstance(index, slice):
+            # Handle slicing: apply slice, then return a new ListModel
+            sliced = super().__getitem__(index)
+            return ListModel(sliced)
+
+        # Normal single-item access
+        if super().__len__() > index:
+            v = super().__getitem__(index)
             if isinstance(v, Model):
                 return v
             v = to_model_or_val(v)
@@ -94,10 +97,10 @@ class ListModel(list):
             return v
 
         # Otherwise, trigger out of bounds exception
-        return super(self.__class__, self).__getitem__(index)
+        return super().__getitem__(index)
 
     def __iter__(self):
-        for i in range(0, super(self.__class__, self).__len__()):
+        for i in range(0, super().__len__()):
             yield self[i]
 
     # Converts the model to a raw list
@@ -111,7 +114,6 @@ class ListModel(list):
 
 
 class Model(dict):
-
     def __init__(self, dict_to_model=None):
         super(Model, self).__init__()
         if dict_to_model is not None:
@@ -122,7 +124,7 @@ class Model(dict):
 
     def __getattr__(self, attr):
         if super(Model, self).__contains__(attr):
-            v = super(self.__class__, self).get(attr)
+            v = super().get(attr)
             if isinstance(v, Model):
                 return v
             v = to_model_or_val(v)
@@ -144,7 +146,7 @@ class Model(dict):
         super(Model, self).__delitem__(key)
 
     def primitive(self):
-        """ Recursively turn Model into dicts. """
+        """Recursively turn Model into dicts."""
         d = {}
         for k, v in self.items():
             if isinstance(v, Model) or isinstance(v, ListModel):

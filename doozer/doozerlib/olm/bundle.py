@@ -1,8 +1,8 @@
 import glob
 import io
+import json
 import os
 import re
-import json
 import shutil
 import threading
 from pathlib import Path
@@ -10,10 +10,12 @@ from typing import Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import yaml
+from artcommonlib import exectools, pushd
+from artcommonlib.brew import BuildStates
 from dockerfile_parse import DockerfileParser
 from koji import ClientSession
+from tenacity import retry, stop_after_attempt, wait_fixed
 
-from artcommonlib import pushd, exectools
 from doozerlib import brew, util
 from doozerlib.runtime import Runtime
 
@@ -29,14 +31,19 @@ class OLMBundle(object):
     independently built, due to their tight coupling to corresponding operators
     """
 
-    def __init__(self, runtime: Runtime,
-                 operator_nvr_or_dict: Union[str, dict],
-                 dry_run: Optional[bool] = False,
-                 brew_session: Optional[ClientSession] = None):
+    def __init__(
+        self,
+        runtime: Runtime,
+        operator_nvr_or_dict: Union[str, dict],
+        dry_run: Optional[bool] = False,
+        brew_session: Optional[ClientSession] = None,
+    ):
         self.runtime = runtime
         self.dry_run = dry_run
         self.brew_session = brew_session or runtime.build_retrying_koji_client()
         self.operator_dict: Optional[dict] = None
+        self.image_references = {}
+        self.found_image_references = {}
 
         if isinstance(operator_nvr_or_dict, dict):
             self.operator_dict = operator_nvr_or_dict
@@ -69,16 +76,23 @@ class OLMBundle(object):
         """
         prefix = f"{self.bundle_brew_component}-{self.operator_dict['version']}.{self.operator_dict['release']}-"
         bundle_package_id = self.brew_session.getPackageID(self.bundle_brew_component, strict=True)
-        builds = self.brew_session.listBuilds(packageID=bundle_package_id, pattern=prefix + "*", state=brew.BuildStates.COMPLETE.value,
-                                              queryOpts={'limit': 1, 'order': '-creation_event_id'}, completeBefore=None)
+        builds = self.brew_session.listBuilds(
+            packageID=bundle_package_id,
+            pattern=prefix + "*",
+            state=BuildStates.COMPLETE.value,
+            queryOpts={'limit': 1, 'order': '-creation_event_id'},
+            completeBefore=None,
+        )
         if not builds:
             return None
 
         build_info = builds[0]
         pullspec = build_info['extra']['image']['index']['pull'][0]
         if not self.delivery_labels_match(pullspec):
-            self.runtime.logger.info(f"Cannot use bundle nvr {build_info['nvr']} since it does not have expected image "
-                                     f"delivery labels for assembly {self.runtime.assembly}")
+            self.runtime.logger.info(
+                f"Cannot use bundle nvr {build_info['nvr']} since it does not have expected image "
+                f"delivery labels for assembly {self.runtime.assembly}"
+            )
             return None
         return build_info['nvr']
 
@@ -101,10 +115,11 @@ class OLMBundle(object):
         self.create_container_yaml()
         return self.commit_and_push_bundle(commit_msg="Update bundle manifests")
 
-    def build(self) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    def build(self) -> Tuple[Optional[int], Optional[int], Optional[dict]]:
         """Trigger a brew build of operator's bundle
 
-        :return: (task_id, task_url, nvr) if build succeeds, (task_id, task_url, None) if container-build task is created but build fails,
+        :return: (task_id, task_url, build_info) if build succeeds,
+                 (task_id, task_url, None) if container-build task is created but build fails,
                  or (None, None, None) if unable to create a container-build task.
         """
         self.clone_bundle()
@@ -117,12 +132,12 @@ class OLMBundle(object):
             return task_id, task_url, None
 
         if self.dry_run:
-            return task_id, task_url, f"{self.bundle_brew_component}-v0.0.0-1"
+            return task_id, task_url, {'nvr': f"{self.bundle_brew_component}-v0.0.0-1"}
 
         taskResult = self.brew_session.getTaskResult(task_id)
         build_id = int(taskResult["koji_builds"][0])
         build_info = self.brew_session.getBuild(build_id)
-        return task_id, task_url, build_info["nvr"]
+        return task_id, task_url, build_info
 
     @property
     def bundle_image_name(self):
@@ -130,8 +145,7 @@ class OLMBundle(object):
         return f'openshift/{prefix}{self.bundle_name}'
 
     def clone_operator(self):
-        """Clone operator distgit repository to doozer working dir
-        """
+        """Clone operator distgit repository to doozer working dir"""
         dg_dir = Path(self.operator_clone_path)
         tag = f'{self.operator_dict["version"]}-{self.operator_dict["release"]}'
         if dg_dir.exists():
@@ -139,17 +153,24 @@ class OLMBundle(object):
             if self.runtime.upcycle:
                 self.runtime.logger.warning("Refreshing source for '%s' due to --upcycle", dg_dir)
                 exectools.cmd_assert(["git", "-C", str(dg_dir), "clean", "-fdx"])
-                exectools.cmd_assert(["git", "-C", str(dg_dir), "fetch", "--depth", "1", "origin", "tag", tag], retries=3)
+                exectools.cmd_assert(
+                    ["git", "-C", str(dg_dir), "fetch", "--depth", "1", "origin", "tag", tag], retries=3
+                )
                 exectools.cmd_assert(["git", "-C", str(dg_dir), "reset", "--hard", "FETCH_HEAD"])
             return
         dg_dir.parent.mkdir(parents=True, exist_ok=True)
-        exectools.cmd_assert('rhpkg {} clone --depth 1 --branch {} {} {}'.format(
-            self.rhpkg_opts, tag, self.operator_repo_name, self.operator_clone_path
-        ), retries=3)
+        exectools.cmd_assert(
+            'rhpkg {} clone --depth 1 --branch {} {} {}'.format(
+                self.rhpkg_opts,
+                tag,
+                self.operator_repo_name,
+                self.operator_clone_path,
+            ),
+            retries=3,
+        )
 
     def checkout_operator_to_build_commit(self):
-        """Checkout clone of operator repository to specific commit used to build given operator NVR
-        """
+        """Checkout clone of operator repository to specific commit used to build given operator NVR"""
         with pushd.Dir(self.operator_clone_path):
             exectools.cmd_assert('git checkout {}'.format(self.operator_build_commit))
 
@@ -161,26 +182,47 @@ class OLMBundle(object):
             if len(err.args) > 1:
                 _, _, clone_error = err.args[1]
                 if f"Could not find remote branch {self.branch} to clone" in clone_error:
-                    self.runtime.logger.warning("Could not find remote branch %s to clone, skipping bundle clone", self.branch)
+                    self.runtime.logger.warning(
+                        "Could not find remote branch %s to clone, skipping bundle clone", self.branch
+                    )
                     return False, f'{self.bundle_repo_name}/{self.branch}'
             raise
 
     def clone_bundle(self, retries: int = 3):
-        """Clone corresponding bundle distgit repository of given operator NVR
-        """
+        """Clone corresponding bundle distgit repository of given operator NVR"""
         dg_dir = Path(self.bundle_clone_path)
         if dg_dir.exists():
             self.runtime.logger.info("Distgit directory already exists; skipping clone: %s", dg_dir)
             if self.runtime.upcycle:
                 self.runtime.logger.warning("Refreshing source for '%s' due to --upcycle", dg_dir)
                 exectools.cmd_assert(["git", "-C", str(dg_dir), "clean", "-fdx"])
-                exectools.cmd_assert(["git", "-C", str(dg_dir), "fetch", "--depth", "1", "origin", self.branch], retries=3)
-                exectools.cmd_assert(["git", "-C", str(dg_dir), "checkout", "-B", self.branch, "--track", f"origin/{self.branch}", "--force"])
+                exectools.cmd_assert(
+                    ["git", "-C", str(dg_dir), "fetch", "--depth", "1", "origin", self.branch], retries=3
+                )
+                exectools.cmd_assert(
+                    [
+                        "git",
+                        "-C",
+                        str(dg_dir),
+                        "checkout",
+                        "-B",
+                        self.branch,
+                        "--track",
+                        f"origin/{self.branch}",
+                        "--force",
+                    ]
+                )
             return
         dg_dir.parent.mkdir(parents=True, exist_ok=True)
-        exectools.cmd_assert('rhpkg {} clone --depth 1 --branch {} {} {}'.format(
-            self.rhpkg_opts, self.branch, self.bundle_repo_name, self.bundle_clone_path
-        ), retries=retries)
+        exectools.cmd_assert(
+            'rhpkg {} clone --depth 1 --branch {} {} {}'.format(
+                self.rhpkg_opts,
+                self.branch,
+                self.bundle_repo_name,
+                self.bundle_clone_path,
+            ),
+            retries=retries,
+        )
 
     def clean_bundle_contents(self):
         """Delete all files currently present in the bundle repository
@@ -214,6 +256,10 @@ class OLMBundle(object):
             shutil.copy2(src, dest, follow_symlinks=False)
         refs = dest / "image-references"
         if refs.exists():
+            with open(refs, 'r') as f:
+                image_refs_yml = yaml.safe_load(f.read())
+            for entry in image_refs_yml.get('spec', {}).get('tags', []):
+                self.image_references[entry["name"]] = entry
             refs.unlink()
 
     def replace_image_references_by_sha_on_bundle_manifests(self):
@@ -231,10 +277,21 @@ class OLMBundle(object):
                     if not self.valid_subscription_label:
                         raise ValueError("missing valid-subscription-label in operator config")
                     yml_content = yaml.safe_load(contents)
-                    yml_content['metadata']['annotations']['operators.openshift.io/valid-subscription'] = self.valid_subscription_label
+                    yml_content['metadata']['annotations']['operators.openshift.io/valid-subscription'] = (
+                        self.valid_subscription_label
+                    )
                     f.write(yaml.dump(yml_content))
                 else:
                     f.write(contents)
+
+        if len(self.found_image_references) != len(self.image_references):
+            message = (
+                "Mismatch between number of found image references and image-references file. "
+                f"Found {len(self.found_image_references)}: {sorted(self.found_image_references.keys())}, "
+                f"Expected {len(self.image_references)}: {sorted(self.image_references.keys())}. "
+                "Operator build metadata is invalid, please investigate."
+            )
+            self.runtime.logger.warning(message)
 
     def generate_bundle_annotations(self):
         """Create an annotations YAML file for the bundle, using info extracted from operator's
@@ -260,27 +317,31 @@ class OLMBundle(object):
         bundle_df.labels['name'] = self.bundle_image_name
         bundle_df.labels['version'] = '{}.{}'.format(
             operator_df.labels['version'],
-            operator_df.labels['release']
+            operator_df.labels['release'],
         )
         bundle_df.labels = {
             **bundle_df.labels,
             **self.redhat_delivery_tags,
-            **self.operator_framework_tags
+            **self.operator_framework_tags,
         }
-        del (bundle_df.labels['release'])
+        del bundle_df.labels['release']
 
     def create_container_yaml(self):
-        """Use container.yaml to disable unnecessary multiarch
-        """
+        """Use container.yaml to disable unnecessary multiarch"""
         filename = '{}/container.yaml'.format(self.bundle_clone_path)
         with io.open(filename, 'w', encoding='utf-8') as writer:
             writer.write('# metadata containers are not functional and do not need to be multiarch')
             writer.write('\n\n')
-            writer.write(yaml.dump({
-                'platforms': {'only': ['x86_64']},
-                'operator_manifests': {'manifests_dir': 'manifests'},
-            }))
+            writer.write(
+                yaml.dump(
+                    {
+                        'platforms': {'only': ['x86_64']},
+                        'operator_manifests': {'manifests_dir': 'manifests'},
+                    }
+                )
+            )
 
+    @retry(reraise=True, stop=stop_after_attempt(3), wait=wait_fixed(60))
     def commit_and_push_bundle(self, commit_msg):
         """Try to commit and push bundle distgit repository if there were any content changes.
 
@@ -314,7 +375,7 @@ class OLMBundle(object):
             return 12345, "https://brewweb.example.com/brew/taskinfo?taskID=12345"
         with pushd.Dir(self.bundle_clone_path):
             rc, out, err = exectools.cmd_gather(
-                'rhpkg {} container-build --nowait --target {}'.format(self.rhpkg_opts, self.target)
+                'rhpkg {} container-build --nowait --target {}'.format(self.rhpkg_opts, self.target),
             )
 
         if rc != 0:
@@ -338,7 +399,7 @@ class OLMBundle(object):
             self.brew_session,
             self.runtime.logger.info,
             task_id,
-            threading.Event()
+            threading.Event(),
         )
         if error:
             self.runtime.logger.info(error)
@@ -356,22 +417,27 @@ class OLMBundle(object):
         found_images = {}
 
         def collect_replaced_image(match):
+            source_image = f'{match.group(1)}:{match.group(2)}'
+            sha = self.fetch_image_sha(source_image)
             image = '{}/{}@{}'.format(
                 'registry.redhat.io',  # hardcoded until appregistry is dead
                 match.group(1).replace('openshift/', 'openshift4/'),
-                self.fetch_image_sha('{}:{}'.format(match.group(1), match.group(2)))
+                sha,
             )
-            key = u'{}'.format(re.search(r'([^\/]+)\/(.+)', match.group(1)).group(2))
-            found_images[key] = u'{}'.format(image)
+            key = re.search(r'([^/]+)/(.+)', match.group(1)).group(2)
+            self.runtime.logger.info(f"Replacing {self.operator_csv_config['registry']}/{source_image} with {image}")
+            found_images[key] = image
             return image
 
+        pattern = r'{}\/([^:]+):([^\'"\\\s]+)'.format(self.operator_csv_config['registry'])
         new_contents = re.sub(
-            r'{}\/([^:]+):([^\'"\\\s]+)'.format(self.operator_csv_config['registry']),
+            pattern,
             collect_replaced_image,
             contents,
-            flags=re.MULTILINE
+            flags=re.MULTILINE,
         )
 
+        self.found_image_references.update(found_images)
         return self.append_related_images_spec(new_contents, found_images)
 
     def fetch_image_sha(self, image):
@@ -406,9 +472,11 @@ class OLMBundle(object):
 
         pull_spec = '{}/{}'.format(registry, image)
         try:
-            image_info = util.oc_image_info__caching(pull_spec)
+            image_info = util.oc_image_info_for_arch__caching(pull_spec)
         except:
-            self.runtime.logger.error(f'Unable to find image from CSV: {pull_spec}. Image may have failed to build after CSV rebase.')
+            self.runtime.logger.error(
+                f'Unable to find image from CSV: {pull_spec}. Image may have failed to build after CSV rebase.'
+            )
             raise
 
         if self.runtime.group_config.operator_image_ref_mode == 'manifest-list':
@@ -437,17 +505,14 @@ class OLMBundle(object):
         if not images:
             return contents
 
-        related_images = [
-            '    - name: {}\n      image: {}'.format(name, image)
-            for name, image in images.items()
-        ]
+        related_images = ['    - name: {}\n      image: {}'.format(name, image) for name, image in images.items()]
         related_images.sort()
 
         return re.sub(
             r'^spec:\n',
             'spec:\n  relatedImages:\n{}\n'.format('\n'.join(related_images)),
             contents,
-            flags=re.MULTILINE
+            flags=re.MULTILINE,
         )
 
     @property
@@ -466,14 +531,14 @@ class OLMBundle(object):
     def operator_manifests_dir(self):
         return '{}/{}'.format(
             self.operator_clone_path,
-            self.operator_csv_config['manifests-dir'].rstrip('/')
+            self.operator_csv_config['manifests-dir'].rstrip('/'),
         )
 
     @property
     def operator_bundle_dir(self):
         return '{}/{}'.format(
             self.operator_manifests_dir,
-            self.operator_csv_config['bundle-dir'].rstrip('/')
+            self.operator_csv_config['bundle-dir'].rstrip('/'),
         )
 
     @property
@@ -524,10 +589,12 @@ class OLMBundle(object):
         files = glob.glob('{}/*'.format(self.operator_bundle_dir))
         if not files:
             # 4.1 channel in package YAML is "preview" or "stable", but directory name is "4.1"
-            files = glob.glob('{}/{}/*'.format(
-                self.operator_manifests_dir,
-                '{MAJOR}.{MINOR}'.format(**self.runtime.group_config.vars)
-            ))
+            files = glob.glob(
+                '{}/{}/*'.format(
+                    self.operator_manifests_dir,
+                    '{MAJOR}.{MINOR}'.format(**self.runtime.group_config.vars),
+                )
+            )
         return files
 
     @property
@@ -584,7 +651,9 @@ class OLMBundle(object):
         target_match = re.match(r'.*-rhel-(\d+)(?:-|$)', self.branch)
         if target_match:
             el_target = int(target_match.group(1))
-            return self.runtime.get_default_candidate_brew_tag(el_target=el_target) or '{}-candidate'.format(self.branch)
+            return self.runtime.get_default_candidate_brew_tag(el_target=el_target) or '{}-candidate'.format(
+                self.branch
+            )
         else:
             raise IOError(f'Unable to determine rhel version from branch: {self.branch}')
 
@@ -601,5 +670,10 @@ class OLMBundle(object):
         image_labels = image_info['config']['config']['Labels']
         for label, value in self.redhat_delivery_tags.items():
             if image_labels.get(label, '') != value:
+                return False
+        if self.operator_index_mode != 'pre-release':
+            # It doesn't matter what the value of com.redhat.prerelease is
+            # ET marks it as prerelease if the label is present
+            if image_labels.get('com.redhat.prerelease', ''):
                 return False
         return True

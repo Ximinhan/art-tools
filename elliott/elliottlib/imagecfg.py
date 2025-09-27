@@ -1,11 +1,11 @@
 from artcommonlib import logutil
+
 from .metadata import Metadata
 
 logger = logutil.get_logger(__name__)
 
 
 class ImageMetadata(Metadata):
-
     def __init__(self, runtime, data_obj):
         super(ImageMetadata, self).__init__('image', runtime, data_obj)
 
@@ -32,3 +32,7 @@ class ImageMetadata(Metadata):
     @property
     def is_payload(self):
         return self.config.get('for_payload', False)
+
+    @property
+    def is_olm_operator(self):
+        return self.config.get('update-csv', False)

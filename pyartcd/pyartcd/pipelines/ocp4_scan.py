@@ -1,42 +1,44 @@
 import os
 from typing import Optional
-import yaml
 
 import click
+import yaml
+from artcommonlib import exectools
+from artcommonlib.constants import KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS
 
-from pyartcd import constants, exectools, util, locks
-from pyartcd import jenkins
+from pyartcd import constants, jenkins, locks
 from pyartcd.cli import cli, click_coroutine, pass_runtime
 from pyartcd.locks import Lock
 from pyartcd.runtime import Runtime
+from pyartcd.util import get_changes, has_layered_rhcos
 
 
 class Ocp4ScanPipeline:
-
     def __init__(self, runtime: Runtime, version: str, data_path: Optional[str] = None):
         self.runtime = runtime
         self.version = version
         self.data_path = data_path or constants.OCP_BUILD_DATA_URL  # in case we will make it a parameter
         self.logger = runtime.logger
-        self.rhcos_changed = False
+        self.rhcos_updated = False
+        self.rhcos_outdated = False
         self.rhcos_inconsistent = False
         self.inconsistent_rhcos_rpms = None
         self.changes = {}
         self.issues = []
         self._doozer_working = self.runtime.working_dir / "doozer_working"
-        self.locked = True  # True by default; if not locked, run() will set it to False
-        self.frozen = False
+        self.skipped = True  # True by default; if not locked, run() will set it to False
+
+        self._doozer_base_command = [
+            'doozer',
+            '--assembly=stream',
+            f'--working-dir={self._doozer_working}',
+            f'--data-path={self.data_path}',
+            f'--group=openshift-{self.version}',
+        ]
 
     async def run(self):
         # If we get here, lock could be acquired
-        self.locked = False
-
-        # Check if automation is frozen for current group
-        if not await util.is_build_permitted(self.version, doozer_working=str(self._doozer_working)):
-            self.logger.info('Skipping this build as it\'s not permitted')
-            self.frozen = True
-            return
-
+        self.skipped = False
         self.logger.info('Building: %s', self.version)
 
         # KUBECONFIG env var must be defined in order to scan sources
@@ -50,49 +52,72 @@ class Ocp4ScanPipeline:
         await self._rhcos_inconsistent()
 
         # Handle source changes, if any
+        changes = False
         if self.changes.get('rpms', None) or self.changes.get('images', None):
             self.logger.info('Detected at least one updated RPM or image')
+            changes = True
+            rpm_list = self.changes.get('rpms', [])
+            image_list = self.changes.get('images', [])
 
             if self.runtime.dry_run:
                 self.logger.info('Would have triggered a %s ocp4 build', self.version)
                 return
+
+            # Update build description
+            jenkins.update_description(f'Changed {len(image_list)} images<br/>')
+            if rpm_list:
+                jenkins.update_description(f'Changed {len(rpm_list)} rpms<br/>')
 
             # Trigger ocp4
             self.logger.info('Triggering a %s ocp4 build', self.version)
             jenkins.start_ocp4(
                 build_version=self.version,
                 assembly='stream',
-                rpm_list=self.changes.get('rpms', []),
-                image_list=self.changes.get('images', []),
-                comment_on_pr=True
+                rpm_list=rpm_list,
+                image_list=image_list,
+                comment_on_pr=True,
             )
 
-        elif self.rhcos_inconsistent:
-            self.logger.info('Detected inconsistent RHCOS RPMs:\n%s', self.inconsistent_rhcos_rpms)
+        if self.rhcos_inconsistent or self.rhcos_outdated:
+            changes = True
+            if self.rhcos_inconsistent:
+                self.logger.info('Detected inconsistent RHCOS RPMs:\n%s', self.inconsistent_rhcos_rpms)
+            if self.rhcos_outdated:
+                self.logger.info('Detected outdated RHCOS RPMs:\n%s', self.changes.get('rhcos', None))
 
             if self.runtime.dry_run:
                 self.logger.info('Would have triggered a %s RHCOS build', self.version)
                 return
-
             # Inconsistency probably means partial failure and we would like to retry.
             # but don't kick off more if already in progress.
             self.logger.info('Triggering a %s RHCOS build for consistency', self.version)
-            jenkins.start_rhcos(build_version=self.version, new_build=True)
+            layered_rhcos = await has_layered_rhcos(self._doozer_base_command)
+            job_name = 'build-node-image' if layered_rhcos else 'build'
+            jenkins.start_rhcos(build_version=self.version, new_build=False, job_name=job_name)
 
-        elif self.rhcos_changed:
+        elif self.rhcos_updated:
+            changes = True
             self.logger.info('Detected at least one updated RHCOS')
 
             if self.runtime.dry_run:
                 self.logger.info('Would have triggered a %s build-sync build', self.version)
                 return
 
-            self.logger.info('Triggering a %s build-sync', self.version)
-            jenkins.start_build_sync(
-                build_version=self.version,
-                assembly="stream",
-            )
+            self.logger.info('Triggering a %s build-sync to pick up latest RHCOS', self.version)
 
-        else:
+            if self.version in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+                self.runtime.logger.info(
+                    f'Skipping Brew build-sync for streams updated by konflux builds {KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS}'
+                )
+            else:
+                jenkins.start_build_sync(
+                    build_version=self.version,
+                    assembly="stream",
+                    build_system="brew",
+                )
+
+        if changes is False:
+            self.logger.info('*** No changes detected')
             jenkins.update_title(' [NO CHANGES]')
 
     async def _get_changes(self):
@@ -103,9 +128,12 @@ class Ocp4ScanPipeline:
         """
 
         # Run doozer scan-sources
-        cmd = f'doozer --data-path={self.data_path} --assembly stream --working-dir={self._doozer_working} ' \
-              f'--group=openshift-{self.version} ' \
-              f'config:scan-sources --yaml --ci-kubeconfig {os.environ["KUBECONFIG"]} --rebase-priv'
+        cmd = self._doozer_base_command + [
+            'config:scan-sources',
+            '--yaml',
+            f'--ci-kubeconfig={os.environ["KUBECONFIG"]}',
+            '--rebase-priv',
+        ]
         if self.runtime.dry_run:
             cmd += ' --dry-run'
         _, out, _ = await exectools.cmd_gather_async(cmd, stderr=None)
@@ -113,7 +141,7 @@ class Ocp4ScanPipeline:
         self.logger.info('scan-sources output for openshift-%s:\n%s', self.version, out)
 
         yaml_data = yaml.safe_load(out)
-        changes = util.get_changes(yaml_data)
+        changes = get_changes(yaml_data)
         if changes:
             self.logger.info('Detected source changes:\n%s', yaml.safe_dump(changes))
         else:
@@ -121,10 +149,11 @@ class Ocp4ScanPipeline:
 
         # Check for RHCOS changes
         if changes.get('rhcos', None):
-            self.rhcos_changed = True
-        else:
-            self.rhcos_changed = False
-
+            for rhcos_change in changes['rhcos']:
+                if rhcos_change['reason'].get('updated', None):
+                    self.rhcos_updated = True
+                if rhcos_change['reason'].get('outdated', None):
+                    self.rhcos_outdated = True
         self.changes = changes
         self.issues = yaml_data.get('issues', [])
 
@@ -143,8 +172,9 @@ class Ocp4ScanPipeline:
 
         slack_client = self.runtime.new_slack_client()
         slack_client.bind_channel(self.version)
-        message = \
+        message = (
             f':warning: @release-artists, some issues have arisen during scan-sources for *{self.version}* :warning:'
+        )
         slack_response = await slack_client.say(message)
 
         slack_thread = slack_response["message"]["ts"]
@@ -156,9 +186,11 @@ class Ocp4ScanPipeline:
         Check for RHCOS inconsistencies by calling doozer inspect:stream INCONSISTENT_RHCOS_RPMS
         """
 
-        cmd = f'doozer --data-path={self.data_path} --assembly stream --working-dir {self._doozer_working} ' \
-              f'--group openshift-{self.version} ' \
-              f'inspect:stream INCONSISTENT_RHCOS_RPMS --strict'
+        cmd = self._doozer_base_command + [
+            'inspect:stream',
+            'INCONSISTENT_RHCOS_RPMS',
+            '--strict',
+        ]
         try:
             _, out, _ = await exectools.cmd_gather_async(cmd, stderr=None)
             self.logger.info(out)
@@ -170,39 +202,46 @@ class Ocp4ScanPipeline:
 
 @cli.command('ocp4-scan')
 @click.option('--version', required=True, help='OCP version to scan')
-@click.option('--ignore-locks', is_flag=True, default=False,
-              help='Do not wait for other builds in this version to complete (only allowed in dry-run mode)')
 @pass_runtime
 @click_coroutine
-async def ocp4_scan(runtime: Runtime, version: str, ignore_locks: bool):
-    lock = Lock.BUILD
-    lock_name = lock.value.format(version=version)
-    lock_identifier = jenkins.get_build_path()
-    if not lock_identifier:
-        runtime.logger.warning('Env var BUILD_URL has not been defined: a random identifier will be used for the locks')
-
+async def ocp4_scan(runtime: Runtime, version: str):
     pipeline = Ocp4ScanPipeline(runtime, version)
     jenkins.init_jenkins()
 
-    if ignore_locks:
-        # Already checked by aos-cd-jobs, but you never know...
-        if not runtime.dry_run:
-            raise RuntimeError('--ignore-locks can only by used with --dry-run')
+    if runtime.dry_run:
         await pipeline.run()
 
     else:
+        lock = Lock.SCAN
+        lock_name = lock.value.format(version=version)
+        lock_identifier = jenkins.get_build_path()
+        if not lock_identifier:
+            runtime.logger.warning(
+                'Env var BUILD_URL has not been defined: a random identifier will be used for the locks'
+            )
+
+        # Scheduled builds are already being skipped if the lock is already acquired.
+        # For manual builds, we need to check if the build and scan locks are already acquired,
+        # and skip the current build if that's the case.
+        # Should that happen, signal it by appending a [SKIPPED][LOCKED] to the build title
+        async def run_with_build_lock():
+            build_lock = Lock.BUILD
+            build_lock_name = build_lock.value.format(version=version)
+            await locks.run_with_lock(
+                coro=pipeline.run(),
+                lock=build_lock,
+                lock_name=build_lock_name,
+                lock_id=lock_identifier,
+                skip_if_locked=True,
+            )
+
         await locks.run_with_lock(
-            coro=pipeline.run(),
+            coro=run_with_build_lock(),
             lock=lock,
             lock_name=lock_name,
             lock_id=lock_identifier,
-            skip_if_locked=True
+            skip_if_locked=True,
         )
 
-    # A build can be skipped because it's frozen, or because there's another run ongoing in the same group
-    # Signal this by adding a [SKIPPED] tag to the build title
-    if pipeline.locked:
+    if pipeline.skipped:
         jenkins.update_title(' [SKIPPED][LOCKED]')
-
-    elif pipeline.frozen:
-        jenkins.update_title(' [SKIPPED][FROZEN]')

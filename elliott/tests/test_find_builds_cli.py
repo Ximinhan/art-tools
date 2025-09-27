@@ -1,11 +1,21 @@
+import asyncio
 import unittest
-from unittest import mock
-
-from flexmock import flexmock
+from unittest import IsolatedAsyncioTestCase, mock
+from unittest.mock import AsyncMock, MagicMock
 
 from elliottlib import errata as erratalib
 from elliottlib.brew import Build
-from elliottlib.cli.find_builds_cli import _filter_out_attached_builds, _find_shipped_builds
+from elliottlib.cli.find_builds_cli import (
+    _filter_out_attached_builds,
+    _find_shipped_builds,
+    find_builds_konflux,
+    find_builds_konflux_all_types,
+)
+from flexmock import flexmock
+
+
+async def _async_return_val(val):
+    return val
 
 
 class TestFindBuildsCli(unittest.TestCase):
@@ -48,6 +58,75 @@ class TestFindBuildsCli(unittest.TestCase):
         actual = _find_shipped_builds(build_ids, mock.MagicMock())
         self.assertEqual(expected, actual)
         get_builds_tags.assert_called_once_with(build_ids, mock.ANY)
+
+
+class TestFindBuildsKonflux(IsolatedAsyncioTestCase):
+    @mock.patch("elliottlib.cli.find_builds_cli.KonfluxBuildRecord")
+    async def test_find_builds_konflux(self, MockKonfluxBuildRecord: mock.MagicMock):
+        runtime = flexmock(konflux_db=flexmock())
+        runtime.konflux_db.should_receive("bind").with_args(MockKonfluxBuildRecord)
+
+        image_meta_1 = MagicMock(base_only=False, is_release=True, is_payload=True, distgit_key="image1")
+        image_meta_1.branch_el_target.return_value = "el8"
+        image_meta_1.get_latest_build = AsyncMock(return_value={"nvr": "image1-1.0.0-1.el8"})
+
+        image_meta_2 = MagicMock(base_only=False, is_release=True, is_payload=False, distgit_key="image2")
+        image_meta_2.branch_el_target.return_value = "el9"
+        image_meta_2.get_latest_build = AsyncMock(return_value={"nvr": "image2-2.0.0-1.el9"})
+
+        runtime.should_receive("image_metas").and_return([image_meta_1, image_meta_2])
+        actual_records = await find_builds_konflux(runtime, payload=True)
+        self.assertEqual(len(actual_records), 1)
+        self.assertEqual(actual_records[0]['nvr'], "image1-1.0.0-1.el8")
+
+
+class TestFindBuildsKonfluxAllTypes(unittest.IsolatedAsyncioTestCase):
+    @mock.patch("elliottlib.cli.find_builds_cli.KonfluxBuildRecord")
+    @mock.patch("elliottlib.cli.find_builds_cli.KonfluxBundleBuildRecord")
+    async def test_find_builds_konflux_all_types(self, MockKonfluxBundleBuildRecord, MockKonfluxBuildRecord):
+        # Setup runtime and DB mocks
+        runtime = flexmock(konflux_db=flexmock())
+        runtime.konflux_db.should_receive("bind").with_args(MockKonfluxBuildRecord)
+        runtime.konflux_db.should_receive("bind").with_args(MockKonfluxBundleBuildRecord)
+
+        # Mock image metadata
+        image_meta_1 = MagicMock(
+            base_only=False, is_release=True, is_payload=True, is_olm_operator=False, distgit_key="image1"
+        )
+        image_meta_1.branch_el_target.return_value = "el8"
+        build_1 = MagicMock(nvr="image1-1.0.0-1.el8")
+        image_meta_1.get_latest_build = AsyncMock(return_value=build_1)
+
+        image_meta_2 = MagicMock(
+            base_only=False, is_release=True, is_payload=False, is_olm_operator=True, distgit_key="image2"
+        )
+        image_meta_2.branch_el_target.return_value = "el9"
+        build_2 = MagicMock(nvr="image2-2.0.0-1.el9")
+        image_meta_2.get_latest_build = AsyncMock(return_value=build_2)
+
+        # Mock OLM bundle search
+        build_3 = MagicMock(nvr="image2-bundle-2.0.0-1.el9")
+        runtime.konflux_db.should_receive("search_builds_by_fields").and_return(iter([build_3]))
+
+        runtime.should_receive("image_metas").and_return([image_meta_1, image_meta_2])
+
+        async def fake_anext(it, default):
+            try:
+                return next(it)
+            except StopIteration:
+                return default
+
+        with mock.patch("elliottlib.cli.find_builds_cli.anext", side_effect=fake_anext):
+            builds_map = await find_builds_konflux_all_types(runtime)
+
+        # Assertions
+        self.assertEqual(len(builds_map['payload']), 1)
+        self.assertEqual(builds_map['payload'][0], build_1.nvr)
+        self.assertEqual(len(builds_map['non_payload']), 1)
+        self.assertEqual(builds_map['non_payload'][0], build_2.nvr)
+        self.assertEqual(len(builds_map['olm_builds']), 1)
+        self.assertEqual(builds_map['olm_builds'][0], build_3.nvr)
+        self.assertEqual(len(builds_map['olm_builds_not_found']), 0)
 
 
 if __name__ == "__main__":

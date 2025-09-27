@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import re
 import shutil
 from collections import namedtuple
 from configparser import ConfigParser
@@ -13,16 +12,21 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import click
 import yaml
-
+from artcommonlib import exectools
 from artcommonlib.assembly import AssemblyTypes
 from artcommonlib.util import get_ocp_version_from_group
-from pyartcd import constants, exectools, locks, jenkins
+
+from pyartcd import constants, jenkins, locks
 from pyartcd.cli import cli, click_coroutine, pass_runtime
 from pyartcd.record import parse_record_log
 from pyartcd.runtime import Runtime
-from pyartcd.util import (get_assembly_type, isolate_el_version_in_branch,
-                          isolate_el_version_in_release, load_group_config,
-                          load_releases_config)
+from pyartcd.util import (
+    get_assembly_type,
+    isolate_el_version_in_branch,
+    isolate_el_version_in_release,
+    load_group_config,
+    load_releases_config,
+)
 
 
 class RebuildType(Enum):
@@ -35,10 +39,19 @@ PlashetBuildResult = namedtuple("PlashetBuildResult", ("repo_name", "local_dir",
 
 
 class RebuildPipeline:
-    """ Rebuilds a component for an assembly """
+    """Rebuilds a component for an assembly"""
 
-    def __init__(self, runtime: Runtime, group: str, assembly: str,
-                 type: RebuildType, dg_key: str, ocp_build_data_url: str, logger: Optional[logging.Logger] = None):
+    def __init__(
+        self,
+        runtime: Runtime,
+        group: str,
+        assembly: str,
+        plashet_remote: dict,
+        type: RebuildType,
+        dg_key: str,
+        ocp_build_data_url: str,
+        logger: Optional[logging.Logger] = None,
+    ):
         if type in [RebuildType.RPM, RebuildType.IMAGE] and not dg_key:
             raise ValueError("'dg_key' is required.")
         elif type == RebuildType.RHCOS and dg_key:
@@ -47,6 +60,7 @@ class RebuildPipeline:
         self.runtime = runtime
         self.group = group
         self.assembly = assembly
+        self.plashet_remote = plashet_remote
         self.type = type
         self.dg_key = dg_key
         self.logger = logger or runtime.logger
@@ -60,8 +74,9 @@ class RebuildPipeline:
         self._doozer_env_vars["DOOZER_WORKING_DIR"] = str(self.runtime.working_dir / "doozer-working")
 
         if not ocp_build_data_url:
-            ocp_build_data_url = self.runtime.config.get("build_config", {}).get("ocp_build_data_url",
-                                                                                 constants.OCP_BUILD_DATA_URL)
+            ocp_build_data_url = self.runtime.config.get("build_config", {}).get(
+                "ocp_build_data_url", constants.OCP_BUILD_DATA_URL
+            )
         if ocp_build_data_url:
             self._doozer_env_vars["DOOZER_DATA_PATH"] = ocp_build_data_url
 
@@ -69,11 +84,12 @@ class RebuildPipeline:
         timestamp = datetime.utcnow().strftime("%Y%m%d%H%M")
         release = f"{timestamp}.p?"
 
-        group_config = await load_group_config(self.group, self.assembly, env=self._doozer_env_vars,
-                                               doozer_data_path=self.ocp_build_data_url)
+        group_config = await load_group_config(
+            self.group, self.assembly, env=self._doozer_env_vars, doozer_data_path=self.ocp_build_data_url
+        )
         releases_config = await load_releases_config(
             group=self.group,
-            data_path=self.ocp_build_data_url
+            data_path=self.ocp_build_data_url,
         )
 
         if get_assembly_type(releases_config, self.assembly) == AssemblyTypes.STREAM:
@@ -109,9 +125,7 @@ class RebuildPipeline:
                 self._generate_repo_file_for_image(file, plashets, group_config["arches"])
 
             # Copies plashet repos out to ocp-artifacts
-            await asyncio.gather(*[
-                self._copy_plashet_out_to_remote(el_version, plashet[1]) for plashet in plashets
-            ])
+            await asyncio.gather(*[self._copy_plashet_out_to_remote(el_version, plashet[1]) for plashet in plashets])
 
             # Builds image
             nvrs = await self._build_image(plashets[-1][2] + "/rebuild.repo")
@@ -131,23 +145,36 @@ class RebuildPipeline:
                 self._generate_repo_file_for_rhcos(file, plashets)
 
             # Copies plashet repos out to ocp-artifacts
-            await asyncio.gather(*[
-                self._copy_plashet_out_to_remote(el_version, plashet[1]) for plashet in plashets
-            ])
+            await asyncio.gather(*[self._copy_plashet_out_to_remote(el_version, plashet[1]) for plashet in plashets])
 
             # Prints further instructions
-            click.secho(f"RHCOS build is not triggered by this job. Please manually run the individual rhcos build jobs on the arch-specific rhcos build clusters with the following Plashet repo:\n\t{plashets[-1][2]}/rebuild.repo", fg="yellow")
+            click.secho(
+                f"RHCOS build is not triggered by this job. Please manually run the individual rhcos build jobs on the arch-specific rhcos build clusters with the following Plashet repo:\n\t{plashets[-1][2]}/rebuild.repo",
+                fg="yellow",
+            )
 
         # Prints example schema
         if self.type in [RebuildType.RPM, RebuildType.IMAGE]:
-            click.secho("Build completes. Please update the assembly schema in releases.yaml to pin the following NVR(s) to the assembly:\n", fg="green")
+            click.secho(
+                "Build completes. Please update the assembly schema in releases.yaml to pin the following NVR(s) to the assembly:\n",
+                fg="green",
+            )
             for nvr in nvrs:
                 click.secho(f"\t{nvr}", fg="green")
             example_schema = yaml.safe_dump(self._generate_example_schema(nvrs))
             click.secho(f"\nExample schema:\n\n{example_schema}", fg="green")
 
-    async def _build_plashet_from_tags(self, name: str, directory_name: str, el_version: int, arches: List[str], tag_pvs: Iterable[Tuple[str, str]], embargoed_tags: Optional[Iterable[str]], signing_advisory: Optional[int]) -> PlashetBuildResult:
-        """ Builds Plashet repo with "from-tags"
+    async def _build_plashet_from_tags(
+        self,
+        name: str,
+        directory_name: str,
+        el_version: int,
+        arches: List[str],
+        tag_pvs: Iterable[Tuple[str, str]],
+        embargoed_tags: Optional[Iterable[str]],
+        signing_advisory: Optional[int],
+    ) -> PlashetBuildResult:
+        """Builds Plashet repo with "from-tags"
         :param name: Plashet repo name
         :param directory_name: Directory name for the plashet repo
         :param el_version: RHEL version
@@ -176,24 +203,34 @@ class RebuildPipeline:
         signing_mode = "signed"  # We assume rpms used in rebuild job should be always signed
         cmd = [
             "doozer",
-            "--data-path", self.ocp_build_data_url,
-            "--group", self.group,
-            "--assembly", self.assembly,
+            "--data-path",
+            self.ocp_build_data_url,
+            "--group",
+            self.group,
+            "--assembly",
+            self.assembly,
             "config:plashet",
-            "--base-dir", str(base_dir),
-            "--name", directory_name,
-            "--repo-subdir", "os"
+            "--base-dir",
+            str(base_dir),
+            "--name",
+            directory_name,
+            "--repo-subdir",
+            "os",
         ]
         for arch in arches:
             cmd.extend(["--arch", arch, signing_mode])
         major, minor = self._ocp_version
-        cmd.extend([
-            "from-tags",
-            "--signing-advisory-id", f"{signing_advisory or 54765}",
-            "--signing-advisory-mode", "clean",
-            "--include-embargoed",
-            "--inherit",
-        ])
+        cmd.extend(
+            [
+                "from-tags",
+                "--signing-advisory-id",
+                f"{signing_advisory or 54765}",
+                "--signing-advisory-mode",
+                "clean",
+                "--include-embargoed",
+                "--inherit",
+            ]
+        )
         if embargoed_tags:
             for t in embargoed_tags:
                 cmd.extend(["--embargoed-brew-tag", t])
@@ -207,14 +244,16 @@ class RebuildPipeline:
         else:
             await exectools.cmd_assert_async(cmd, env=self._doozer_env_vars)
 
-        remote_url = constants.PLASHET_REMOTE_URL + f"/{major}.{minor}"
+        remote_url = self.plashet_remote['url'] + f"/{major}.{minor}"
         if el_version >= 8:
             remote_url += f"-el{el_version}"
         remote_url += f"/{self.assembly}/{directory_name}"
         return PlashetBuildResult(name, plashet_dir, remote_url)
 
-    async def _build_plashet_for_assembly(self, name: str, directory_name: str, el_version: int, arches: List[str], signing_advisory: Optional[int]) -> PlashetBuildResult:
-        """ Builds Plashet with "for-assembly"
+    async def _build_plashet_for_assembly(
+        self, name: str, directory_name: str, el_version: int, arches: List[str], signing_advisory: Optional[int]
+    ) -> PlashetBuildResult:
+        """Builds Plashet with "for-assembly"
         :param name: Plashet repo name
         :param directory_name: Directory name for the plashet repo
         :param el_version: RHEL version
@@ -236,22 +275,33 @@ class RebuildPipeline:
         signing_mode = "signed"  # We assume rpms used in rebuild job should be always signed
         cmd = [
             "doozer",
-            "--data-path", self.ocp_build_data_url,
-            "--group", self.group,
-            "--assembly", self.assembly,
+            "--data-path",
+            self.ocp_build_data_url,
+            "--group",
+            self.group,
+            "--assembly",
+            self.assembly,
             "config:plashet",
-            "--base-dir", str(base_dir),
-            "--name", directory_name,
-            "--repo-subdir", "os"
+            "--base-dir",
+            str(base_dir),
+            "--name",
+            directory_name,
+            "--repo-subdir",
+            "os",
         ]
         for arch in arches:
             cmd.extend(["--arch", arch, signing_mode])
-        cmd.extend([
-            "for-assembly",
-            "--signing-advisory-id", f"{signing_advisory or 54765}",
-            "--signing-advisory-mode", "clean",
-            "--el-version", f"{el_version}",
-        ])
+        cmd.extend(
+            [
+                "for-assembly",
+                "--signing-advisory-id",
+                f"{signing_advisory or 54765}",
+                "--signing-advisory-mode",
+                "clean",
+                "--el-version",
+                f"{el_version}",
+            ]
+        )
         if self.type == RebuildType.IMAGE:
             cmd.extend(["--image", self.dg_key])
         elif self.type == RebuildType.RHCOS:
@@ -265,15 +315,16 @@ class RebuildPipeline:
             await exectools.cmd_assert_async(cmd, env=self._doozer_env_vars)
 
         major, minor = self._ocp_version
-        remote_url = constants.PLASHET_REMOTE_URL + f"/{major}.{minor}"
+        remote_url = self.plashet_remote['url'] + f"/{major}.{minor}"
         if el_version >= 8:
             remote_url += f"-el{el_version}"
         remote_url += f"/{self.assembly}/{directory_name}"
         return PlashetBuildResult(name, plashet_dir, remote_url)
 
-    async def _copy_plashet_out_to_remote(self, el_version: int, local_plashet_dir: os.PathLike, symlink_name: Optional[str] = None):
-        """ Copies plashet out to remote host (ocp-artifacts)
-        """
+    async def _copy_plashet_out_to_remote(
+        self, el_version: int, local_plashet_dir: os.PathLike, symlink_name: Optional[str] = None
+    ):
+        """Copies plashet out to remote host (ocp-artifacts)"""
         # Make sure the remote base dir exist
         major, minor = self._ocp_version
         remote_dir = f"{constants.PLASHET_REMOTE_BASE_DIR}/{major}.{minor}"
@@ -282,7 +333,7 @@ class RebuildPipeline:
         remote_dir += f"/{self.assembly}"
         cmd = [
             "ssh",
-            constants.PLASHET_REMOTE_HOST,
+            self.plashet_remote['host'],
             "--",
             "mkdir",
             "-p",
@@ -307,7 +358,7 @@ class RebuildPipeline:
             "--perms",
             "--",
             f"{local_plashet_dir}",
-            f"{constants.PLASHET_REMOTE_HOST}:{remote_dir}"
+            f"{self.plashet_remote['host']}:{remote_dir}",
         ]
         if self.runtime.dry_run:
             self.logger.warning("[DRY RUN] Would have run %s", cmd)
@@ -318,7 +369,7 @@ class RebuildPipeline:
             # Make a symlink
             cmd = [
                 "ssh",
-                constants.PLASHET_REMOTE_HOST,
+                self.plashet_remote['host'],
                 "--",
                 "ln",
                 "-sfn",
@@ -331,8 +382,10 @@ class RebuildPipeline:
             else:
                 await exectools.cmd_assert_async(cmd)
 
-    async def _build_plashets(self, timestamp: str, el_version: int, group_config: Dict, image_config: Optional[Dict]) -> List[PlashetBuildResult]:
-        """ Build plashet repos and return the URL to rebuild.repo
+    async def _build_plashets(
+        self, timestamp: str, el_version: int, group_config: Dict, image_config: Optional[Dict]
+    ) -> List[PlashetBuildResult]:
+        """Build plashet repos and return the URL to rebuild.repo
         :return: A List of tuples in the form of (repo_name, plashet_dir, plashet_url).
         """
         major, minor = self._ocp_version
@@ -342,7 +395,9 @@ class RebuildPipeline:
             f"rhel-{el_version}-server-ose-rpms-embargoed": (
                 "basis",  # directory name suffix for the basis plashet repo
                 f"rhaos-{major}.{minor}-rhel-{el_version}-candidate",  # brew tag
-                f"OSE-{major}.{minor}-RHEL-{el_version}" if el_version >= 8 else f"RHEL-{el_version}-OSE-{major}.{minor}",  # product version
+                f"OSE-{major}.{minor}-RHEL-{el_version}"
+                if el_version >= 8
+                else f"RHEL-{el_version}-OSE-{major}.{minor}",  # product version
             ),
             f"rhel-{el_version}-server-ironic-rpms": (
                 "ironic",  # directory name suffix for the basis plashet repo
@@ -362,30 +417,68 @@ class RebuildPipeline:
             for repo in repos:
                 plashet_config = PLASHET_CONFIGS[repo]
                 basis_repo_dir = f"{self.assembly}-{timestamp}-image-{self.dg_key}-{plashet_config[0]}"
-                self.logger.info("Building basis plashet repo %s from Brew tag %s for image %s...", basis_repo_dir, plashet_config[1], self.dg_key)
-                plashets.append(await self._build_plashet_from_tags(repo, basis_repo_dir, el_version, arches, (plashet_config[1:3],), EMBARGOED_TAGS, signing_advisory))
+                self.logger.info(
+                    "Building basis plashet repo %s from Brew tag %s for image %s...",
+                    basis_repo_dir,
+                    plashet_config[1],
+                    self.dg_key,
+                )
+                plashets.append(
+                    await self._build_plashet_from_tags(
+                        repo,
+                        basis_repo_dir,
+                        el_version,
+                        arches,
+                        (plashet_config[1:3],),
+                        EMBARGOED_TAGS,
+                        signing_advisory,
+                    )
+                )
             # Build "overrides" plashet repo with "for-assembly"
             overrides_repo_dir = f"{self.assembly}-{timestamp}-image-{self.dg_key}-overrides"
             self.logger.info("Building overrides plashet repo %s from for image %s...", overrides_repo_dir, self.dg_key)
-            plashets.append(await self._build_plashet_for_assembly("plashet-rebuild-overrides", overrides_repo_dir, el_version, arches, signing_advisory))
+            plashets.append(
+                await self._build_plashet_for_assembly(
+                    "plashet-rebuild-overrides", overrides_repo_dir, el_version, arches, signing_advisory
+                )
+            )
         elif self.type == RebuildType.RHCOS:
             plashet_config = PLASHET_CONFIGS[f"rhel-{el_version}-server-ose-rpms-embargoed"]
             basis_repo_dir = f"{self.assembly}-{timestamp}-rhcos-{plashet_config[0]}"
             overrides_repo_dir = f"{self.assembly}-{timestamp}-rhcos-overrides"
             # Build "basis" plashet repo with "from-tags"
-            self.logger.info("Building basis plashet repo %s from Brew tag %s for RHCOS...", basis_repo_dir, plashet_config[1])
-            plashets.append(await self._build_plashet_from_tags("plashet-rebuild-basis", basis_repo_dir, el_version, arches, (plashet_config[1:3],), EMBARGOED_TAGS, signing_advisory))
+            self.logger.info(
+                "Building basis plashet repo %s from Brew tag %s for RHCOS...", basis_repo_dir, plashet_config[1]
+            )
+            plashets.append(
+                await self._build_plashet_from_tags(
+                    "plashet-rebuild-basis",
+                    basis_repo_dir,
+                    el_version,
+                    arches,
+                    (plashet_config[1:3],),
+                    EMBARGOED_TAGS,
+                    signing_advisory,
+                )
+            )
             # Build "overrides" plashet repo with "for-assembly"
             self.logger.info("Building overrides plashet repo %s from for RHCOS...", overrides_repo_dir)
-            plashets.append(await self._build_plashet_for_assembly("plashet-rebuild-overrides", overrides_repo_dir, el_version, arches, signing_advisory))
+            plashets.append(
+                await self._build_plashet_for_assembly(
+                    "plashet-rebuild-overrides", overrides_repo_dir, el_version, arches, signing_advisory
+                )
+            )
         else:
             raise ValueError(f"Building plashets for component type {self.type} is not supported.")
 
         return plashets
 
     def _generate_repo_file_for_image(self, file: TextIOWrapper, plashets: Iterable[PlashetBuildResult], arches):
-        # Copy content of .oit/signed.repo in the distgit repo
-        source_path = Path(self._doozer_env_vars["DOOZER_WORKING_DIR"]) / f"distgits/containers/{self.dg_key}/.oit/signed.repo"
+        # Copy content of .oit/art-signed.repo in the distgit repo
+        source_path = (
+            Path(self._doozer_env_vars["DOOZER_WORKING_DIR"])
+            / f"distgits/containers/{self.dg_key}/.oit/art-signed.repo"
+        )
         repo_content = source_path.read_text()
 
         yum_repos = ConfigParser()
@@ -404,27 +497,33 @@ class RebuildPipeline:
             yum_repos[repo_name]["baseurl"] = f"{repo_url}/$basearch/os"
             yum_repos[repo_name]["enabled"] = "1"
             if repo_name == "plashet-rebuild-overrides":
-                yum_repos[repo_name]["gpgcheck"] = "0"  # We might have include beta signed / unsigned rpms for overrides
+                yum_repos[repo_name]["gpgcheck"] = (
+                    "0"  # We might have include beta signed / unsigned rpms for overrides
+                )
                 yum_repos[repo_name]["priority"] = "1"  # https://wiki.centos.org/PackageManagement/Yum/Priorities
             else:
                 yum_repos[repo_name]["gpgcheck"] = "1"
                 yum_repos[repo_name]["gpgkey"] = "file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release"
 
-        file.writelines([
-            "# These repositories are generated by the OpenShift Automated Release Team\n",
-            "# https://issues.redhat.com/browse/ART-3154\n",
-            "\n",
-        ])
+        file.writelines(
+            [
+                "# These repositories are generated by the OpenShift Automated Release Team\n",
+                "# https://issues.redhat.com/browse/ART-3154\n",
+                "\n",
+            ]
+        )
         yum_repos.write(file)
 
     def _generate_repo_file_for_rhcos(self, file: TextIOWrapper, plashets: Iterable[PlashetBuildResult]):
         # Generate repo entry for plashet-A
         # See https://gitlab.cee.redhat.com/coreos/redhat-coreos/-/blob/4.7/rhaos.repo
-        file.writelines([
-            "# These repositories are generated by the OpenShift Automated Release Team\n",
-            "# https://issues.redhat.com/browse/ART-3154\n",
-            "\n",
-        ])
+        file.writelines(
+            [
+                "# These repositories are generated by the OpenShift Automated Release Team\n",
+                "# https://issues.redhat.com/browse/ART-3154\n",
+                "\n",
+            ]
+        )
         yum_repos = ConfigParser()
         for repo_name, _, repo_url in plashets:
             yum_repos[repo_name] = {}
@@ -441,10 +540,14 @@ class RebuildPipeline:
         self.logger.info("Determining distgit branch for image %s...", self.dg_key)
         cmd = [
             "doozer",
-            "--data-path", self.ocp_build_data_url,
-            "--group", self.group,
-            "--assembly", self.assembly,
-            "-i", self.dg_key,
+            "--data-path",
+            self.ocp_build_data_url,
+            "--group",
+            self.group,
+            "--assembly",
+            self.assembly,
+            "-i",
+            self.dg_key,
             "config:print",
             "--yaml",
         ]
@@ -453,7 +556,7 @@ class RebuildPipeline:
         return config
 
     async def _rebase_image(self, release: str):
-        """ Rebases image
+        """Rebases image
         :param release: release field for rebase
         """
         # rebase
@@ -461,36 +564,48 @@ class RebuildPipeline:
         version = f"v{major}.{minor}"
         cmd = [
             "doozer",
-            "--data-path", self.ocp_build_data_url,
-            "--group", self.group,
-            "--assembly", self.assembly,
+            "--data-path",
+            self.ocp_build_data_url,
+            "--group",
+            self.group,
+            "--assembly",
+            self.assembly,
             "--latest-parent-version",
-            "-i", self.dg_key,
+            "-i",
+            self.dg_key,
             "images:rebase",
-            "--version", version,
-            "--release", release,
+            "--version",
+            version,
+            "--release",
+            release,
             "--force-yum-updates",
-            "--message", f"Updating Dockerfile version and release {version}-{release}",
+            "--message",
+            f"Updating Dockerfile version and release {version}-{release}",
         ]
         if not self.runtime.dry_run:
             cmd.append("--push")
         await exectools.cmd_assert_async(cmd, env=self._doozer_env_vars)
 
     async def _build_image(self, repo_url: str) -> List[str]:
-        """ Builds image
+        """Builds image
         :param plashet_url: Plashet URL
         :return: NVRs
         """
         # build
         cmd = [
             "doozer",
-            "--data-path", self.ocp_build_data_url,
-            "--group", self.group,
-            "--assembly", self.assembly,
+            "--data-path",
+            self.ocp_build_data_url,
+            "--group",
+            self.group,
+            "--assembly",
+            self.assembly,
             "--latest-parent-version",
-            "-i", self.dg_key,
+            "-i",
+            self.dg_key,
             "images:build",
-            "--repo", repo_url,
+            "--repo",
+            repo_url,
         ]
         if self.runtime.dry_run:
             cmd.append("--dry-run")
@@ -505,20 +620,26 @@ class RebuildPipeline:
             return record_log["build"][-1]["nvrs"].split(",")
 
     async def _rebase_and_build_rpm(self, release: str) -> List[str]:
-        """ Rebase and build RPM
+        """Rebase and build RPM
         :param release: release field for rebase
         :return: NVRs
         """
         major, minor = self._ocp_version
         cmd = [
             "doozer",
-            "--data-path", self.ocp_build_data_url,
-            "--group", self.group,
-            "--assembly", self.assembly,
-            "-r", self.dg_key,
+            "--data-path",
+            self.ocp_build_data_url,
+            "--group",
+            self.group,
+            "--assembly",
+            self.assembly,
+            "-r",
+            self.dg_key,
             "rpms:rebase-and-build",
-            "--version", f"{major}.{minor}",
-            "--release", release,
+            "--version",
+            f"{major}.{minor}",
+            "--release",
+            release,
         ]
         if self.runtime.dry_run:
             cmd.append("--dry-run")
@@ -555,57 +676,99 @@ class RebuildPipeline:
                                 {
                                     "distgit_key": self.dg_key,
                                     "metadata": {
-                                        "is": is_entry
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                }
-            }
+                                        "is": is_entry,
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                },
+            },
         }
         return schema
 
 
 @cli.command("rebuild")
-@click.option("--ocp-build-data-url", metavar='BUILD_DATA', default=None,
-              help=f"Git repo or directory containing groups metadata e.g. {constants.OCP_BUILD_DATA_URL}")
+@click.option(
+    "--ocp-build-data-url",
+    metavar='BUILD_DATA',
+    default=None,
+    help=f"Git repo or directory containing groups metadata e.g. {constants.OCP_BUILD_DATA_URL}",
+)
 @click.option("--version", required=True, help="OSE Version")
-@click.option("--assembly", metavar="ASSEMBLY_NAME", required=True,
-              help="The name of an assembly to rebase & build for. e.g. 4.9.1")
-@click.option("--type", metavar="BUILD_TYPE", required=True,
-              type=click.Choice(("rpm", "image", "rhcos")),
-              help="image or rpm or rhcos")
-@click.option("--component", "-c", metavar="DISTGIT_KEY",
-              help="The name of a component to rebase & build for. e.g. openshift-enterprise-cli")
-@click.option('--ignore-locks', is_flag=True, default=False,
-              help='Do not wait for other builds in this version to complete (use only if you know they will not conflict)')
+@click.option(
+    "--assembly",
+    metavar="ASSEMBLY_NAME",
+    required=True,
+    help="The name of an assembly to rebase & build for. e.g. 4.9.1",
+)
+@click.option(
+    "--type",
+    metavar="BUILD_TYPE",
+    required=True,
+    type=click.Choice(("rpm", "image", "rhcos")),
+    help="image or rpm or rhcos",
+)
+@click.option(
+    "--component",
+    "-c",
+    metavar="DISTGIT_KEY",
+    help="The name of a component to rebase & build for. e.g. openshift-enterprise-cli",
+)
+@click.option(
+    '--ignore-locks',
+    is_flag=True,
+    default=False,
+    help='Do not wait for other builds in this version to complete (use only if you know they will not conflict)',
+)
 @pass_runtime
 @click_coroutine
-async def rebuild(runtime: Runtime, ocp_build_data_url: str, version: str, assembly: str, type: str,
-                  component: Optional[str], ignore_locks: bool):
-
+async def rebuild(
+    runtime: Runtime,
+    ocp_build_data_url: str,
+    version: str,
+    assembly: str,
+    type: str,
+    component: Optional[str],
+    ignore_locks: bool,
+):
     if type != "rhcos" and not component:
         raise click.BadParameter(f"'--component' is required for type {type}")
     elif type == "rhcos" and component:
         raise click.BadParameter("Option '--component' cannot be used when --type == 'rhcos'")
-    pipeline = RebuildPipeline(runtime, group=f'openshift-{version}', assembly=assembly, type=RebuildType[type.upper()],
-                               dg_key=component, ocp_build_data_url=ocp_build_data_url)
+    pipelines = [
+        RebuildPipeline(
+            runtime,
+            group=f'openshift-{version}',
+            assembly=assembly,
+            plashet_remote=remote,
+            type=RebuildType[type.upper()],
+            dg_key=component,
+            ocp_build_data_url=ocp_build_data_url,
+        )
+        for remote in constants.PLASHET_REMOTES
+    ]
 
     if ignore_locks:
-        await pipeline.run()
+        await asyncio.gather(*[pipeline.run() for pipeline in pipelines])
 
     else:
         lock = locks.Lock.BUILD
         lock_name = lock.value.format(version=version)
         lock_identifier = jenkins.get_build_path()
         if not lock_identifier:
-            runtime.logger.warning('Env var BUILD_URL has not been defined: '
-                                   'a random identifier will be used for the locks')
+            runtime.logger.warning(
+                'Env var BUILD_URL has not been defined: a random identifier will be used for the locks'
+            )
 
-        await locks.run_with_lock(
-            coro=pipeline.run(),
-            lock=lock,
-            lock_name=lock_name,
-            lock_id=lock_identifier
+        await asyncio.gather(
+            *[
+                locks.run_with_lock(
+                    coro=pipeline.run(),
+                    lock=lock,
+                    lock_name=lock_name,
+                    lock_id=lock_identifier,
+                )
+                for pipeline in pipelines
+            ]
         )

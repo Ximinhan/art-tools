@@ -1,14 +1,13 @@
-
 import json
 import os
 import traceback
 from typing import Optional
 
 import click
-
-from artcommonlib import redis
+from artcommonlib import exectools, redis
 from artcommonlib.util import isolate_major_minor_in_group
-from pyartcd import constants, exectools
+
+from pyartcd import constants
 from pyartcd.cli import cli, click_coroutine, pass_runtime
 from pyartcd.jenkins import get_build_url
 from pyartcd.runtime import Runtime
@@ -55,7 +54,9 @@ class TagRPMsPipeline:
                     for nvr in nvrs:
                         message += f"\t{nvr}\n"
                 if untagged:
-                    message += "Builds were untagged because they were tagged into the stop-ship tags.\n\n"
+                    message += "Builds were untagged because they were tagged into the stop-ship tags. Notify ota-monitor on Slack channel #forum-release if a release contains this build is already promoted.\n"
+                    message += "May need to manually trigger builds of kernel carryin images like `driver-toolkit` and `ironic-rhcos-downloader`.\n\n"
+                    await self.slack_client.say(f":alert-siren: Hi @release-artists ,\n{message}")
             if report["tagged"]:
                 for tag, nvrs in report["tagged"].items():
                     if not nvrs:
@@ -67,22 +68,22 @@ class TagRPMsPipeline:
                     message += f"To revert, run `brew untag {tag} {' '.join(nvrs)}`.\n"
                 if tagged:
                     message += "If you untag a build manually, it will not be re-tagged by this job again.\n\n"
-            if untagged or tagged:  # Don't spam release-artists if nothing changed
-                await self.slack_client.say(f":white_check_mark: Hi @release-artists ,\n{message}")
+                    await self.slack_client.say(f":white_check_mark: New rpm tagged! \n{message}")
         except Exception as err:
             error_message = f"Error running tag-rpms: {err}\n {traceback.format_exc()}"
             self.logger.error(error_message)
-            await self.slack_client.say(":warning: Error running tag-rpms")
             raise
 
     async def tag_rpms(self):
-        """ run doozer config:tag-rpms
+        """run doozer config:tag-rpms
         :return: a dict containing which packages have been tagged and untagged
         """
         cmd = [
             "doozer",
-            "--group", self.group,
-            "--assembly", "stream",
+            "--group",
+            self.group,
+            "--assembly",
+            "stream",
             "config:tag-rpms",
             "--json",
         ]
@@ -111,15 +112,25 @@ class TagRPMsPipeline:
 
         # Notify ART
         if fail_count % ART_NOTIFY_FREQUENCY == 0:
-            await self.slack_client.say(f'tag_rpms for {self.group} failed {fail_count} times. '
-                                        f'See <{self.job_run}|job> logs for details"')
+            await self.slack_client.say(
+                f'tag_rpms for {self.group} failed {fail_count} times. See <{self.job_run}|job> logs for details"'
+            )
 
 
 @cli.command("tag-rpms", short_help="Tag and untag rpms for rpm delivery")
-@click.option("--data-path", metavar='BUILD_DATA', default=None,
-              help=f"Git repo or directory containing groups metadata e.g. {constants.OCP_BUILD_DATA_URL}")
-@click.option("-g", "--group", metavar='NAME', required=True,
-              help="The group of components on which to operate. e.g. openshift-4.12")
+@click.option(
+    "--data-path",
+    metavar='BUILD_DATA',
+    default=None,
+    help=f"Git repo or directory containing groups metadata e.g. {constants.OCP_BUILD_DATA_URL}",
+)
+@click.option(
+    "-g",
+    "--group",
+    metavar='NAME',
+    required=True,
+    help="The group of components on which to operate. e.g. openshift-4.12",
+)
 @pass_runtime
 @click_coroutine
 async def tag_rpms_cli(runtime: Runtime, data_path: Optional[str], group: str):

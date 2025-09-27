@@ -1,12 +1,12 @@
-import click
 import sys
 import traceback
 
+import click
 from artcommonlib import logutil
+
 from elliottlib import Runtime
 from elliottlib.cli.common import cli
 from elliottlib.cli.find_bugs_sweep_cli import FindBugsMode
-
 
 LOGGER = logutil.get_logger(__name__)
 
@@ -20,19 +20,16 @@ class FindBugsQE(FindBugsMode):
 
 
 @cli.command("find-bugs:qe", short_help="Change MODIFIED bugs to ON_QA")
-@click.option("--noop", "--dry-run",
-              is_flag=True,
-              default=False,
-              help="Don't change anything")
+@click.option("--noop", "--dry-run", is_flag=True, default=False, help="Don't change anything")
 @click.pass_obj
 def find_bugs_qe_cli(runtime: Runtime, noop):
     """Find MODIFIED bugs for the target-releases, and set them to ON_QA.
-    with a release comment on each bug
+        with a release comment on each bug
 
-\b
-    $ elliott -g openshift-4.6 find-bugs:qe
+    \b
+        $ elliott -g openshift-4.6 find-bugs:qe
 
-"""
+    """
     runtime.initialize()
     find_bugs_obj = FindBugsQE()
     exit_code = 0
@@ -57,7 +54,8 @@ def find_bugs_qe(runtime, find_bugs_obj, noop, bug_tracker):
 
     release_comment = (
         "An ART build cycle completed after this fix was made, which usually means it can be"
-        f" expected in the next created {major_version}.{minor_version} nightly and release.")
+        f" expected in the next created {major_version}.{minor_version} nightly and release."
+    )
     for bug in bugs:
         updated = bug_tracker.update_bug_status(bug, 'ON_QA', comment=release_comment, noop=noop)
         if updated:
@@ -70,11 +68,22 @@ def find_bugs_qe(runtime, find_bugs_obj, noop, bug_tracker):
     """
                 bug_tracker.add_comment(bug.id, comment, private=True, noop=noop)
 
+                # get summary of tracker bug and update it if needed
+                if not bug.has_valid_target_version_in_summary(major_version, minor_version):
+                    new_s = bug.make_summary_with_target_version(major_version, minor_version)
+                    LOGGER.info(f"Updating summary for bug {bug.id} from '{bug.summary}' to '{new_s}'")
+                    try:
+                        bug.update_summary(new_s, noop=noop)
+                    except Exception as e:
+                        LOGGER.warning("Failed to fix summary: %s", str(e))
+
             elif bug_tracker.type == 'jira':
                 # If a security level is specified, the bug won't be visible on advisories
                 # Make this explicit in the bug comment. Not applicable for security trackers/flaw bugs
                 security_level = bug.security_level
                 if security_level:
-                    comment = "This is not a public issue, the customer visible advisory will not link the fix." \
-                              "Setting the Security Level to public before the advisory ships will have it included"
+                    comment = (
+                        "This is not a public issue, the customer visible advisory will not link the fix."
+                        "Setting the Security Level to public before the advisory ships will have it included"
+                    )
                     bug_tracker.add_comment(bug.id, comment, private=True, noop=noop)

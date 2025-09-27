@@ -4,14 +4,16 @@ import os
 import time
 from enum import Enum
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 import requests
+from jenkinsapi.build import Build
+from jenkinsapi.custom_exceptions import NotFound
 from jenkinsapi.jenkins import Jenkins
 from jenkinsapi.job import Job
 from jenkinsapi.queue import QueueItem
-from jenkinsapi.build import Build
 from jenkinsapi.utils.crumb_requester import CrumbRequester
-from jenkinsapi.custom_exceptions import NotFound
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 from pyartcd import constants
 
@@ -24,13 +26,22 @@ jenkins_client: Optional[Jenkins] = None
 
 class Jobs(Enum):
     BUILD_SYNC = 'aos-cd-builds/build%2Fbuild-sync'
+    BUILD_SYNC_KONFLUX = 'aos-cd-builds/build%2Fbuild-sync-konflux'
     BUILD_MICROSHIFT = 'aos-cd-builds/build%2Fbuild-microshift'
+    BUILD_MICROSHIFT_BOOTC = 'aos-cd-builds/build%2Fbuild-microshift-bootc'
     OCP4 = 'aos-cd-builds/build%2Focp4'
+    OCP4_KONFLUX = 'aos-cd-builds/build%2Focp4-konflux'
+    OCP4_SCAN = 'aos-cd-builds/build%2Focp4_scan'
+    OCP4_SCAN_KONFLUX = 'aos-cd-builds/build%2Focp4-scan-konflux'
     RHCOS = 'aos-cd-builds/build%2Frhcos'
     OLM_BUNDLE = 'aos-cd-builds/build%2Folm_bundle'
+    OLM_BUNDLE_KONFLUX = 'aos-cd-builds/build%2Folm_bundle_konflux'
     SYNC_FOR_CI = 'scheduled-builds/sync-for-ci'
     MICROSHIFT_SYNC = 'aos-cd-builds/build%2Fmicroshift_sync'
     CINCINNATI_PRS = 'aos-cd-builds/build%2Fcincinnati-prs'
+    RHCOS_SYNC = 'aos-cd-builds/build%2Frhcos_sync'
+    BUILD_PLASHETS = 'aos-cd-builds/build%2Fbuild-plashets'
+    BUILD_FBC = 'aos-cd-builds/build%2Fbuild-fbc'
 
 
 def get_jenkins_url():
@@ -49,7 +60,7 @@ def init_jenkins():
     requester = CrumbRequester(
         username=os.environ['JENKINS_SERVICE_ACCOUNT'],
         password=os.environ['JENKINS_SERVICE_ACCOUNT_TOKEN'],
-        baseurl=jenkins_url
+        baseurl=jenkins_url,
     )
 
     jenkins_client = Jenkins(
@@ -57,7 +68,8 @@ def init_jenkins():
         username=os.environ['JENKINS_SERVICE_ACCOUNT'],
         password=os.environ['JENKINS_SERVICE_ACCOUNT_TOKEN'],
         requester=requester,
-        lazy=True
+        lazy=True,
+        timeout=60,
     )
     logger.info('Connected to Jenkins server %s', jenkins_client.base_server_url())
 
@@ -98,6 +110,79 @@ def get_build_id_from_url(build_url: str) -> int:
 
 def get_job_name():
     return os.environ.get("JOB_NAME")
+
+
+def get_job_name_and_build_number_from_path(build_path: str) -> tuple[Optional[str], Optional[str]]:
+    if not build_path:
+        logger.warning('Empty build path received')
+        return None, None
+
+    path = build_path
+    if build_path.startswith('http://') or build_path.startswith('https://'):
+        path = urlparse(build_path).path
+
+    # path is now something like '/job/aos-cd-builds/job/build%252Focp4-konflux/16686/'
+    path = path.strip('/')
+
+    try:
+        job_path_str, build_number = path.rsplit("/", 1)
+    except ValueError:
+        logger.warning('Invalid build path: %s', build_path)
+        return None, None
+
+    # If job_path_str is like 'job/aos-cd-builds/job/build%2Focp4-konflux'
+    # We need to convert it to a job name like 'aos-cd-builds/build%2Focp4-konflux'
+    job_name = job_path_str
+    if job_name.startswith('job/'):
+        job_name = job_name[4:]
+    job_name = job_name.replace('/job/', '/')
+
+    # The job name from URL path is double-encoded. We need to decode it once.
+    job_name = unquote(job_name)
+
+    return job_name, build_number
+
+
+def get_build_parameters(build_path: str) -> Optional[dict]:
+    """
+    Fetches build data using API endpoint {JENKINS_SERVER_URL}/{BUILD_PATH}/api/json
+    and returns the build parameters
+    """
+
+    init_jenkins()
+
+    job_name, build_number = get_job_name_and_build_number_from_path(build_path)
+    if not job_name:
+        return None
+
+    try:
+        job = jenkins_client.get_job(job_name)
+    except (requests.exceptions.HTTPError, NotFound) as err:
+        # Check for 404
+        if isinstance(err, requests.exceptions.HTTPError):
+            if err.response.status_code == 404:
+                logger.warning('Job %s not found', job_name)
+                return None
+        else:  # issubclass(type(err), NotFound)
+            logger.warning('Job %s not found', job_name)
+            return None
+        # Reraise other errors
+        raise
+
+    try:
+        build = job.get_build(int(build_number))
+    except (NotFound, ValueError):
+        return None
+
+    params = {}
+    build_data = build._data
+    for action in build_data.get('actions', []):
+        if action.get('_class') == 'hudson.model.ParametersAction':
+            for param in action.get('parameters', []):
+                if 'value' in param:
+                    params[param['name']] = param['value']
+            break  # Found parameters, no need to check other actions
+    return params
 
 
 def check_env_vars(func):
@@ -144,8 +229,10 @@ def wait_until_building(queue_item: QueueItem, job: Job, delay: int = 5) -> Buil
     jenkins_url = get_jenkins_url()
     triggered_build_url = triggered_build_url.replace(constants.JENKINS_UI_URL, jenkins_url)
     triggered_build = Build(url=triggered_build_url, buildno=get_build_id_from_url(triggered_build_url), job=job)
-    description = f'Started by upstream project <b>{current_job_name}</b> ' \
-                  f'build number <a href="{current_build_url}">{get_build_id_from_url(current_build_url)}</a><br><br>'
+    description = (
+        f'Started by upstream project <b>{current_job_name}</b> '
+        f'build number <a href="{current_build_url}">{get_build_id_from_url(current_build_url)}</a><br><br>'
+    )
     set_build_description(triggered_build, description)
 
     return triggered_build
@@ -156,17 +243,16 @@ def set_build_description(build: Build, description: str):
         f'{build.baseurl}/submitDescription',
         params={
             'Submit': 'submit',
-            'description': description
+            'description': description,
         },
         data="",
-        valid=[200]
+        valid=[200],
     )
 
 
 def is_build_running(build_path: str) -> bool:
     """
     Fetches build data using API endpoint {JENKINS_SERVER_URL}/{BUILD_PATH}/api/json
-    E.g. https://art-jenkins.apps.prod-stable-spoke1-dc-iad2.itup.redhat.com/job/aos-cd-builds/job/build%252Focp4/46902/api/json
 
     The resulting JSON has a field called "inProgress" that is true if the build is still ongoing
 
@@ -176,27 +262,36 @@ def is_build_running(build_path: str) -> bool:
     """
 
     init_jenkins()
-    job_path, build_number = build_path.rstrip("/").rsplit("/", 1)
-    job_name = job_path.rsplit("/", 1)[1]
-    job_url = jenkins_client.base_server_url() + "/" + job_path
+
+    job_name, build_number = get_job_name_and_build_number_from_path(build_path)
+    if not job_name:
+        return False
+
     try:
-        job = Job(job_url, job_name, jenkins_client)
-    except requests.exceptions.HTTPError as err:
-        if err.response.status_code == 404:
+        job = jenkins_client.get_job(job_name)
+    except (requests.exceptions.HTTPError, NotFound) as err:
+        if isinstance(err, requests.exceptions.HTTPError):
+            if err.response.status_code == 404:
+                return False
+        else:
             return False
         raise
+
     try:
         build = job.get_build(int(build_number))
-    except NotFound:
+    except (NotFound, ValueError):
         return False
     return build.is_running()
 
 
 @check_env_vars
-def start_build(job: Jobs, params: dict,
-                block_until_building: bool = True,
-                block_until_complete: bool = False,
-                watch_building_delay: int = 5) -> Optional[str]:
+def start_build(
+    job: Jobs,
+    params: dict,
+    block_until_building: bool = True,
+    block_until_complete: bool = False,
+    watch_building_delay: int = 5,
+) -> Optional[str]:
     """
     Starts a new Jenkins build
 
@@ -234,11 +329,12 @@ def start_build(job: Jobs, params: dict,
     return result
 
 
-def start_ocp4(build_version: str, assembly: str, rpm_list: list,
-               image_list: list, comment_on_pr: bool, **kwargs) -> Optional[str]:
+def start_ocp4(
+    build_version: str, assembly: str, rpm_list: list, image_list: list, comment_on_pr: bool, **kwargs
+) -> Optional[str]:
     params = {
         'BUILD_VERSION': build_version,
-        'ASSEMBLY': assembly
+        'ASSEMBLY': assembly,
     }
 
     # If any rpm/image changed, force a build with only changed sources
@@ -268,20 +364,85 @@ def start_ocp4(build_version: str, assembly: str, rpm_list: list,
     return start_build(
         job=Jobs.OCP4,
         params=params,
-        **kwargs
+        **kwargs,
     )
 
 
-def start_rhcos(build_version: str, new_build: bool, **kwargs) -> Optional[str]:
+def start_ocp4_konflux(
+    build_version: str,
+    assembly: str,
+    image_list: list,
+    rpm_list: list = None,
+    limit_arches: list = None,
+    **kwargs,
+) -> Optional[str]:
+    params = {
+        'BUILD_VERSION': build_version,
+        'ASSEMBLY': assembly,
+    }
+
+    # Build only changed images or none
+    if image_list:
+        params['IMAGE_LIST'] = ','.join(image_list)
+
+    # Build changed RPMs if any
+    if rpm_list:
+        params['RPM_BUILD_STRATEGY'] = 'only'
+        params['RPM_LIST'] = ','.join(rpm_list)
+
+    # Limit arches when requested
+    if limit_arches:
+        params['LIMIT_ARCHES'] = ','.join(limit_arches)
+
+    # SKIP_PLASHETS defaults to True for manual builds, setting to False for scheduled
+    params['SKIP_PLASHETS'] = False
+
+    return start_build(
+        job=Jobs.OCP4_KONFLUX,
+        params=params,
+        **kwargs,
+    )
+
+
+def start_ocp4_scan(version: str, **kwargs) -> Optional[str]:
+    params = {
+        'VERSION': version,
+    }
+    return start_build(
+        job=Jobs.OCP4_SCAN,
+        params=params,
+        **kwargs,
+    )
+
+
+def start_ocp4_scan_konflux(version: str, **kwargs) -> Optional[str]:
+    params = {
+        'VERSION': version,
+    }
+    return start_build(
+        job=Jobs.OCP4_SCAN_KONFLUX,
+        params=params,
+        **kwargs,
+    )
+
+
+def start_rhcos(build_version: str, new_build: bool, job_name: str = 'build', **kwargs) -> Optional[str]:
     return start_build(
         job=Jobs.RHCOS,
-        params={'BUILD_VERSION': build_version, 'NEW_BUILD': new_build},
-        **kwargs
+        params={'BUILD_VERSION': build_version, 'NEW_BUILD': new_build, 'JOB_NAME': job_name},
+        **kwargs,
     )
 
 
-def start_build_sync(build_version: str, assembly: str, doozer_data_path: Optional[str] = None,
-                     doozer_data_gitref: Optional[str] = None, **kwargs) -> Optional[str]:
+def start_build_sync(
+    build_version: str,
+    assembly: str,
+    doozer_data_path: Optional[str] = None,
+    doozer_data_gitref: Optional[str] = None,
+    build_system: Optional[str] = 'brew',
+    exclude_arches: list = None,
+    **kwargs,
+) -> Optional[str]:
     params = {
         'BUILD_VERSION': build_version,
         'ASSEMBLY': assembly,
@@ -290,16 +451,24 @@ def start_build_sync(build_version: str, assembly: str, doozer_data_path: Option
         params['DOOZER_DATA_PATH'] = doozer_data_path
     if doozer_data_gitref:
         params['DOOZER_DATA_GITREF'] = doozer_data_gitref
+    if exclude_arches:
+        params['EXCLUDE_ARCHES'] = ','.join(exclude_arches)
 
-    return start_build(
-        job=Jobs.BUILD_SYNC,
-        params=params,
-        **kwargs
-    )
+    if build_system == 'brew':
+        return start_build(
+            job=Jobs.BUILD_SYNC,
+            params=params | kwargs,
+        )
+    elif build_system == 'konflux':
+        return start_build(
+            job=Jobs.BUILD_SYNC_KONFLUX,
+            params=params | kwargs,
+        )
 
 
-def start_cincinnati_prs(from_releases: list, release_name: str, advisory_id: int,
-                         candidate_pr_note: str, skip_ota_notification, **kwargs) -> Optional[str]:
+def start_cincinnati_prs(
+    from_releases: list, release_name: str, advisory_id: int, candidate_pr_note: str, skip_ota_notification, **kwargs
+) -> Optional[str]:
     return start_build(
         job=Jobs.CINCINNATI_PRS,
         params={
@@ -309,7 +478,8 @@ def start_cincinnati_prs(from_releases: list, release_name: str, advisory_id: in
             'CANDIDATE_PR_NOTE': candidate_pr_note,
             'SKIP_OTA_SLACK_NOTIFICATION': skip_ota_notification,
             'GITHUB_ORG': 'openshift',
-        }, **kwargs
+        },
+        **kwargs,
     )
 
 
@@ -319,15 +489,20 @@ def start_build_microshift(build_version: str, assembly: str, dry_run: bool, **k
         params={
             'BUILD_VERSION': build_version,
             'ASSEMBLY': assembly,
-            'DRY_RUN': dry_run
+            'DRY_RUN': dry_run,
         },
-        **kwargs
+        **kwargs,
     )
 
 
-def start_olm_bundle(build_version: str, assembly: str, operator_nvrs: list,
-                     doozer_data_path: str = constants.OCP_BUILD_DATA_URL,
-                     doozer_data_gitref: str = '', **kwargs) -> Optional[str]:
+def start_olm_bundle(
+    build_version: str,
+    assembly: str,
+    operator_nvrs: list,
+    doozer_data_path: str = constants.OCP_BUILD_DATA_URL,
+    doozer_data_gitref: str = '',
+    **kwargs,
+) -> Optional[str]:
     if not operator_nvrs:
         logger.warning('Empty operator NVR received: skipping olm-bundle')
         return
@@ -339,9 +514,40 @@ def start_olm_bundle(build_version: str, assembly: str, operator_nvrs: list,
             'ASSEMBLY': assembly,
             'DOOZER_DATA_PATH': doozer_data_path,
             'DOOZER_DATA_GITREF': doozer_data_gitref,
-            'OPERATOR_NVRS': ','.join(operator_nvrs)
+            'OPERATOR_NVRS': ','.join(operator_nvrs),
         },
-        **kwargs
+        **kwargs,
+    )
+
+
+def start_olm_bundle_konflux(
+    build_version: str,
+    assembly: str,
+    operator_nvrs: list,
+    doozer_data_path: str = constants.OCP_BUILD_DATA_URL,
+    doozer_data_gitref: str = '',
+    group: Optional[str] = None,
+    **kwargs,
+) -> Optional[str]:
+    if not operator_nvrs:
+        logger.warning('Empty operator NVR received: skipping olm-bundle')
+        return
+
+    params = {
+        'BUILD_VERSION': build_version,
+        'ASSEMBLY': assembly,
+        'DOOZER_DATA_PATH': doozer_data_path,
+        'DOOZER_DATA_GITREF': doozer_data_gitref,
+        'OPERATOR_NVRS': ','.join(operator_nvrs),
+    }
+
+    if group:
+        params['GROUP'] = group
+
+    return start_build(
+        job=Jobs.OLM_BUNDLE_KONFLUX,
+        params=params,
+        **kwargs,
     )
 
 
@@ -349,24 +555,92 @@ def start_sync_for_ci(version: str, **kwargs):
     return start_build(
         job=Jobs.SYNC_FOR_CI,
         params={
-            'ONLY_FOR_VERSION': version
+            'ONLY_FOR_VERSION': version,
         },
-        **kwargs
+        **kwargs,
     )
 
 
-def start_microshift_sync(version: str, assembly: str, **kwargs):
+def start_microshift_sync(version: str, assembly: str, dry_run: bool, **kwargs):
     return start_build(
         job=Jobs.MICROSHIFT_SYNC,
         params={
             'BUILD_VERSION': version,
-            'ASSEMBLY': assembly
+            'ASSEMBLY': assembly,
+            'DRY_RUN': dry_run,
         },
-        **kwargs
+        **kwargs,
+    )
+
+
+def start_build_microshift_bootc(version: str, assembly: str, dry_run: bool, **kwargs):
+    return start_build(
+        job=Jobs.BUILD_MICROSHIFT_BOOTC,
+        params={
+            'BUILD_VERSION': version,
+            'ASSEMBLY': assembly,
+            'DRY_RUN': dry_run,
+        },
+        **kwargs,
+    )
+
+
+def start_rhcos_sync(release_tag_or_pullspec: str, dry_run: bool, **kwargs) -> Optional[str]:
+    return start_build(
+        job=Jobs.RHCOS_SYNC,
+        params={
+            'RELEASE_TAG': release_tag_or_pullspec,
+            'DRY_RUN': dry_run,
+        },
+        **kwargs,
+    )
+
+
+def start_build_plashets(
+    version, release, assembly, repos=None, data_path='', data_gitref='', copy_links=False, dry_run=False, **kwargs
+) -> Optional[str]:
+    return start_build(
+        job=Jobs.BUILD_PLASHETS,
+        params={
+            'VERSION': version,
+            'RELEASE': release,
+            'ASSEMBLY': assembly,
+            'REPOS': ','.join(repos) if repos else '',
+            'DATA_PATH': data_path,
+            'DATA_GITREF': data_gitref,
+            'COPY_LINKS': copy_links,
+            'DRY_RUN': dry_run,
+        },
+        **kwargs,
+    )
+
+
+def start_build_fbc(
+    version: str,
+    assembly: str,
+    operator_nvrs: list,
+    dry_run: bool,
+    group: Optional[str] = None,
+    **kwargs,
+) -> Optional[str]:
+    params = {
+        'BUILD_VERSION': version,
+        'ASSEMBLY': assembly,
+        'OPERATOR_NVRS': ','.join(operator_nvrs),
+        'DRY_RUN': dry_run,
+    }
+    if group:
+        params['GROUP'] = group
+
+    return start_build(
+        job=Jobs.BUILD_FBC,
+        params=params,
+        **kwargs,
     )
 
 
 @check_env_vars
+@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_fixed(10))
 def update_title(title: str, append: bool = True):
     """
     Set build title to <title>. If append is True, retrieve current title,
@@ -378,7 +652,7 @@ def update_title(title: str, append: bool = True):
     build = Build(
         url=current_build_url.replace(constants.JENKINS_UI_URL, jenkins_url),
         buildno=int(list(filter(None, current_build_url.split('/')))[-1]),
-        job=job
+        job=job,
     )
 
     if append:
@@ -386,14 +660,11 @@ def update_title(title: str, append: bool = True):
 
     data = {'json': f'{{"displayName":"{title}"}}'}
     headers = {'Content-Type': 'application/x-www-form-urlencoded', 'Referer': f"{build.baseurl}/configure"}
-    build.job.jenkins.requester.post_url(
-        f'{build.baseurl}/configSubmit',
-        params=data,
-        data='',
-        headers=headers)
+    build.job.jenkins.requester.post_url(f'{build.baseurl}/configSubmit', params=data, data='', headers=headers)
 
 
 @check_env_vars
+@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_fixed(10))
 def update_description(description: str, append: bool = True):
     """
     Set build description to <description>. If append is True, retrieve current description,
@@ -405,11 +676,13 @@ def update_description(description: str, append: bool = True):
     build = Build(
         url=current_build_url.replace(constants.JENKINS_UI_URL, jenkins_url),
         buildno=int(list(filter(None, current_build_url.split('/')))[-1]),
-        job=job
+        job=job,
     )
 
     if append:
-        description = build.get_description() + description
+        current_description = build.get_description()
+        current_description = current_description if current_description else ''
+        description = current_description + description
 
     set_build_description(build, description)
 

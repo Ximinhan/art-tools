@@ -12,8 +12,11 @@ def parse_record_log(file: TextIO) -> Dict[str, List[Dict[str, Optional[str]]]]:
     for line in file:
         fields = line.rstrip().split("|")
         type = fields[0]
-        record = {entry_split[0]: entry_split[1] if len(entry_split) > 1 else None for entry_split in
-                  map(lambda entry: entry.split("=", 1), fields[1:]) if entry_split[0]}
+        record = {
+            entry_split[0]: entry_split[1] if len(entry_split) > 1 else None
+            for entry_split in map(lambda entry: entry.split("=", 1), fields[1:])
+            if entry_split[0]
+        }
         result.setdefault(type, []).append(record)
     return result
 
@@ -78,7 +81,7 @@ def get_failed_builds(record_log: dict, full_record: bool = False) -> dict:
         distgit = build['distgit']
 
         if build['status'] != '0':
-            failed_map[distgit] = build if full_record else build['task_url']
+            failed_map[distgit] = build if full_record else build.get('task_url', 'No task URL available')
 
         elif build['push_status'] != '0':
             failed_map[distgit] = build if full_record else 'Failed to push built image. See debug.log'
@@ -119,7 +122,7 @@ def get_successful_builds(record_log: dict, full_record: bool = False) -> dict:
     for build in builds:
         distgit = build['distgit']
         if build['status'] == '0':
-            success_map[distgit] = build if full_record else build['task_url']
+            success_map[distgit] = build if full_record else build.get('task_url', 'No task URL available')
 
     return success_map
 
@@ -136,7 +139,7 @@ def get_successful_rpms(record_log: dict, full_record: bool = False) -> dict:
     for rpm in rpms:
         distgit = rpm["distgit_key"]
         if rpm["status"] == "0":
-            success_map[distgit] = rpm if full_record else rpm["task_url"]
+            success_map[distgit] = rpm if full_record else rpm.get("task_url", "No task URL available")
 
     return success_map
 
@@ -153,7 +156,7 @@ def get_failed_rpms(record_log: dict, full_record: bool = False) -> dict:
     for rpm in rpms:
         distgit = rpm["distgit_key"]
         if rpm["status"] != "0":
-            failed_map[distgit] = rpm if full_record else rpm["task_url"]
+            failed_map[distgit] = rpm if full_record else rpm.get("task_url", "No task URL available")
         else:
             # build may have succeeded later. If so, remove.
             if distgit in failed_map:

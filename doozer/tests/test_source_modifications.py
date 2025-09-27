@@ -1,15 +1,12 @@
-
 import os
 import pathlib
 import shutil
 import tempfile
 import unittest
-
 from unittest import mock
-import yaml.scanner
 
-from doozerlib.source_modifications import (AddModifier, RemoveModifier,
-                                            SourceModifierFactory)
+import yaml.scanner
+from doozerlib.source_modifications import AddModifier, RemoveModifier, SourceModifierFactory
 
 
 class SourceModifierFactoryTestCase(unittest.TestCase):
@@ -46,7 +43,7 @@ class AddModifierTestCase(unittest.TestCase):
             session = MockSession()
             response = session.get.return_value
             response.content = expected_content
-            context = {"distgit_path": pathlib.Path(self.temp_dir)}
+            context = {"distgit_path": pathlib.Path(self.temp_dir), "build_system": "brew"}
             modifier.act(ceiling_dir=self.temp_dir, session=session, context=context)
         with open(params["path"], "rb") as f:
             actual = f.read()
@@ -67,7 +64,7 @@ class AddModifierTestCase(unittest.TestCase):
             response = session.get.return_value
             response.content = expected_content
             with self.assertRaises(IOError) as cm:
-                context = {"distgit_path": pathlib.Path(self.temp_dir)}
+                context = {"distgit_path": pathlib.Path(self.temp_dir), "build_system": "brew"}
                 modifier.act(ceiling_dir=self.temp_dir, session=session, context=context)
             self.assertIn("overwrite", repr(cm.exception))
 
@@ -76,7 +73,7 @@ class AddModifierTestCase(unittest.TestCase):
             "source": "http://example.com/gating_yaml",
             "path": os.path.join(self.temp_dir, "gating.yaml"),
             "overwriting": True,
-            "validate": "yaml"
+            "validate": "yaml",
         }
         expected_content = b"@!abc123"
         modifier = AddModifier(**params)
@@ -87,7 +84,7 @@ class AddModifierTestCase(unittest.TestCase):
             response = session.get.return_value
             response.content = expected_content
             with self.assertRaises(yaml.scanner.ScannerError):
-                context = {"distgit_path": pathlib.Path(self.temp_dir)}
+                context = {"distgit_path": pathlib.Path(self.temp_dir), "build_system": "brew"}
                 modifier.act(ceiling_dir=self.temp_dir, session=session, context=context)
 
 
@@ -102,11 +99,14 @@ class TestRemoveModifier(unittest.TestCase):
             "distgit_path": distgit_path,
         }
         with mock.patch.object(pathlib.Path, "rglob") as rglob, mock.patch.object(pathlib.Path, "unlink") as unlink:
-            rglob.return_value = map(lambda path: distgit_path.joinpath(path), [
-                "1.txt",
-                "a/2.txt",
-                "b/c/d/e/3.txt",
-            ])
+            rglob.return_value = map(
+                lambda path: distgit_path.joinpath(path),
+                [
+                    "1.txt",
+                    "a/2.txt",
+                    "b/c/d/e/3.txt",
+                ],
+            )
             modifier.act(context=context, ceiling_dir=str(distgit_path))
             unlink.assert_called()
 
@@ -120,11 +120,14 @@ class TestRemoveModifier(unittest.TestCase):
             "distgit_path": distgit_path,
         }
         with mock.patch.object(pathlib.Path, "rglob") as rglob:
-            rglob.return_value = map(lambda path: pathlib.Path("/some/other/path").joinpath(path), [
-                "1.txt",
-                "a/2.txt",
-                "b/c/d/e/3.txt",
-            ])
+            rglob.return_value = map(
+                lambda path: pathlib.Path("/some/other/path").joinpath(path),
+                [
+                    "1.txt",
+                    "a/2.txt",
+                    "b/c/d/e/3.txt",
+                ],
+            )
             with self.assertRaises(PermissionError):
                 modifier.act(context=context, ceiling_dir=str(distgit_path))
 

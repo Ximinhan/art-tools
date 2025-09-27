@@ -109,7 +109,17 @@
         "advance?": {
           "$ref": "#/properties/advisories/properties/advance"
         },
-        "advance-": {}
+        "advance-": {},
+        "rhcos": {
+          "type": "integer"
+        },
+        "rhcos!": {
+          "$ref": "#/properties/advisories/properties/advance"
+        },
+        "rhcos?": {
+          "$ref": "#/properties/advisories/properties/advance"
+        },
+        "rhcos-": {}
       },
       "additionalProperties": false
     },
@@ -144,6 +154,44 @@
     "upgrades": {
       "type": "string"
     },
+    "shipment_advisory": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "live_id": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "shipment": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "env": {
+          "type": "string",
+          "enum": ["stage", "prod"]
+        },
+        "advisories": {
+          "type": "array",
+          "items": {
+            "$ref": "#/properties/shipment_advisory"
+          }
+        }
+      }
+    },
+    "shipment!": {
+      "$ref": "#/properties/shipment"
+    },
+    "shipment?": {
+      "$ref": "#/properties/shipment"
+    },
+    "shipment-": {},
     "upgrades!": {
       "$ref": "#/properties/upgrades"
     },
@@ -151,6 +199,16 @@
       "$ref": "#/properties/upgrades"
     },
     "upgrades-": {},
+    "upgrades_next": {
+      "type": "string"
+    },
+    "upgrades_next!": {
+      "$ref": "#/properties/upgrades_next"
+    },
+    "upgrades_next?": {
+      "$ref": "#/properties/upgrades_next"
+    },
+    "upgrades_next-": {},
     "check_golang_versions": {
       "type": "boolean"
     },
@@ -228,8 +286,7 @@
     },
     "urls-": {},
     "canonical_builders_from_upstream": {
-      "description": "Assert our base images, or listen to upstream",
-      "enum": [true, false, "auto", "off", "no", "on", "yes"]
+      "type": "boolean"
     },
     "canonical_builders_from_upstream?": {
       "$ref": "#/properties/canonical_builders_from_upstream"
@@ -241,6 +298,9 @@
     "operator_index_mode": {
       "type": "string",
       "enum": ["pre-release", "pre-ga", "ga"]
+    },
+    "release_date": {
+      "type": "string"
     }
   },
   "additionalProperties": false

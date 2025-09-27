@@ -1,14 +1,19 @@
+from datetime import datetime, timezone
 from unittest import TestCase
 
 import yaml
-
-from artcommonlib.assembly import assembly_rhcos_config, assembly_basis_event, assembly_group_config, \
-    assembly_config_struct, assembly_metadata_config, _merger
-from artcommonlib.model import Model, Missing
+from artcommonlib.assembly import (
+    _merger,
+    assembly_basis_event,
+    assembly_config_struct,
+    assembly_group_config,
+    assembly_metadata_config,
+    assembly_rhcos_config,
+)
+from artcommonlib.model import Missing, Model
 
 
 class TestAssembly(TestCase):
-
     def setUp(self) -> None:
         releases_yml = """
 releases:
@@ -188,17 +193,126 @@ releases:
         except Exception as e:
             self.fail(f'Expected ValueError on assembly infinite recursion but got: {type(e)}: {e}')
 
-    def test_assembly_group_config(self):
+    def test_assembly_basis_time_invalid_1(self):
+        releases_yml = """
+releases:
+  foo:
+    assembly:
+      basis:
+        time: 2021-01-01T00:00:00Z
+    type: standard
+"""
+        self.releases_config = Model(dict_to_model=yaml.safe_load(releases_yml))
+        with self.assertRaises(ValueError) as cm:
+            assembly_basis_event(self.releases_config, 'foo', build_system='konflux')
+        self.assertIn("Invalid time format for assembly", str(cm.exception))
 
-        group_config = Model(dict_to_model={
-            'arches': [
-                'x86_64'
-            ],
-            'advisories': {
-                'image': 1,
-                'extras': 1,
+    def test_assembly_basis_time_invalid_2(self):
+        releases_yml = """
+releases:
+  foo:
+    assembly:
+      basis:
+        time: not_a_valid_datetime
+    type: standard
+"""
+        self.releases_config = Model(dict_to_model=yaml.safe_load(releases_yml))
+        with self.assertRaises(ValueError) as cm:
+            assembly_basis_event(self.releases_config, 'foo', build_system='konflux')
+        self.assertIn("Invalid isoformat string", str(cm.exception))
+
+    def test_assembly_basis_time_valid(self):
+        releases_yml = """
+releases:
+  foo:
+    assembly:
+      basis:
+        time: "2021-01-01T00:00:00Z"
+    type: standard
+"""
+        self.releases_config = Model(dict_to_model=yaml.safe_load(releases_yml))
+        self.assertEqual(
+            assembly_basis_event(releases_config=self.releases_config, assembly='foo', build_system='konflux'),
+            datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_asssembly_basis_time_with_brew_event_1(self):
+        releases_yml = """
+        releases:
+          foo:
+            assembly:
+              basis:
+                time: "2021-01-01T00:00:00Z"
+                brew_event: 123456
+            type: standard
+        """
+        self.releases_config = Model(dict_to_model=yaml.safe_load(releases_yml))
+        self.assertEqual(
+            assembly_basis_event(releases_config=self.releases_config, assembly='foo', build_system='konflux'),
+            datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_asssembly_basis_time_with_brew_event_2(self):
+        releases_yml = """
+        releases:
+          foo:
+            assembly:
+              basis:
+                time: "2021-01-01T00:00:00Z"
+                brew_event: 123456
+            type: standard
+        """
+        self.releases_config = Model(dict_to_model=yaml.safe_load(releases_yml))
+        self.assertEqual(
+            assembly_basis_event(releases_config=self.releases_config, assembly='foo', build_system='brew'),
+            123456,
+        )
+
+    def test_asssembly_basis_time_with_brew_event_3(self):
+        releases_yml = """
+        releases:
+          foo:
+            assembly:
+              basis:
+                time: "2021-01-01T00:00:00Z"
+            type: standard
+        """
+        self.releases_config = Model(dict_to_model=yaml.safe_load(releases_yml))
+        self.assertEqual(
+            assembly_basis_event(releases_config=self.releases_config, assembly='foo', build_system='brew'),
+            datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_asssembly_basis_time_with_brew_event_4(self):
+        releases_yml = """
+        releases:
+          foo:
+            assembly:
+              basis: {}
+            type: standard
+        """
+        self.releases_config = Model(dict_to_model=yaml.safe_load(releases_yml))
+
+        with self.assertRaises(ValueError) as _:
+            assembly_basis_event(
+                releases_config=self.releases_config, assembly='foo', build_system='konflux', strict=True
+            )
+
+        with self.assertRaises(ValueError) as _:
+            assembly_basis_event(releases_config=self.releases_config, assembly='foo', build_system='brew', strict=True)
+
+    def test_assembly_group_config(self):
+        group_config = Model(
+            dict_to_model={
+                'arches': [
+                    'x86_64',
+                ],
+                'advisories': {
+                    'image': 1,
+                    'extras': 1,
+                },
             }
-        })
+        )
 
         config = assembly_group_config(self.releases_config, 'ART_1', group_config)
         self.assertEqual(len(config.arches), 3)
@@ -247,15 +361,15 @@ releases:
                     "assembly": {
                         "basis": {
                             "assembly": "parent",
-                        }
-                    }
+                        },
+                    },
                 },
                 "parent": {
                     "assembly": {
-                        "type": "custom"
-                    }
+                        "type": "custom",
+                    },
                 },
-            }
+            },
         }
         actual = assembly_config_struct(Model(release_configs), "child", "type", "standard")
         self.assertEqual(actual, "custom")
@@ -267,15 +381,15 @@ releases:
                         "basis": {
                             "assembly": "parent",
                         },
-                        "type": "candidate"
-                    }
+                        "type": "candidate",
+                    },
                 },
                 "parent": {
                     "assembly": {
-                        "type": "custom"
-                    }
+                        "type": "custom",
+                    },
                 },
-            }
+            },
         }
         actual = assembly_config_struct(Model(release_configs), "child", "type", "standard")
         self.assertEqual(actual, "candidate")
@@ -287,13 +401,12 @@ releases:
                         "basis": {
                             "assembly": "parent",
                         },
-                    }
+                    },
                 },
                 "parent": {
-                    "assembly": {
-                    }
+                    "assembly": {},
                 },
-            }
+            },
         }
         actual = assembly_config_struct(Model(release_configs), "child", "type", "standard")
         self.assertEqual(actual, "standard")
@@ -305,14 +418,14 @@ releases:
                         "basis": {
                             "assembly": "parent",
                         },
-                    }
+                    },
                 },
                 "parent": {
                     "assembly": {
-                        "type": None
+                        "type": None,
                     },
                 },
-            }
+            },
         }
         actual = assembly_config_struct(Model(release_configs), "child", "type", "standard")
         self.assertEqual(actual, None)
@@ -326,10 +439,10 @@ releases:
                         },
                         "foo": {
                             "a": 1,
-                            "b": 2
+                            "b": 2,
                         },
-                        "bar": [1, 2, 3]
-                    }
+                        "bar": [1, 2, 3],
+                    },
                 },
                 "parent": {
                     "assembly": {
@@ -337,37 +450,41 @@ releases:
                             "b": 3,
                             "c": 4,
                         },
-                        "bar": [0, 2, 4]
-                    }
+                        "bar": [0, 2, 4],
+                    },
                 },
-            }
+            },
         }
         actual = assembly_config_struct(Model(release_configs), "child", "foo", {})
-        self.assertEqual(actual, {
-            "a": 1,
-            "b": 2,
-            "c": 4,
-        })
+        self.assertEqual(
+            actual,
+            {
+                "a": 1,
+                "b": 2,
+                "c": 4,
+            },
+        )
         actual = assembly_config_struct(Model(release_configs), "child", "bar", [])
         self.assertEqual(actual, [0, 1, 2, 3, 4])
 
     def test_asembly_metadata_config(self):
-
-        meta_config = Model(dict_to_model={
-            'owners': ['kuryr-team@redhat.com'],
-            'content': {
-                'source': {
-                    'git': {
-                        'url': 'git@github.com:openshift-priv/kuryr-kubernetes.git',
-                        'branch': {
-                            'target': 'release-4.8',
-                        }
+        meta_config = Model(
+            dict_to_model={
+                'owners': ['kuryr-team@redhat.com'],
+                'content': {
+                    'source': {
+                        'git': {
+                            'url': 'git@github.com:openshift-priv/kuryr-kubernetes.git',
+                            'branch': {
+                                'target': 'release-4.8',
+                            },
+                        },
+                        'specfile': 'openshift-kuryr-kubernetes-rhel8.spec',
                     },
-                    'specfile': 'openshift-kuryr-kubernetes-rhel8.spec'
-                }
-            },
-            'name': 'openshift-kuryr'
-        })
+                },
+                'name': 'openshift-kuryr',
+            }
+        )
 
         config = assembly_metadata_config(self.releases_config, 'ART_1', 'rpm', 'openshift-kuryr', meta_config)
         # Ensure no loss
@@ -425,51 +542,51 @@ releases:
         # Dicts are additive
         self.assertEqual(
             _merger({'x': 5}, None),
-            {'x': 5}
+            {'x': 5},
         )
 
         self.assertEqual(
             _merger({'x': 5}, {'y': 6}),
-            {'x': 5, 'y': 6}
+            {'x': 5, 'y': 6},
         )
 
         # Depth does not matter
         self.assertEqual(
             _merger({'r': {'x': 5}}, {'r': {'y': 6}}),
-            {'r': {'x': 5, 'y': 6}}
+            {'r': {'x': 5, 'y': 6}},
         )
 
         self.assertEqual(
             _merger({'r': {'x': 5, 'y': 7}}, {'r': {'y': 6}}),
-            {'r': {'x': 5, 'y': 7}}
+            {'r': {'x': 5, 'y': 7}},
         )
 
         # ? key provides default only
         self.assertEqual(
             _merger({'r': {'x': 5, 'y?': 7}}, {'r': {'y': 6}}),
-            {'r': {'x': 5, 'y': 6}}
+            {'r': {'x': 5, 'y': 6}},
         )
 
         # ! key dominates completely
         self.assertEqual(
             _merger({'r!': {'x': 5}}, {'r': {'y': 6}}),
-            {'r': {'x': 5}}
+            {'r': {'x': 5}},
         )
 
         # Lists are combined, dupes eliminated, and results sorted
         self.assertEqual(
             _merger({'r': [1, 2]}, {'r': [1, 3, 4]}),
-            {'r': [1, 2, 3, 4]}
+            {'r': [1, 2, 3, 4]},
         )
 
         # ! key dominates completely
         self.assertEqual(
             _merger({'r!': [1, 2]}, {'r': [3, 4]}),
-            {'r': [1, 2]}
+            {'r': [1, 2]},
         )
 
         # - key removes itself entirely
         self.assertEqual(
             _merger({'r-': [1, 2]}, {'r': [3, 4]}),
-            {}
+            {},
         )

@@ -3,9 +3,7 @@ import sys
 
 from jsonschema import RefResolver, ValidationError
 from jsonschema.validators import validator_for
-
 from schema import SchemaError
-
 
 if sys.version_info < (3, 9):
     # importlib.resources either doesn't exist or lacks the files()
@@ -41,6 +39,10 @@ def _demerge(data):
 
 
 def validate(_, data):
+    for assembly_name, assembly in data.get('releases', {}).items():
+        if "group!" in assembly.get('assembly', {}).keys():
+            return f"Found forbidden key 'group!' in release '{assembly_name}'"
+
     # Load Json schemas
     path = importlib_resources.files("validator") / "json_schemas"
     schemas = {source.name: json.load(open(source)) for source in path.iterdir() if source.name.endswith(".json")}
@@ -54,4 +56,4 @@ def validate(_, data):
         validator.validate(demerged_data)
     except ValidationError:
         errors = validator.iter_errors(demerged_data)
-        return '\n'.join([str(e.message) for e in errors])
+        return '\n'.join([f"{e.json_path}: {e.message}" for e in errors])

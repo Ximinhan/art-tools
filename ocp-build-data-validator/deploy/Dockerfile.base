@@ -3,7 +3,7 @@ LABEL name="ocp-build-data-validator" \
   description="ocp-build-data validator container image" \
   maintainer="OpenShift Automated Release Tooling (ART) Team <aos-team-art@redhat.com>"
 
-RUN yum install -y epel-release @python38 \
+RUN yum install -y epel-release @python311 \
  && yum install -y \
     gcc \
     git \
@@ -12,16 +12,14 @@ RUN yum install -y epel-release @python38 \
     libcurl-devel \
     libgit2 \
     openssl-devel \
-    python38-{devel,pip,requests} \
+    python311-{devel,pip,requests} \
  && yum clean all \
- && update-alternatives --set python3 /usr/bin/python3.8
+ && update-alternatives --set python3 /usr/bin/python3.11
 
 RUN python3 -m pip install -U pip build \
  && useradd -ms /bin/bash -u 1000 art \
  && curl -o /etc/pki/ca-trust/source/anchors/2022-IT-Root-CA.pem --fail -L \
          https://certs.corp.redhat.com/certs/2022-IT-Root-CA.pem \
- && curl -o /etc/pki/ca-trust/source/anchors/2015-IT-Root-CA.pem --fail -L \
-         https://certs.corp.redhat.com/certs/2015-IT-Root-CA.pem \
  && update-ca-trust extract  # Trust the Red Hat IT Root CAs
 
 USER art

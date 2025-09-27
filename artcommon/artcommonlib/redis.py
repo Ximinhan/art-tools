@@ -5,6 +5,7 @@ from functools import wraps
 from string import Template
 
 import redis
+from artcommonlib import constants
 
 logger = logging.getLogger(__name__)
 
@@ -19,16 +20,12 @@ class RedisError(Exception):
 def redis_url(use_ssl=True):
     if not os.environ.get('REDIS_SERVER_PASSWORD', None):
         raise RedisError('Please define REDIS_SERVER_PASSWORD env var')
-    if not os.environ.get('REDIS_HOST', None):
-        raise RedisError('Please define REDIS_HOST env var')
-    if not os.environ.get('REDIS_PORT', None):
-        raise RedisError('Please define REDIS_PORT env var')
 
     return redis_url_template.substitute(
         protocol='rediss' if use_ssl else 'redis',
         redis_password=os.environ['REDIS_SERVER_PASSWORD'],
-        redis_host=os.environ['REDIS_HOST'],
-        redis_port=os.environ['REDIS_PORT']
+        redis_host=constants.REDIS_HOST,
+        redis_port=constants.REDIS_PORT,
     )
 
 
@@ -88,35 +85,26 @@ def get_value_sync(conn: redis.client.Redis, key: str):
     return value
 
 
-@handle_connection_sync
-def get_value_sync(conn: redis.client.Redis, key: str):
-    """
-    Same as get_value(), but synchronous
-    """
-
-    value = conn.get(key)
-    logger.debug('Key %s has value %s', key, value)
-    return value
-
-
 @handle_connection
-async def set_value(conn: redis.asyncio.client.Redis, key: str, value):
+async def set_value(conn: redis.asyncio.client.Redis, key: str, value, expiry=None):
     """
     Sets value for a key
+
+    expiry optionally sets an expiry flag in seconds
     """
 
     logger.debug('Setting key %s to %s', key, value)
-    await conn.set(key, value)
+    await conn.set(key, value, ex=expiry)
 
 
 @handle_connection_sync
-def set_value_sync(conn: redis.client.Redis, key: str, value):
+def set_value_sync(conn: redis.client.Redis, key: str, value, expiry=None):
     """
     Same as set_value(), but synchronous
     """
 
     logger.debug('Setting key %s to %s', key, value)
-    conn.set(key, value)
+    conn.set(key, value, ex=expiry)
 
 
 @handle_connection
@@ -126,17 +114,6 @@ async def get_keys(conn: redis.asyncio.client.Redis, pattern: str):
     """
 
     keys = await conn.keys(pattern)
-    logger.debug('Found keys matching pattern %s: %s', pattern, ', '.join(keys))
-    return keys
-
-
-@handle_connection_sync
-def get_keys_sync(conn: redis.client.Redis, pattern: str):
-    """
-    Same as get_keys(), but synchronous
-    """
-
-    keys = conn.keys(pattern)
     logger.debug('Found keys matching pattern %s: %s', pattern, ', '.join(keys))
     return keys
 
@@ -217,3 +194,15 @@ async def list_push_all(key: str, values: list) -> None:
     """
     for value in values:
         await list_push(key, value)
+
+
+@handle_connection
+async def get_multiple_values(conn: redis.asyncio.client.Redis, keys: list[str]):
+    """
+    Retrieves values for a list of Redis string keys using a single MGET operation.
+
+    :param conn: An active Redis asyncio client connection.
+    :param keys: List of Redis keys (strings) to retrieve values for.
+    :return: A list of values corresponding to the given keys. If a key does not exist, its value will be None.
+    """
+    return await conn.mget(keys)

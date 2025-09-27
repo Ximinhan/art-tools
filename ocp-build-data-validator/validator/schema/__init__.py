@@ -1,5 +1,5 @@
-from . import image_schema, rpm_schema, streams_schema, releases_schema
 from .. import support
+from . import image_schema, releases_schema, rpm_schema, shipment_schema, streams_schema
 
 
 def ignore_validate(*args, **kwargs):
@@ -7,17 +7,20 @@ def ignore_validate(*args, **kwargs):
     return ''
 
 
-def validate(file, data):
+def validate(file, data, images_dir=None):
     return {
         'streams': streams_schema.validate,
-        'image': image_schema.validate,
+        'image': lambda f, d: image_schema.validate(f, d, images_dir=images_dir),
         'rpm': rpm_schema.validate,
         'ignore': ignore_validate,
-        'releases': releases_schema.validate
+        'releases': releases_schema.validate,
+        'shipment': shipment_schema.validate,
     }.get(support.get_artifact_type(file), err)(file, data)
 
 
 def err(*_):
-    return ('Could not determine a schema\n'
-            'Supported schemas: image, rpm\n'
-            'Make sure the file is placed in either dir "images" or "rpms"')
+    return (
+        'Could not determine a schema\n'
+        'Supported schemas: image, rpm\n'
+        'Make sure the file is placed in either dir "images" or "rpms"'
+    )

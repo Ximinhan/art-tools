@@ -1,44 +1,79 @@
 # -*- coding: utf-8 -*-
-import click
 import os
 import shutil
-import yaml
 import sys
 import tempfile
+
+import click
+import yaml
+from artcommonlib import exectools
+from artcommonlib.format_util import color_print, green_print, red_print, yellow_print
+from artcommonlib.pushd import Dir
 from future import standard_library
 
-from artcommonlib import exectools
-from artcommonlib.format_util import red_print, green_print, yellow_print, color_print
-from artcommonlib.pushd import Dir
-from doozerlib import state, cli as cli_package
+from doozerlib import cli as cli_package
+from doozerlib import state
 from doozerlib.cli import cli, pass_runtime
-
-from doozerlib.cli.release_gen_payload import release_gen_payload
-from doozerlib.cli.get_nightlies import get_nightlies
-from doozerlib.cli.detect_embargo import detect_embargo
-from doozerlib.cli.images_health import images_health
-from doozerlib.cli.images_streams import images_streams, images_streams_mirror, images_streams_gen_buildconfigs
-from doozerlib.cli.release_gen_assembly import releases_gen_assembly, gen_assembly_from_releases
-from doozerlib.cli.scan_sources import config_scan_source_changes
-from doozerlib.cli.rpms_read_config import config_read_rpms
+from doozerlib.cli.config import (
+    config_commit,
+    config_gencsv,
+    config_get,
+    config_mode,
+    config_print,
+    config_push,
+    config_read_assemblies,
+    config_read_group,
+    config_read_releases,
+    config_rhcos_src,
+    config_update_required,
+)
 from doozerlib.cli.config_plashet import config_plashet
-from doozerlib.cli.release_calc_upgrade_tests import release_calc_upgrade_tests
-from doozerlib.cli.inspect_stream import inspect_stream
 from doozerlib.cli.config_tag_rpms import config_tag_rpms
-from doozerlib.cli.scan_osh import scan_osh
-from doozerlib.cli.scan_fips import scan_fips
-from doozerlib.cli.gen_assembly_helper import gen_assembly_rhcos
-from doozerlib.cli.rpms import rpms_print, rpms_rebase_and_build, rpms_rebase, rpms_build, rpms_clone, rpms_clone_sources
+from doozerlib.cli.detect_embargo import detect_embargo
+from doozerlib.cli.fbc import fbc_import, fbc_rebase_and_build
+from doozerlib.cli.get_nightlies import get_nightlies
+from doozerlib.cli.images import (
+    distgit_config_template,
+    images_build_image,
+    images_clone,
+    images_covscan,
+    images_foreach,
+    images_list,
+    images_merge,
+    images_print,
+    images_pull_image,
+    images_push,
+    images_push_distgit,
+    images_rebase,
+    images_revert,
+    images_show_ancestors,
+    images_show_tree,
+    query_rpm_version,
+)
+from doozerlib.cli.images_health import images_health
+from doozerlib.cli.images_konflux import images_konflux_build, images_konflux_rebase
+from doozerlib.cli.images_okd import images_okd, images_okd_prs
+from doozerlib.cli.images_streams import images_streams, images_streams_gen_buildconfigs, images_streams_mirror
+from doozerlib.cli.inspect_stream import inspect_stream
 from doozerlib.cli.olm_bundle import list_olm_operators, olm_bundles_print, rebase_and_build_olm_bundle
-from doozerlib.cli.config import config_commit, config_push, config_get, config_read_group, config_read_releases, \
-    config_read_assemblies, config_mode, config_print, config_gencsv, config_rhcos_src, config_update_required
-from doozerlib.cli.images import images_clone, images_list, images_push_distgit, images_covscan, images_rebase, \
-    images_foreach, images_revert, images_merge, images_build_image, images_push, images_pull_image, images_show_tree, \
-    images_print, distgit_config_template, query_rpm_version
-
+from doozerlib.cli.release_calc_upgrade_tests import release_calc_upgrade_tests
+from doozerlib.cli.release_gen_assembly import gen_assembly_from_releases, releases_gen_assembly
+from doozerlib.cli.release_gen_payload import release_gen_payload
+from doozerlib.cli.rpms import (
+    rpms_build,
+    rpms_clone,
+    rpms_clone_sources,
+    rpms_print,
+    rpms_rebase,
+    rpms_rebase_and_build,
+)
+from doozerlib.cli.rpms_read_config import config_read_rpms
+from doozerlib.cli.scan_fips import scan_fips
+from doozerlib.cli.scan_osh import scan_osh
+from doozerlib.cli.scan_sources import config_scan_source_changes
+from doozerlib.cli.scan_sources_konflux import config_scan_source_changes_konflux
 from doozerlib.exceptions import DoozerFatalError
-from doozerlib.util import analyze_debug_timing
-from doozerlib.util import get_release_calc_previous
+from doozerlib.util import analyze_debug_timing, get_release_calc_previous
 
 standard_library.install_aliases()
 
@@ -50,20 +85,28 @@ standard_library.install_aliases()
 
 
 @cli.command("db:query", short_help="Query database records")
-@click.option("-p", "--operation", required=True, metavar='NAME',
-              help="Which operation to query (e.g. 'build')")
-@click.option("-a", "--attribute", default=[], metavar='NAME', multiple=True,
-              help="Attribute name to output")
-@click.option("-m", "--match", default=[], metavar='NAME=VALUE', multiple=True,
-              help="name=value matches (AND logic)")
-@click.option("-l", "--like", default=[], metavar='NAME=%VALUE%', multiple=True,
-              help="name LIKE value matches (AND logic)")
-@click.option("-w", "--where", metavar='EXPR', default='',
-              help="Complex expression instead of matching. e.g. ( `NAME`=\"VALUE\" and `NAME2` LIKE \"VALUE2%\" ) or NOT `NAME3` < \"VALUE3\"")
-@click.option("-s", "--sort-by", '--order-by', default=None, metavar='NAME',
-              help="Attribute name to sort by. Note: The sort attribute must be present in at least one of the predicates of the expression.")
-@click.option("--limit", default=0, metavar='NUM',
-              help="Limit records returned to specified number")
+@click.option("-p", "--operation", required=True, metavar='NAME', help="Which operation to query (e.g. 'build')")
+@click.option("-a", "--attribute", default=[], metavar='NAME', multiple=True, help="Attribute name to output")
+@click.option("-m", "--match", default=[], metavar='NAME=VALUE', multiple=True, help="name=value matches (AND logic)")
+@click.option(
+    "-l", "--like", default=[], metavar='NAME=%VALUE%', multiple=True, help="name LIKE value matches (AND logic)"
+)
+@click.option(
+    "-w",
+    "--where",
+    metavar='EXPR',
+    default='',
+    help="Complex expression instead of matching. e.g. ( `NAME`=\"VALUE\" and `NAME2` LIKE \"VALUE2%\" ) or NOT `NAME3` < \"VALUE3\"",
+)
+@click.option(
+    "-s",
+    "--sort-by",
+    '--order-by',
+    default=None,
+    metavar='NAME',
+    help="Attribute name to sort by. Note: The sort attribute must be present in at least one of the predicates of the expression.",
+)
+@click.option("--limit", default=0, metavar='NUM', help="Limit records returned to specified number")
 @click.option("-o", "--output", metavar='format', default="human", help='Output format: human, csv, or yaml')
 @pass_runtime
 def db_select(runtime, operation, attribute, match, like, where, sort_by, limit, output):
@@ -169,43 +212,75 @@ def cleanup(runtime):
 
 
 @cli.command("release:calc-previous", short_help="Returns a list of releases to include in a release's previous field")
-@click.option("--version", metavar='NEW_VER', required=True,
-              help="The release to calculate previous for (e.g. 4.5.4 or 4.6.0..hotfix)")
-@click.option("-a", "--arch",
-              metavar='ARCH',
-              help="Arch for which the repo should be generated",
-              default='x86_64', required=False)
-@click.option("--graph-url", metavar='GRAPH_URL', required=False,
-              default='https://api.openshift.com/api/upgrades_info/v1/graph',
-              help="Cincinnati graph URL to query")
-@click.option("--graph-content-stable", metavar='JSON_FILE', required=False,
-              help="Override content from stable channel - primarily for testing")
-@click.option("--graph-content-candidate", metavar='JSON_FILE', required=False,
-              help="Override content from candidate channel - primarily for testing")
-@click.option("--suggestions-url", metavar='SUGGESTIONS_URL', required=False,
-              default="https://raw.githubusercontent.com/openshift/cincinnati-graph-data/master/build-suggestions/",
-              help="Suggestions URL, load from {major}-{minor}-{arch}.yaml")
+@click.option(
+    "--version",
+    metavar='NEW_VER',
+    required=True,
+    help="The release to calculate previous for (e.g. 4.5.4 or 4.6.0..hotfix)",
+)
+@click.option(
+    "-a", "--arch", metavar='ARCH', help="Arch for which the repo should be generated", default='x86_64', required=False
+)
+@click.option(
+    "--graph-url",
+    metavar='GRAPH_URL',
+    required=False,
+    default='https://api.openshift.com/api/upgrades_info/v1/graph',
+    help="Cincinnati graph URL to query",
+)
+@click.option(
+    "--graph-content-stable",
+    metavar='JSON_FILE',
+    required=False,
+    help="Override content from stable channel - primarily for testing",
+)
+@click.option(
+    "--graph-content-candidate",
+    metavar='JSON_FILE',
+    required=False,
+    help="Override content from candidate channel - primarily for testing",
+)
+@click.option(
+    "--suggestions-url",
+    metavar='SUGGESTIONS_URL',
+    required=False,
+    default="https://raw.githubusercontent.com/openshift/cincinnati-graph-data/master/build-suggestions/",
+    help="Suggestions URL, load from {major}-{minor}-{arch}.yaml",
+)
 def release_calc_previous(version, arch, graph_url, graph_content_stable, graph_content_candidate, suggestions_url):
     # Refer to https://docs.google.com/document/d/16eGVikCYARd6nUUtAIHFRKXa7R_rU5Exc9jUPcQoG8A/edit
     # for information on channels & edges
-    results = get_release_calc_previous(version, arch, graph_url, graph_content_stable, graph_content_candidate, suggestions_url)
+    results = get_release_calc_previous(
+        version, arch, graph_url, graph_content_stable, graph_content_candidate, suggestions_url
+    )
     print(','.join(results))
 
 
 @cli.command("beta:reposync", short_help="Sync yum repos listed in group.yaml to local directory.")
 @click.option("-o", "--output", metavar="DIR", help="Output directory to sync to", required=True)
 @click.option("-c", "--cachedir", metavar="DIR", help="Cache directory for yum", required=True)
-@click.option("-a", "--arch",
-              metavar='ARCH',
-              help="Arch for which the repo should be generated",
-              default='x86_64', required=False)
-@click.option("--repo-type", metavar="REPO_TYPE", envvar="OIT_IMAGES_REPO_TYPE",
-              default="unsigned",
-              help="Repo group type to use for repo file generation (e.g. signed, unsigned).")
-@click.option("-n", "--name", "names", default=[], metavar='NAME', multiple=True,
-              help="Only sync the specified repository names; if not specified all will be synced.")
-@click.option('--dry-run', default=False, is_flag=True,
-              help='Print derived yum configuration for sync operation and exit')
+@click.option(
+    "-a", "--arch", metavar='ARCH', help="Arch for which the repo should be generated", default='x86_64', required=False
+)
+@click.option(
+    "--repo-type",
+    metavar="REPO_TYPE",
+    envvar="OIT_IMAGES_REPO_TYPE",
+    default="unsigned",
+    help="Repo group type to use for repo file generation (e.g. signed, unsigned).",
+)
+@click.option(
+    "-n",
+    "--name",
+    "names",
+    default=[],
+    metavar='NAME',
+    multiple=True,
+    help="Only sync the specified repository names; if not specified all will be synced.",
+)
+@click.option(
+    '--dry-run', default=False, is_flag=True, help='Print derived yum configuration for sync operation and exit'
+)
 @pass_runtime
 def beta_reposync(runtime, output, cachedir, arch, repo_type, names, dry_run):
     """Sync yum repos listed in group.yaml to local directory.
@@ -257,6 +332,8 @@ installonly_limit=3
         yellow_print('Creating cachedir: {}'.format(cachedir))
         exectools.cmd_assert('mkdir -p {}'.format(cachedir))
 
+    metadata_dir = None
+    yc_file = None
     try:
         # If corrupted, reposync metadata can interfere with subsequent runs.
         # Ensure we have a clean space for each invocation.
@@ -270,7 +347,6 @@ installonly_limit=3
         exectools.cmd_assert('yum clean all')  # clean the cache first to avoid outdated repomd.xml files
 
         for repo in repos.values():
-
             # If specific names were specified, only synchronize them.
             if names and repo.name not in names:
                 continue
@@ -280,16 +356,17 @@ installonly_limit=3
                 continue
 
             color_print('Syncing repo {}'.format(repo.name), 'blue')
-            cmd = ('dnf '
-                   f'--config {yc_file.name} '
-                   f'--repoid {repo.name} '
-                   'reposync '
-                   f'--arch {arch} '
-                   '--arch noarch '
-                   '--delete '
-                   '--download-metadata '
-                   f'--download-path {output} '
-                   )
+            cmd = (
+                'dnf '
+                f'--config {yc_file.name} '
+                f'--repoid {repo.name} '
+                'reposync '
+                f'--arch {arch} '
+                '--arch noarch '
+                '--delete '
+                '--download-metadata '
+                f'--download-path {output} '
+            )
             if repo.is_reposync_latest_only():
                 cmd += '--newest-only '
 
@@ -308,7 +385,11 @@ installonly_limit=3
         shutil.rmtree(metadata_dir, ignore_errors=True)
 
     if optional_fails:
-        yellow_print('Completed with the following optional repos skipped or partial due to failure, see log.:\n{}'.format('\n'.join(optional_fails)))
+        yellow_print(
+            'Completed with the following optional repos skipped or partial due to failure, see log.:\n{}'.format(
+                '\n'.join(optional_fails)
+            )
+        )
     else:
         green_print('Repos synced to {}'.format(output))
 
@@ -345,6 +426,7 @@ def analyze_debug_log(debug_log):
 
 def main():
     try:
+        # pylint: disable=no-value-for-parameter
         cli(obj={})
     except DoozerFatalError as ex:
         # Allow capturing actual tool errors and print them

@@ -1,10 +1,14 @@
-PLASHET_REMOTE_URL = "https://ocp-artifacts.hosts.prod.psi.rdu2.redhat.com/pub/RHOCP/plashets"
-PLASHET_REMOTE_HOST = "ocp-artifacts"
+PLASHET_REMOTES = [
+    {
+        'url': 'https://ocp-artifacts-art--runtime-int.apps.prod-stable-spoke1-dc-iad2.itup.redhat.com/pub/RHOCP/plashets',
+        'host': 'ocp-artifacts',
+    },
+]
+
 PLASHET_REMOTE_BASE_DIR = "/mnt/data/pub/RHOCP/plashets"
 
 SPMM_UTILS_REMOTE_HOST = "exd-ocp-buildvm-bot-prod@spmm-util"
 
-OPERATOR_URL = 'registry-proxy.engineering.redhat.com/rh-osbs/openshift-ose-operator-sdk'
 RELEASE_IMAGE_REPO = "quay.io/openshift-release-dev/ocp-release"
 
 GIT_AUTHOR = "AOS Automation Release Team <noreply@redhat.com>"
@@ -44,3 +48,7 @@ UMB_BROKERS = {
 }
 
 GITHUB_OWNER = "openshift-eng"
+
+KONFLUX_IMAGE_BUILD_PLR_TEMPLATE_URL_FORMAT = "https://raw.githubusercontent.com/{owner}/art-konflux-template/refs/heads/{branch_name}/.tekton/art-konflux-template-push.yaml"  # Konflux PipelineRun (PLR) template for image builds
+KONFLUX_BUNDLE_BUILD_PLR_TEMPLATE_URL_FORMAT = "https://raw.githubusercontent.com/{owner}/art-konflux-template/refs/heads/{branch_name}/.tekton/art-bundle-konflux-template-push.yaml"  # Konflux PipelineRun (PLR) template for bundle builds
+KONFLUX_FBC_BUILD_PLR_TEMPLATE_URL_FORMAT = "https://raw.githubusercontent.com/{owner}/art-konflux-template/refs/heads/{branch_name}/.tekton/art-fbc-konflux-template-push.yaml"  # Konflux PipelineRun (PLR) template for FBC builds

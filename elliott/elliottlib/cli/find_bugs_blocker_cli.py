@@ -1,12 +1,16 @@
-import click
+import logging
 import sys
 import traceback
 
+import click
 from artcommonlib.format_util import green_prefix
-from elliottlib.cli.find_bugs_sweep_cli import print_report, FindBugsMode
+
+from elliottlib import Runtime, constants
 from elliottlib.bzutil import BugTracker
-from elliottlib import (Runtime, constants)
 from elliottlib.cli.common import cli
+from elliottlib.cli.find_bugs_sweep_cli import FindBugsMode, print_report
+
+LOGGER = logging.getLogger(__name__)
 
 
 class FindBugsBlocker(FindBugsMode):
@@ -19,43 +23,52 @@ class FindBugsBlocker(FindBugsMode):
     def search(self, bug_tracker_obj: BugTracker, verbose: bool = False):
         return bug_tracker_obj.blocker_search(
             self.status,
-            verbose=verbose
+            verbose=verbose,
         )
 
 
 @cli.command("find-bugs:blocker", short_help="List active blocker bugs")
-@click.option("--include-status", 'include_status',
-              multiple=True,
-              default=None,
-              required=False,
-              type=click.Choice(constants.VALID_BUG_STATES),
-              help="Include bugs of this status")
-@click.option("--exclude-status", 'exclude_status',
-              multiple=True,
-              default=None,
-              required=False,
-              type=click.Choice(constants.VALID_BUG_STATES),
-              help="Exclude bugs of this status")
-@click.option('--output', '-o',
-              required=False,
-              type=click.Choice(['text', 'json', 'slack']),
-              default='text',
-              help='Display format for output')
+@click.option(
+    "--include-status",
+    'include_status',
+    multiple=True,
+    default=None,
+    required=False,
+    type=click.Choice(constants.VALID_BUG_STATES),
+    help="Include bugs of this status",
+)
+@click.option(
+    "--exclude-status",
+    'exclude_status',
+    multiple=True,
+    default=None,
+    required=False,
+    type=click.Choice(constants.VALID_BUG_STATES),
+    help="Exclude bugs of this status",
+)
+@click.option(
+    '--output',
+    '-o',
+    required=False,
+    type=click.Choice(['text', 'json', 'slack']),
+    default='text',
+    help='Display format for output',
+)
 @click.pass_obj
 def find_bugs_blocker_cli(runtime: Runtime, include_status, exclude_status, output):
     """
-List active OCP blocker bugs for the target-releases.
-default bug status to search: ['NEW', 'ASSIGNED', 'POST', 'MODIFIED', 'ON_DEV', 'ON_QA']
-Use --exclude_status to filter out from default status list.
+    List active OCP blocker bugs for the target-releases.
+    default bug status to search: ['NEW', 'ASSIGNED', 'POST', 'MODIFIED', 'ON_DEV', 'ON_QA']
+    Use --exclude_status to filter out from default status list.
 
-    Find blocker bugs for 4.6:
-\b
-    $ elliott -g openshift-4.6 find-bugs:blocker
+        Find blocker bugs for 4.6:
+    \b
+        $ elliott -g openshift-4.6 find-bugs:blocker
 
-    Output in json format:
-\b
-    $ elliott -g openshift-4.6 find-bugs:blocker --output json
-"""
+        Output in json format:
+    \b
+        $ elliott -g openshift-4.6 find-bugs:blocker --output json
+    """
     runtime.initialize()
     find_bugs_obj = FindBugsBlocker()
     find_bugs_obj.include_status(include_status)
@@ -65,8 +78,8 @@ Use --exclude_status to filter out from default status list.
         try:
             find_bugs_blocker(runtime, output, find_bugs_obj, b)
         except Exception as e:
-            runtime.logger.error(traceback.format_exc())
-            runtime.logger.error(f'exception with {b.type} bug tracker: {e}')
+            LOGGER.error(traceback.format_exc())
+            LOGGER.error(f'exception with {b.type} bug tracker: {e}')
             exit_code = 1
     sys.exit(exit_code)
 

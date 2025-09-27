@@ -1,8 +1,12 @@
+import io
+import logging
+import shutil
+import tempfile
 from unittest import IsolatedAsyncioTestCase
-from future import standard_library
 
 from artcommonlib.assembly import AssemblyTypes
 from artcommonlib.model import Model
+from future import standard_library
 
 standard_library.install_aliases()
 
@@ -10,10 +14,6 @@ try:
     from importlib import reload
 except ImportError:
     pass
-import io
-import logging
-import tempfile
-import shutil
 
 
 class MockDistgit(object):
@@ -27,7 +27,6 @@ class MockContent(object):
 
 
 class MockConfig(dict):
-
     def __init__(self, *args, **kwargs):
         super(MockConfig, self).__init__(*args, **kwargs)
         self.distgit = MockDistgit()
@@ -37,7 +36,6 @@ class MockConfig(dict):
 
 
 class SimpleMockLock(object):
-
     def __enter__(self):
         pass
 
@@ -46,7 +44,6 @@ class SimpleMockLock(object):
 
 
 class MockRuntime(object):
-
     def __init__(self, logger):
         self.branch = None
         self.distgits_dir = "distgits_dir"
@@ -56,12 +53,8 @@ class MockRuntime(object):
         self.cache_dir = None
         self.assembly_type = AssemblyTypes.STANDARD
 
-    def detect_remote_source_branch(self, _):
-        pass
-
 
 class MockMetadata(object):
-
     def __init__(self, runtime):
         self.config = MockConfig()
         self.runtime = runtime
@@ -76,9 +69,15 @@ class MockMetadata(object):
     def get_component_name(self):
         pass
 
+    @property
+    def canonical_builders_enabled(self):
+        return False
+
+    def has_source(self):
+        return True
+
 
 class MockScanner(object):
-
     def __init__(self):
         self.matches = []
         self.files = []

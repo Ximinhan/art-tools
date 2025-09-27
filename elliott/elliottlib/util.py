@@ -1,21 +1,27 @@
 import asyncio
-import json
+import concurrent.futures
 import datetime
+import json
 import re
-import click
 from collections import deque
 from itertools import chain
 from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool as ThreadPool
 from sys import getsizeof, stderr
-from typing import Dict, Iterable, List, Optional, Tuple, Sequence, Any
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import click
+import yaml
 from artcommonlib import exectools
-from artcommonlib.format_util import red_prefix, green_prefix, green_print
+from artcommonlib.build_visibility import get_build_system
+from artcommonlib.format_util import green_prefix, green_print, red_prefix
+from artcommonlib.konflux.konflux_build_record import KonfluxBuildRecord
+from artcommonlib.konflux.konflux_db import KonfluxDb
+from artcommonlib.logutil import get_logger
+from errata_tool import Erratum
+
 from elliottlib import brew
 from elliottlib.exceptions import BrewBuildException
-
-from errata_tool import Erratum
 
 # -----------------------------------------------------------------------------
 # Constants and defaults
@@ -23,6 +29,8 @@ from errata_tool import Erratum
 default_release_date = datetime.datetime(1970, 1, 1, 0, 0)
 now = datetime.datetime.now()
 YMD = '%Y-%b-%d'
+LOGGER = get_logger(__name__)
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 
 def exit_unauthenticated():
@@ -46,6 +54,8 @@ def ensure_erratatool_auth():
 
 def validate_release_date(ctx, param, value):
     """Ensures dates are provided in the correct format"""
+    if value is None:
+        return None
     try:
         release_date = datetime.datetime.strptime(value, YMD)
         if release_date == default_release_date:
@@ -66,38 +76,37 @@ def validate_email_address(ctx, param, value):
     # Really just check to match /^[^@]+@[^@]+\.[^@]+$/
     email_re = re.compile(r'^[^@ ]+@[^@ ]+\.[^@ ]+$')
     if not email_re.match(value):
-        raise click.BadParameter(
-            "Invalid email address for {}: {}".format(param, value))
+        raise click.BadParameter("Invalid email address for {}: {}".format(param, value))
 
     return value
 
 
 def pbar_header(msg_prefix='', msg='', seq=[], char='*', file=None):
     """Generate a progress bar header for a given iterable or
-sequence. The given sequence must have a countable length. A bar of
-`char` characters is printed between square brackets.
+    sequence. The given sequence must have a countable length. A bar of
+    `char` characters is printed between square brackets.
 
-    :param string msg_prefix: Header text to print in heavy green text
-    :param string msg: Header text to print in the default char face
-    :param sequence seq: A sequence (iterable) to size the progress
-    bar against
-    :param str char: The character to use when drawing the progress
-    :param file: the file to print the progress. None means stdout.
-    bar
+        :param string msg_prefix: Header text to print in heavy green text
+        :param string msg: Header text to print in the default char face
+        :param sequence seq: A sequence (iterable) to size the progress
+        bar against
+        :param str char: The character to use when drawing the progress
+        :param file: the file to print the progress. None means stdout.
+        bar
 
-For example:
+    For example:
 
-    pbar_header("Foo: ", "bar", seq=[None, None, None], char='-')
+        pbar_header("Foo: ", "bar", seq=[None, None, None], char='-')
 
-would produce:
+    would produce:
 
-    Foo: bar
-    [---]
+        Foo: bar
+        [---]
 
-where 'Foo: ' is printed using green_prefix() and 'bar' is in the
-default console fg color and weight.
+    where 'Foo: ' is printed using green_prefix() and 'bar' is in the
+    default console fg color and weight.
 
-TODO: This would make a nice context wrapper.
+    TODO: This would make a nice context wrapper.
 
     """
     green_prefix(msg_prefix, file=file)
@@ -107,16 +116,16 @@ TODO: This would make a nice context wrapper.
 
 def progress_func(func, char='*', file=None):
     """Use to wrap functions called in parallel. Prints a character for
-each function call.
+    each function call.
 
-    :param lambda-function func: A 'lambda wrapped' function to call
-    after printing a progress character
-    :param str char: The character (or multi-char string, if you
-    really wanted to) to print before calling `func`
-    :param file: the file to print the progress. None means stdout.
+        :param lambda-function func: A 'lambda wrapped' function to call
+        after printing a progress character
+        :param str char: The character (or multi-char string, if you
+        really wanted to) to print before calling `func`
+        :param file: the file to print the progress. None means stdout.
 
-    Usage examples:
-      * See find-builds command
+        Usage examples:
+          * See find-builds command
     """
     click.secho(char, fg='green', nl=False, file=file)
     return func()
@@ -142,9 +151,7 @@ def parallel_results_with_progress(inputs, func, file=None):
     """
     click.secho('[', nl=False, file=file)
     pool = ThreadPool(cpu_count())
-    results = pool.map(
-        lambda it: progress_func(lambda: func(it), file=file),
-        inputs)
+    results = pool.map(lambda it: progress_func(lambda: func(it), file=file), inputs)
 
     # Wait for results
     pool.close()
@@ -155,13 +162,13 @@ def parallel_results_with_progress(inputs, func, file=None):
 
 
 def get_release_version(pv):
-    """ known formats of product_version:
-        - OSE-4.1-RHEL-8
-        - RHEL-7-OSE-4.1
-        - ...-FOR-POWER-LE and similar suffixes we probably no longer need
-        - OSE-IRONIC-4.11-RHEL-8
+    """known formats of product_version:
+    - OSE-4.1-RHEL-8
+    - RHEL-7-OSE-4.1
+    - ...-FOR-POWER-LE and similar suffixes we probably no longer need
+    - OSE-IRONIC-4.11-RHEL-8
 
-        this will break and need fixing if we introduce more.
+    this will break and need fixing if we introduce more.
     """
     return re.search(r'OSE-(IRONIC-)?(\d+\.\d+)', pv).groups()[1]
 
@@ -315,7 +322,7 @@ def strip_epoch(nvr: str):
 
 # https://code.activestate.com/recipes/577504/
 def total_size(o, handlers={}, verbose=False):
-    """ Returns the approximate memory footprint an object and all of its contents.
+    """Returns the approximate memory footprint an object and all of its contents.
 
     Automatically finds the contents of the following builtin containers and
     their subclasses:  tuple, list, deque, dict, set and frozenset.
@@ -325,7 +332,10 @@ def total_size(o, handlers={}, verbose=False):
                     OtherContainerClass: OtherContainerClass.get_elements}
 
     """
-    dict_handler = lambda d: chain.from_iterable(d.items())
+
+    def dict_handler(d):
+        return chain.from_iterable(d.items())
+
     all_handlers = {
         tuple: iter,
         list: iter,
@@ -381,13 +391,42 @@ def get_golang_container_nvrs(nvrs: List[Tuple[str, str, str]], logger) -> Dict[
 
     :return: a dict mapping go version string to a list of nvrs built from that go version
     """
-    all_build_objs = brew.get_build_objects([
-        '{}-{}-{}'.format(*n) for n in nvrs
-    ])
+    # quickly determine build system from given nvrs using build_visibility suffix
+    build_system = None
+    for nvr in nvrs:
+        # release is something like 202508201021.p2.gb7cfbf8.assembly.stream.el8
+        # we just want the p2 part
+        nvr_build_system = get_build_system(nvr[2].split('.')[1])
+        if build_system is not None:
+            assert build_system == nvr_build_system, (
+                f'Build system mismatch for {nvr}: {build_system} != {nvr_build_system}'
+            )
+        else:
+            build_system = nvr_build_system
+    if build_system == 'brew':
+        return get_golang_container_nvrs_brew(nvrs, logger)
+    elif build_system == 'konflux':
+        return get_golang_container_nvrs_konflux(nvrs, logger)
+
+
+def get_golang_container_nvrs_brew(nvrs: List[Tuple[str, str, str]], logger) -> Dict[str, Dict[str, str]]:
+    """
+    :param nvrs: a list of tuples containing (name, version, release) in order
+    :param logger: logger
+
+    :return: a dict mapping go version string to a list of nvrs built from that go version
+    """
+    all_build_objs = brew.get_build_objects(['{}-{}-{}'.format(*n) for n in nvrs])
     go_nvr_map = {}
-    for build in all_build_objs:
+    for build, nvr_param in zip(all_build_objs, nvrs):
+        if not build:
+            raise ValueError(f'Brew build object not found for {"-".join(nvr_param)}.')
         go_version = None
-        nvr = (build['name'], build['version'], build['release'])
+        try:
+            nvr = (build['name'], build['version'], build['release'])
+        except TypeError:
+            logger.error(f'Error parsing {build}')
+            raise
         name = nvr[0]
         if name == 'openshift-golang-builder-container' or 'go-toolset' in name:
             go_version = golang_builder_version(nvr, logger)
@@ -417,6 +456,56 @@ def get_golang_container_nvrs(nvrs: List[Tuple[str, str, str]], logger) -> Dict[
         if go_version not in go_nvr_map:
             go_nvr_map[go_version] = set()
         go_nvr_map[go_version].add(nvr)
+    return go_nvr_map
+
+
+def get_golang_container_nvrs_konflux(nvrs: List[Tuple[str, str, str]], logger) -> Dict[str, Dict[str, str]]:
+    """
+    :param nvrs: a list of tuples containing (name, version, release) in order
+    :param logger: logger
+
+    :return: a dict mapping go version string to a list of nvrs built from that go version
+    """
+    konflux_db = KonfluxDb()
+    konflux_db.bind(KonfluxBuildRecord)
+
+    logger.info(f'Getting build records for {len(nvrs)} nvrs from KonfluxDB')
+
+    all_build_objs = _executor.submit(
+        lambda: asyncio.run(konflux_db.get_build_records_by_nvrs(['{}-{}-{}'.format(*n) for n in nvrs]))
+    ).result()
+
+    go_nvr_map = {}
+    for build in all_build_objs:
+        go_version = None
+        nvr = build.nvr
+        name = parse_nvr(nvr)['name']
+        if name == 'openshift-golang-builder-container' or 'go-toolset' in name:
+            # this assumes golang builder for image is still in brew
+            go_version = golang_builder_version(nvr, logger)
+            if not go_version:
+                raise ValueError(f'Cannot find go version for {name}')
+            if go_version not in go_nvr_map:
+                go_nvr_map[go_version] = set()
+            go_nvr_map[go_version].add(nvr)
+            continue
+
+        parents = build.parent_images
+        for p in parents:
+            # brew.registry.redhat.io/rh-osbs/openshift-golang-builder:v1.24.4-202507171054.g2f6f49f.el9
+            if 'openshift-golang-builder' in p or 'go-toolset' in p:
+                temp = p.split('/')[-1]
+                go_version = temp.replace(':', '-container-')
+                break
+
+        if not go_version:
+            logger.debug(f'Could not find parent Go builder image for {nvr}')
+            continue
+
+        if go_version not in go_nvr_map:
+            go_nvr_map[go_version] = set()
+        go_nvr_map[go_version].add(nvr)
+    logger.info(f'Found {len(go_nvr_map)} golang builder nvrs: {sorted(go_nvr_map.keys())}')
     return go_nvr_map
 
 
@@ -493,41 +582,55 @@ def pretty_print_nvrs_go_json(go_nvr_map, report=False):
 
 def chunk(a_sequence: Sequence[Any], chunk_size: int) -> List[Any]:
     for i in range(0, len(a_sequence), chunk_size):
-        yield a_sequence[i:i + chunk_size]
+        yield a_sequence[i : i + chunk_size]
 
 
 def all_same(items: Iterable[Any]):
-    """ Determine if all items are the same """
+    """Determine if all items are the same"""
     it = iter(items)
     first = next(it, None)
     return all(x == first for x in it)
 
 
-async def get_nvrs_from_payload(pullspec, rhcos_images, logger=None):
+async def get_nvrs_from_release(pullspec_or_imagestream, rhcos_images, logger=None):
+    """
+    Get all payload NVRs from a release pullspec or imagestream.
+    """
+
     def log(msg):
         if logger:
             logger.info(msg)
 
+    # a pullspec looks like this: quay.io/openshift-release-dev/ocp-release:4.17.14-x86_64
+    # an imagestream looks like this: 4.17-art-assembly-4.17.14
+    if '@' in pullspec_or_imagestream or ':' in pullspec_or_imagestream:
+        is_pullspec = True
+    else:
+        is_pullspec = False
+
     all_payload_nvrs = {}
     log("Fetching release info...")
-    release_export_cmd = f'oc adm release info {pullspec} -o json'
+    if is_pullspec:
+        rc, stdout, stderr = await exectools.cmd_gather_async(
+            f'oc adm release info -o json -n ocp {pullspec_or_imagestream}'
+        )
+        tags = json.loads(stdout)['references']['spec']['tags']
+    else:  # it is an imagestream
+        # get image_stream and name_space out of pullspec_or_imagestream
+        image_stream = pullspec_or_imagestream.split("/")[-1]  # Get the part after /
+        name_space = pullspec_or_imagestream.split("/")[0]  # Get the part before /
 
-    rc, stdout, stderr = exectools.cmd_gather(release_export_cmd)
-    if rc != 0:
-        # Probably no point in continuing.. can't contact brew?
-        msg = f"Unable to run oc release info: out={stdout}  ; err={stderr}"
-        raise RuntimeError(msg)
+        rc, stdout, stderr = await exectools.cmd_gather_async(f'oc -o json -n {name_space} get is/{image_stream}')
+        tags = json.loads(stdout)['spec']['tags']
 
-    payload_json = json.loads(stdout)
     log("Looping over payload images...")
-    log(f"{len(payload_json['references']['spec']['tags'])} images to check")
-    cmds = [['oc', 'image', 'info', '-o', 'json', tag['from']['name']] for tag in
-            payload_json['references']['spec']['tags']]
+    log(f"{len(tags)} images to check")
+    cmds = [['oc', 'image', 'info', '-o', 'json', tag['from']['name']] for tag in tags]
 
     log("Querying image infos...")
     cmd_results = await asyncio.gather(*[exectools.cmd_gather_async(cmd) for cmd in cmds])
 
-    for image, cmd, cmd_result in zip(payload_json['references']['spec']['tags'], cmds, cmd_results):
+    for image, cmd, cmd_result in zip(tags, cmds, cmd_results):
         image_name = image['name']
         rc, stdout, stderr = cmd_result
         if rc != 0:
@@ -551,3 +654,42 @@ async def get_nvrs_from_payload(pullspec, rhcos_images, logger=None):
         r = labels['release']
         all_payload_nvrs[component] = (v, r)
     return all_payload_nvrs
+
+
+def get_common_advisory_template(runtime):
+    out = runtime.get_file_from_branch(branch="main", filename="config/advisory_templates.yml")
+    return yaml.safe_load(out)
+
+
+def get_advisory_boilerplate(runtime, et_data, art_advisory_key, errata_type):
+    # rhsa/rhba keys are in lower case: https://github.com/openshift-eng/ocp-build-data/blob/main/config/advisory_templates.yml#L3
+    # Also if advisory type is RHEA, use the RHBA advisory template
+    errata_type = errata_type.lower()
+    errata_type = "rhba" if errata_type == "rhea" else errata_type
+    et_data["errata_type"] = errata_type
+
+    # Group level overrides common config present in openshift-eng/ocp-build-data main branch
+    # Try to get the group level boilerplate first
+    boilerplate = et_data.get("boilerplates", {})
+    if not boilerplate:
+        # If group level is missing, use common one in openshift#main branch
+        common_advisory_template = get_common_advisory_template(runtime)
+        boilerplate = common_advisory_template.get("boilerplates", {})
+
+    if not boilerplate:
+        raise ValueError("`boilerplates` is required in erratatool.yml")
+    if art_advisory_key not in boilerplate:
+        if art_advisory_key == "rhcos" and "image" in boilerplate:
+            # For backwards compatibility with older versions of erratatool.yml, i.e. rhcos key does not exist
+            art_advisory_key = "image"
+        else:
+            raise ValueError(f"Boilerplate {art_advisory_key} not found in erratatool.yml")
+
+    # Get the boilerplate for a type of errata and advisory type
+    try:
+        advisory_boilerplate = boilerplate[art_advisory_key][errata_type]
+    except KeyError:
+        # For backwards compatibility with older versions of erratatool.yml, i.e. rhsa, rhba keys does not exist
+        advisory_boilerplate = boilerplate[art_advisory_key]
+
+    return advisory_boilerplate

@@ -1,16 +1,18 @@
 import json
-import os
 import logging
-
-from pyartcd import exectools
-from pyartcd.runtime import Runtime
-import openshift_client as octool
+import os
 from typing import List, Optional
 
+import openshift_client as octool
+from artcommonlib import exectools
+from tenacity import retry, stop_after_attempt
+
+from pyartcd.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
 
+@retry(reraise=True, stop=stop_after_attempt(3))
 async def get_image_info(pullspec: str, raise_if_not_found: bool = False):
     cmd = ["oc", "image", "info", "--show-multiarch", "-o", "json", "--", pullspec]
     env = os.environ.copy()
@@ -32,6 +34,7 @@ async def get_image_info(pullspec: str, raise_if_not_found: bool = False):
     return info
 
 
+@retry(reraise=True, stop=stop_after_attempt(3))
 async def get_release_image_info(pullspec: str, raise_if_not_found: bool = False):
     cmd = ["oc", "adm", "release", "info", "-o", "json", "--", pullspec]
     env = os.environ.copy()
@@ -50,21 +53,46 @@ async def get_release_image_info(pullspec: str, raise_if_not_found: bool = False
     return info
 
 
-async def registry_login(runtime: Runtime):
+async def registry_login():
+    """
+    Login into OC registry using KUBECONFIG env var
+    """
+
     try:
-        await exectools.cmd_gather_async(
-            f'oc --kubeconfig {os.environ["KUBECONFIG"]} registry login')
+        await exectools.cmd_gather_async(f'oc --kubeconfig {os.environ["KUBECONFIG"]} registry login')
 
     except KeyError:
-        runtime.logger.error('KUBECONFIG env var must be defined!')
+        logger.error('KUBECONFIG env var must be defined!')
         raise
 
     except ChildProcessError:
-        runtime.logger.error('Failed to login into OC registry')
+        logger.error('Failed to login into OC registry')
         raise
 
 
-def common_oc_wrapper(cmd_result_name: str, cli_verb: str, oc_args: List[str], check_status: bool = True, return_value: bool = False) -> (int, str):
+async def qci_registry_login():
+    """
+    Log in to quay.io with credentials necessary to push to DPTP's QCI registry (quay.io/openshift/ci)
+    """
+
+    try:
+        await exectools.cmd_gather_async(
+            f'oc registry login --registry=quay.io/openshift --auth-basic={os.environ["QCI_USER"]}:{os.environ["QCI_PASSWORD"]}'
+        )
+
+    except KeyError:
+        logger.error('QCI_USER and QCI_PASSWORD env vars must be defined!')
+        raise
+
+    except ChildProcessError:
+        logger.error('Failed to login into QCI registry')
+        raise
+
+
+@retry(reraise=True, stop=stop_after_attempt(3))
+def common_oc_wrapper(
+    cmd_result_name: str, cli_verb: str, oc_args: List[str], check_status: bool = True, return_value: bool = False
+) -> (int, str):
     # cmd_result_name: Result obj name in log
     # cli_verb: first command group
     # oc_args: args list of command
@@ -116,7 +144,9 @@ def extract_release_client_tools(release_pullspec: str, path_arg: str, single_ar
     common_oc_wrapper("extract_tools", "adm", args, True, False)
 
 
-def extract_baremetal_installer(release_pullspec: str, path: str, arch: str) -> (int, str):
+def extract_baremetal_installer(
+    release_pullspec: str, path: str, arch: str, cmd: str = 'openshift-baremetal-install'
+) -> (int, str):
     """
     Extract baremetal-installer binary to specified location
     :param release_pullspec: e.g. quay.io/openshift-release-dev/ocp-release:4.14.0-ec.2-x86_64
@@ -124,13 +154,25 @@ def extract_baremetal_installer(release_pullspec: str, path: str, arch: str) -> 
     :param arch: "amd64", "s390x", "ppc64le", "arm64"
     """
 
+    cmd_os = f'linux/{arch}'
     # oc adm release extract --command=openshift-baremetal-install -n=ocp --to <path> <pullspec>
-    args = ['release', 'extract', '--command=openshift-baremetal-install', '-n=ocp', '--from',
-            release_pullspec, '--command-os', f'linux/{arch}', f'--to={path}']
+    args = [
+        'release',
+        'extract',
+        f'--command={cmd}',
+        '-n=ocp',
+        '--from',
+        release_pullspec,
+        '--filter-by-os',
+        cmd_os,
+        '--command-os',
+        cmd_os,
+        f'--to={path}',
+    ]
     return common_oc_wrapper(
         cmd_result_name='extract_baremetal',
         cli_verb='adm',
         oc_args=args,
         check_status=True,
-        return_value=True
+        return_value=True,
     )

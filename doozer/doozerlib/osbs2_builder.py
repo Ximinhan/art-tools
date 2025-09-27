@@ -5,8 +5,8 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import quote
 
 import koji
-
 from artcommonlib import exectools
+
 from doozerlib import brew, distgit, image, runtime
 from doozerlib.constants import BREWWEB_URL, DISTGIT_GIT_URL
 from doozerlib.exceptions import DoozerFatalError
@@ -20,13 +20,10 @@ class OSBS2BuildError(Exception):
 
 
 class OSBS2Builder:
-    """ Builds container images with OSBS 2
-    """
+    """Builds container images with OSBS 2"""
 
-    def __init__(
-        self, runtime: "runtime.Runtime", *, scratch: bool = False, dry_run: bool = False
-    ) -> None:
-        """ Create a OSBS2Builder instance.
+    def __init__(self, runtime: "runtime.Runtime", *, scratch: bool = False, dry_run: bool = False) -> None:
+        """Create a OSBS2Builder instance.
         :param runtime: Doozer runtime
         :param scratch: Whether to create a scratch build
         :param dry_run: Don't build anything but just exercise the code
@@ -35,8 +32,10 @@ class OSBS2Builder:
         self.scratch = scratch
         self.dry_run = dry_run
 
-    async def build(self, image: "image.ImageMetadata", profile: Dict, retries: int = 3) -> Tuple[int, Optional[str], Optional[Dict]]:
-        """ Build an image
+    async def build(
+        self, image: "image.ImageMetadata", profile: Dict, retries: int = 3
+    ) -> Tuple[int, Optional[str], Optional[Dict]]:
+        """Build an image
         :param image: Image metadata
         :param profile: Build profile
         :param retries: The number of times to retry
@@ -89,7 +88,11 @@ class OSBS2Builder:
                     build_info = koji_api.getBuild(nvr)
                     if build_info and build_info.get('state') == 1:  # State 1 means complete.
                         build_url = f"{BREWWEB_URL}/buildinfo?buildID={build_info['id']}"
-                        logger.info("Image %s already built against this dist-git commit (or version-release tag): %s", build_info["nvr"], build_url)
+                        logger.info(
+                            "Image %s already built against this dist-git commit (or version-release tag): %s",
+                            build_info["nvr"],
+                            build_url,
+                        )
                         error = None  # Treat as a success
 
             except Exception as err:
@@ -131,20 +134,31 @@ class OSBS2Builder:
         if error:
             raise OSBS2BuildError(
                 f"Giving up after {retries} failed attempt(s): {message}",
-                task_id, task_url
+                task_id,
+                task_url,
             )
 
         if build_info:
-            logger.info("Successfully built image %s; task: %s ; nvr: %s ; build record: %s ", image.name, task_url, build_info["nvr"], build_url)
+            logger.info(
+                "Successfully built image %s; task: %s ; nvr: %s ; build record: %s ",
+                image.name,
+                task_url,
+                build_info["nvr"],
+                build_url,
+            )
         else:
             logger.info("Successfully built image %s without a build record; task: %s", image.name, task_url)
 
         if not self.scratch and self._runtime.hotfix:
             # Tag the image so it won't get garbage collected.
-            logger.info(f'Tagging {image.get_component_name()} build {build_info["nvr"]} into {image.hotfix_brew_tag()}'
-                        f' to prevent garbage collection')
+            logger.info(
+                f'Tagging {image.get_component_name()} build {build_info["nvr"]} into {image.hotfix_brew_tag()}'
+                f' to prevent garbage collection'
+            )
             if self.dry_run:
-                logger.warning("[DRY RUN] Build %s would have been tagged into %s", build_info["nvr"], image.hotfix_brew_tag())
+                logger.warning(
+                    "[DRY RUN] Build %s would have been tagged into %s", build_info["nvr"], image.hotfix_brew_tag()
+                )
             else:
                 koji_api.tagBuild(image.hotfix_brew_tag(), build_info["nvr"])
                 logger.warning("Build %s has been tagged into %s", build_info["nvr"], image.hotfix_brew_tag())
@@ -158,15 +172,17 @@ class OSBS2Builder:
         repo_type = profile["repo_type"]
         repo_list = profile["repo_list"]
         if repo_type and not repo_list:  # If --repo was not specified on the command line
-            repo_file = f".oit/{repo_type}.repo"
+            repo_file = f".oit/art-{repo_type}.repo"
             if not self.dry_run:
                 existence, repo_url = dg.cgit_file_available(repo_file)
             else:
                 logger.warning("[DRY RUN] Would have checked if cgit repo file is present.")
                 existence, repo_url = True, f"https://cgit.example.com/{repo_file}"
             if not existence:
-                raise FileNotFoundError(f"Repo file {repo_file} is not available on cgit; cgit cache may not be"
-                                        f" reflecting distgit in a timely manner.")
+                raise FileNotFoundError(
+                    f"Repo file {repo_file} is not available on cgit; cgit cache may not be"
+                    f" reflecting distgit in a timely manner."
+                )
             repo_list = [repo_url]
 
         opts = {

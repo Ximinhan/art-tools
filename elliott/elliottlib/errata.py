@@ -7,25 +7,24 @@ associated metadata.
 Classes representing an ERRATUM (a single errata)
 
 """
+
 import datetime
 import json
-import ssl
 import re
+import ssl
+from functools import lru_cache
+from typing import Dict, List
+
 import click
 import requests
-from functools import lru_cache
-
 from artcommonlib import logutil
 from artcommonlib.format_util import green_print
-from elliottlib import exceptions, constants, brew
-from elliottlib.util import chunk
-from elliottlib import bzutil
+from errata_tool import ErrataConnector, ErrataException, Erratum
 from requests_gssapi import HTTPSPNEGOAuth
-from errata_tool import Erratum, ErrataException, ErrataConnector
-from typing import List, Optional
+from tenacity import retry, stop_after_attempt, wait_fixed
 
-
-import xmlrpc.client
+from elliottlib import brew, bzutil, constants, exceptions
+from elliottlib.util import chunk
 
 logger = logutil.get_logger(__name__)
 
@@ -36,6 +35,7 @@ class Advisory(Erratum):
     """
     Wrapper class of errata_tool.Erratum
     """
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
@@ -70,7 +70,7 @@ class Advisory(Erratum):
             self.addBuilds(
                 buildlist=[build.nvr for build in builds if build.product_version == pv],
                 release=pv,
-                file_types={build.nvr: [file_type] for build in builds if build.product_version == pv}
+                file_types={build.nvr: [file_type] for build in builds if build.product_version == pv},
             )
 
         build_nvrs = sorted(build.nvr for build in builds)
@@ -112,12 +112,22 @@ def add_jira_issue(advisory_id, jira_issue_id):
     return ErrataConnector()._post(f"/api/v1/erratum/{advisory_id}/add_jira_issue", json={'jira_issue': jira_issue_id})
 
 
+def sync_jira_issue(jira_issue_id):
+    """
+    Sync a jira issue to advisory
+    Response code will return
+    """
+    return ErrataConnector()._post("/api/v1/jira/refresh", json=[jira_issue_id])
+
+
 def remove_jira_issue(advisory_id, jira_issue_id):
     """
     Remove a jira issue from advisory
     Response code will return
     """
-    return ErrataConnector()._post(f"/api/v1/erratum/{advisory_id}/remove_jira_issue", json={'jira_issue': jira_issue_id})
+    return ErrataConnector()._post(
+        f"/api/v1/erratum/{advisory_id}/remove_jira_issue", json={'jira_issue': jira_issue_id}
+    )
 
 
 def remove_multi_jira_issues(advisory_id, jira_list: List):
@@ -180,11 +190,16 @@ def get_jira_issue(jira_issue_id):
     return ErrataConnector()._get(f"/jira_issues/{jira_issue_id}.json")
 
 
-def get_bug_ids(advisory_id):
+def get_bug_ids(advisory_id) -> dict:
     """
     Retrieve just the bug IDs from an advisory without wasting time processing it, loading builds, etc.
+    :param advisory_id: The advisory ID
+    :return: A dict with keys 'bugzilla' and 'jira' containing lists of bug IDs
     """
-    return [bug['bug']['id'] for bug in get_raw_erratum(advisory_id)['bugs']['bugs']]
+    raw_erratum = get_raw_erratum(advisory_id)
+    bugzilla_ids = [bug['bug']['id'] for bug in raw_erratum['bugs']['bugs']]
+    jira_ids = raw_erratum['jira_issues']['idsfixed']
+    return {'bugzilla': bugzilla_ids, 'jira': jira_ids}
 
 
 def get_erratum_content_type(advisory_id: str):
@@ -197,8 +212,16 @@ def get_erratum_content_type(advisory_id: str):
     return None
 
 
-def new_erratum(et_data, errata_type, boilerplate_name, release_date=None, create=False,
-                assigned_to=None, manager=None, package_owner=None):
+def new_erratum(
+    et_data,
+    errata_type,
+    boilerplate_name,
+    release_date=None,
+    create=False,
+    assigned_to=None,
+    manager=None,
+    package_owner=None,
+):
     """5.2.1.1. POST /api/v1/erratum
 
     Create a new advisory.
@@ -255,7 +278,7 @@ def new_erratum(et_data, errata_type, boilerplate_name, release_date=None, creat
         qe_group=et_data['quality_responsibility_name'],
         owner_email=package_owner,
         manager_email=manager,
-        date=release_date
+        date=release_date,
     )
 
     if create:
@@ -272,17 +295,15 @@ def build_signed(build):
     :param string build: The build nvr or id
     """
     filter_endpoint = constants.errata_get_build_url.format(id=build)
-    res = requests.get(filter_endpoint,
-                       verify=ssl.get_default_verify_paths().openssl_cafile,
-                       auth=HTTPSPNEGOAuth())
+    res = requests.get(filter_endpoint, verify=ssl.get_default_verify_paths().openssl_cafile, auth=HTTPSPNEGOAuth())
     if res.status_code == 200:
         return res.json()['rpms_signed']
     elif res.status_code == 401:
         raise exceptions.ErrataToolUnauthenticatedException(res.text)
     else:
-        raise exceptions.ErrataToolError("Other error (status_code={code}): {msg}".format(
-            code=res.status_code,
-            msg=res.text))
+        raise exceptions.ErrataToolError(
+            "Other error (status_code={code}): {msg}".format(code=res.status_code, msg=res.text)
+        )
 
 
 def get_art_release_from_erratum(advisory_id):
@@ -299,24 +320,27 @@ def get_art_release_from_erratum(advisory_id):
 def add_comment(advisory_id, comment):
     """5.2.1.8. POST /api/v1/erratum/{id}/add_comment
 
-        Add a comment to an advisory.
-        Example request body:
+    Add a comment to an advisory.
+    Example request body:
 
-            {"comment": "This is my comment"}
+        {"comment": "This is my comment"}
 
-        The response body is the updated or unmodified advisory, in the same format as GET /api/v1/erratum/{id}.
+    The response body is the updated or unmodified advisory, in the same format as GET /api/v1/erratum/{id}.
 
-        https://errata.devel.redhat.com/developer-guide/api-http-api.html#api-post-apiv1erratumidadd_comment
+    https://errata.devel.redhat.com/developer-guide/api-http-api.html#api-post-apiv1erratumidadd_comment
 
-        :param dict comment: The metadata object to add as a comment
-        """
+    :param dict comment: The metadata object to add as a comment
+    """
     data = {"comment": json.dumps(comment)}
-    return requests.post(constants.errata_add_comment_url.format(id=advisory_id),
-                         verify=ssl.get_default_verify_paths().openssl_cafile,
-                         auth=HTTPSPNEGOAuth(),
-                         json=data)
+    return requests.post(
+        constants.errata_add_comment_url.format(id=advisory_id),
+        verify=ssl.get_default_verify_paths().openssl_cafile,
+        auth=HTTPSPNEGOAuth(),
+        json=data,
+    )
 
 
+@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_fixed(60))
 def get_builds(advisory_id, session=None):
     """5.2.2.6. GET /api/v1/erratum/{id}/builds
      Fetch the Brew builds associated with an advisory.
@@ -333,13 +357,16 @@ def get_builds(advisory_id, session=None):
     """
     if not session:
         session = requests.session()
-    res = session.get(constants.errata_get_builds_url.format(id=advisory_id),
-                      verify=ssl.get_default_verify_paths().openssl_cafile,
-                      auth=HTTPSPNEGOAuth())
+    res = session.get(
+        constants.errata_get_builds_url.format(id=advisory_id),
+        verify=ssl.get_default_verify_paths().openssl_cafile,
+        auth=HTTPSPNEGOAuth(),
+    )
     if res.status_code == 200:
         return res.json()
     else:
         raise exceptions.ErrataToolUnauthorizedException(res.text)
+
 
 # https://errata.devel.redhat.com/bugs/1743872/advisories.json
 
@@ -365,9 +392,11 @@ def get_brew_builds(errata_id, session=None):
     if session is None:
         session = requests.session()
 
-    res = session.get(constants.errata_get_builds_url.format(id=errata_id),
-                      verify=ssl.get_default_verify_paths().openssl_cafile,
-                      auth=HTTPSPNEGOAuth())
+    res = session.get(
+        constants.errata_get_builds_url.format(id=errata_id),
+        verify=ssl.get_default_verify_paths().openssl_cafile,
+        auth=HTTPSPNEGOAuth(),
+    )
     brew_list = []
     if res.status_code == 200:
         jlist = res.json()
@@ -376,12 +405,11 @@ def get_brew_builds(errata_id, session=None):
                 brew_list.append(brew.Build(nvr=list(obj.keys())[0], product_version=key))
         return brew_list
     else:
-        raise exceptions.BrewBuildException("fetch builds from {id}: {msg}".format(
-            id=errata_id,
-            msg=res.text))
+        raise exceptions.BrewBuildException("fetch builds from {id}: {msg}".format(id=errata_id, msg=res.text))
 
 
-def get_brew_build(nvr, product_version='', session=None):
+@retry(reraise=True, stop=stop_after_attempt(10), wait=wait_fixed(3))
+def get_brew_build(nvr, product_version='', session=None) -> brew.Build:
     """5.2.2.1. GET /api/v1/build/{id_or_nvr}
 
     Get Brew build details.
@@ -403,22 +431,22 @@ def get_brew_build(nvr, product_version='', session=None):
 
     """
     if session is None:
-        session = requests.session()
+        session = requests.Session()
 
-    res = session.get(constants.errata_get_build_url.format(id=nvr),
-                      verify=ssl.get_default_verify_paths().openssl_cafile,
-                      auth=HTTPSPNEGOAuth())
+    res = session.get(
+        constants.errata_get_build_url.format(id=nvr),
+        verify=ssl.get_default_verify_paths().openssl_cafile,
+        auth=HTTPSPNEGOAuth(),
+    )
 
     if res.status_code == 200:
         return brew.Build(nvr=nvr, body=res.json(), product_version=product_version)
     else:
-        raise exceptions.BrewBuildException("{build}: {msg}".format(
-            build=nvr,
-            msg=res.text))
+        raise exceptions.BrewBuildException("{build}: {msg}".format(build=nvr, msg=res.text))
 
 
 def get_advisories_for_bug(bug_id, session=None):
-    """ Fetch the list of advisories which a specified bug is attached to.
+    """Fetch the list of advisories which a specified bug is attached to.
 
     5.2.26.7 /bugs/{id}/advisories.json
 
@@ -427,9 +455,11 @@ def get_advisories_for_bug(bug_id, session=None):
     """
     if not session:
         session = requests.session()
-    r = session.get(constants.errata_get_advisories_for_bug_url.format(id=int(bug_id)),
-                    verify=ssl.get_default_verify_paths().openssl_cafile,
-                    auth=HTTPSPNEGOAuth())
+    r = session.get(
+        constants.errata_get_advisories_for_bug_url.format(id=int(bug_id)),
+        verify=ssl.get_default_verify_paths().openssl_cafile,
+        auth=HTTPSPNEGOAuth(),
+    )
     r.raise_for_status()
     return r.json()
 
@@ -449,8 +479,9 @@ def remove_bugzilla_bugs(advisory_obj, bugids: List):
     advisory_obj.commit()
 
 
-def add_bugzilla_bugs_with_retry(advisory: Erratum, bugids: List, noop: bool = False,
-                                 batch_size: int = constants.BUG_ATTACH_CHUNK_SIZE):
+def add_bugzilla_bugs_with_retry(
+    advisory: Erratum, bugids: List, noop: bool = False, batch_size: int = constants.BUG_ATTACH_CHUNK_SIZE
+):
     """
     adding specified bugs into advisory, retry 2 times: first time
     parse the exception message to get failed bug id list, remove from original
@@ -497,8 +528,9 @@ def add_bugzilla_bugs_with_retry(advisory: Erratum, bugids: List, noop: bool = F
         logger.info("All bugzilla bugs attached")
 
 
-def add_jira_bugs_with_retry(advisory: Erratum, bugids: List[str], noop: bool = False,
-                             batch_size: int = constants.BUG_ATTACH_CHUNK_SIZE):
+def add_jira_bugs_with_retry(
+    advisory: Erratum, bugids: List[str], noop: bool = False, batch_size: int = constants.BUG_ATTACH_CHUNK_SIZE
+):
     """
     :param advisory: advisory object
     :param bugids: iterable of jira bug ids to attach to advisory
@@ -559,7 +591,9 @@ def get_advisory_images(image_advisory_id, raw=False):
     def _get_image_name(nvr, repo):
         name = next(iter(repo['docker']['target']['external_repos'].keys()), None)
         if not name:
-            raise ValueError(f"Couldn't get repo name for {nvr}. Please open a ticket for CLOUDWF to set up the CDN repo.")
+            raise ValueError(
+                f"Couldn't get repo name for {nvr}. Please open a ticket for CLOUDWF to set up the CDN repo."
+            )
         return name
 
     def _get_vr(component):
@@ -567,8 +601,7 @@ def get_advisory_images(image_advisory_id, raw=False):
         return '{}-{}'.format(parts[-2], parts[-1])
 
     image_list = [
-        '{}:{}'.format(_get_image_name(nvr, repo), _get_vr(nvr))
-        for nvr, repo in sorted(cdn_docker_file_list.items())
+        '{}:{}'.format(_get_image_name(nvr, repo), _get_vr(nvr)) for nvr, repo in sorted(cdn_docker_file_list.items())
     ]
 
     return '#########\n{}\n#########'.format('\n'.join(image_list))
@@ -601,7 +634,7 @@ def get_advisory_nvrs(advisory):
     except exceptions.ErrataToolError as ex:
         raise exceptions.ElliottFatalError(getattr(ex, 'message', repr(ex)))
 
-    all_advisory_nvrs = {}
+    all_advisory_nvrs: Dict[str, str] = {}
     # Results come back with top level keys which are brew tags
     for tag in builds.keys():
         # Each top level has a key 'builds' which is a list of dicts
@@ -639,6 +672,27 @@ def get_all_advisory_nvrs(advisory):
     return all_advisory_nvrs
 
 
+def get_advisory_nvrs_flattened(advisory: str | int) -> List[str]:
+    """
+    :return: get a flattened list of string nvrs for a given advisory
+    """
+    try:
+        builds = get_builds(advisory)
+    except exceptions.ErrataToolError as ex:
+        raise exceptions.ElliottFatalError(getattr(ex, 'message', repr(ex)))
+
+    all_advisory_nvrs = []
+    # Results come back with top level keys which are brew tags
+    for tag in builds.keys():
+        # Each top level has a key 'builds' which is a list of dicts
+        for build in builds[tag]['builds']:
+            for name in build.keys():
+                n, v, r = name.rsplit('-', 2)
+                all_advisory_nvrs.append(f"{n}-{v}-{r}")
+
+    return all_advisory_nvrs
+
+
 def get_advisory(advisory_id):
     return ErrataConnector()._get(f'/api/v1/erratum/{advisory_id}')
 
@@ -659,21 +713,27 @@ def set_blocking_advisory(target_advisory_id, blocking_advisory_id, blocking_sta
     :param blocking_advisory_id: advisory number of the blocker
     :param blocking_state: a valid advisory state like "SHIPPED_LIVE" (default to "SHIPPED_LIVE")
     """
-    response = ErrataConnector()._post(f'/api/v1/erratum/{target_advisory_id}/add_blocking_errata',
-                                       json={"blocking_errata": blocking_advisory_id})
+    response = ErrataConnector()._post(
+        f'/api/v1/erratum/{target_advisory_id}/add_blocking_errata', json={"blocking_errata": blocking_advisory_id}
+    )
     if response.status_code != requests.codes.created:
         # The endpoint 404s if the advisory is already in the list
         # with the error text "Advisory already listed"
         # so only warn if the error is something else
         if "Advisory already listed" not in response.text:
-            logger.warning(f'Failed to set blocking advisory {blocking_advisory_id} for advisory {target_advisory_id}'
-                           f' with error: {response.text} status code: {response.status_code}')
+            logger.warning(
+                f'Failed to set blocking advisory {blocking_advisory_id} for advisory {target_advisory_id}'
+                f' with error: {response.text} status code: {response.status_code}'
+            )
     data = {"blocking_errata": blocking_advisory_id, "blocker_state": blocking_state}
-    response = ErrataConnector()._post(f'/api/v1/erratum/{target_advisory_id}/set_blocker_state_for_blocking_errata',
-                                       json=data)
+    response = ErrataConnector()._post(
+        f'/api/v1/erratum/{target_advisory_id}/set_blocker_state_for_blocking_errata', json=data
+    )
     if response.status_code != requests.codes.created:
-        raise IOError(f'Failed to set blocking advisory {blocking_advisory_id} for advisory {target_advisory_id} '
-                      f'with error: {response.text} status code: {response.status_code}')
+        raise IOError(
+            f'Failed to set blocking advisory {blocking_advisory_id} for advisory {target_advisory_id} '
+            f'with error: {response.text} status code: {response.status_code}'
+        )
     return response.json()
 
 
@@ -729,8 +789,10 @@ def remove_dependent_advisories(advisory_id):
         data = {"dependent_errata": int(dependent)}
         response = ErrataConnector()._post(endpoint, json=data)
         if response.status_code != requests.codes.created:
-            raise IOError(f'Failed to remove dependent {dependent} from {advisory_id}'
-                          f'with code {response.status_code} and error: {response.text}')
+            raise IOError(
+                f'Failed to remove dependent {dependent} from {advisory_id}'
+                f'with code {response.status_code} and error: {response.text}'
+            )
 
 
 def remove_blocking_advisories_depends(advisory_id):
@@ -740,8 +802,10 @@ def remove_blocking_advisories_depends(advisory_id):
         data = {"blocking_errata": int(advisory_id)}
         response = ErrataConnector()._post(endpoint, json=data)
         if response.status_code != requests.codes.created:
-            raise IOError(f'Failed to remove blocking {advisory_id} from {blocking_advisory}'
-                          f'with code {response.status_code} and error: {response.text}')
+            raise IOError(
+                f'Failed to remove blocking {advisory_id} from {blocking_advisory}'
+                f'with code {response.status_code} and error: {response.text}'
+            )
 
 
 def get_file_meta(advisory_id) -> List[dict]:
@@ -777,7 +841,7 @@ def create_batch(release_version, release_date):
         "release_name": "RHOSE ASYNC - AUTO",
         "release_date": release_date,
         "description": f"OCP {release_version}",
-        "is_active": True
+        "is_active": True,
     }
     response = ErrataConnector()._post("/api/v1/batches", json=data)
     if response.status_code != requests.codes.created:
@@ -805,8 +869,7 @@ def unlock_batch(batch_id):
 
 
 def get_advisory_batch(advisory_id):
-    """Get the batch id for an advisory.
-    """
+    """Get the batch id for an advisory."""
     erratum = get_raw_erratum(advisory_id)['errata']
     advisory_type_key = list(erratum.keys())[0]
     return erratum[advisory_type_key]['batch_id']
@@ -839,17 +902,23 @@ def unset_advisory_batch(advisory_id):
     """
     batch_id = get_advisory_batch(advisory_id)
     if not batch_id:
+        logger.info(f'No batch found for {advisory_id}')
         return
 
     # Make sure the batch is unlocked
+    logger.info(f'Unlocking batch {batch_id} for advisory {advisory_id}')
     unlock_batch(batch_id)
 
     # Clear batch
     response = ErrataConnector()._post(f'/api/v1/erratum/{advisory_id}/change_batch', json={"clear_batch": True})
+    logger.info(
+        f'Attempted to remove advisory {advisory_id} from batch {batch_id}, got http status {response.status_code}'
+    )
     if response.status_code != requests.codes.created:
         raise IOError(f'Failed to unset advisory batch with code {response.status_code} and error: {response.text}')
 
     # Lock the batch
+    logger.info(f'Locking batch {batch_id} for advisory {advisory_id}')
     lock_batch(batch_id)
 
 
@@ -857,5 +926,24 @@ def put_file_meta(advisory_id, file_meta: dict) -> List[dict]:
     """Update the metadata for some or all files in this advisory.
     https://errata.devel.redhat.com/documentation/developer-guide/api-http-api.html#api-put-apiv1erratumidfilemeta
     """
-    return ErrataConnector()._put(f'/api/v1/erratum/{advisory_id}/filemeta?put_rank=true',
-                                  json=file_meta)
+    return ErrataConnector()._put(f'/api/v1/erratum/{advisory_id}/filemeta?put_rank=true', json=file_meta)
+
+
+def push_cdn_stage(advisory_id):
+    """Trigger stage push for an advisory
+    https://errata.devel.redhat.com/documentation/developer-guide/api-http-api.html#pushing-advisories
+    """
+    response = ErrataConnector()._post(
+        f'/api/v1/erratum/{advisory_id}/push', json=[{"target": "cdn_stage"}, {"target": "cdn_docker_stage"}]
+    )
+    if response.status_code == 400 and "dependencies" in response.text:
+        # if advisory has push dependencies then it will return 400, this is expected
+        return None
+    return response.json()
+
+
+def is_advisory_editable(advisory_id: int) -> bool:
+    erratum = get_raw_erratum(advisory_id)['errata']
+    advisory_type_key = list(erratum.keys())[0]
+    status = erratum[advisory_type_key]['status']
+    return status in {"NEW_FILES", "QE"}

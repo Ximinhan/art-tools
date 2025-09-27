@@ -3,10 +3,10 @@
 Test functions related to controlled command execution
 """
 
-
 import asyncio
+import subprocess
+import time
 import unittest
-
 from unittest import IsolatedAsyncioTestCase, mock
 
 from artcommonlib import exectools
@@ -25,6 +25,7 @@ class RetryTestCase(IsolatedAsyncioTestCase):
     """
     Test the exectools.retry() method
     """
+
     ERROR_MSG = r"Giving up after {} failed attempt\(s\)"
 
     def test_success(self):
@@ -32,7 +33,10 @@ class RetryTestCase(IsolatedAsyncioTestCase):
         Given a function that passes, make sure it returns successfully with
         a single retry or greater.
         """
-        pass_function = lambda: True
+
+        def pass_function():
+            return True
+
         self.assertTrue(exectools.retry(1, pass_function))
         self.assertTrue(exectools.retry(2, pass_function))
 
@@ -41,12 +45,13 @@ class RetryTestCase(IsolatedAsyncioTestCase):
         Given a function that fails, make sure that it raise an exception
         correctly with a single retry limit and greater.
         """
-        fail_function = lambda: False
+
+        def fail_function():
+            return False
+
         assertRaisesRegex = self.assertRaisesRegex if hasattr(self, 'assertRaisesRegex') else self.assertRaisesRegexp
-        assertRaisesRegex(
-            Exception, self.ERROR_MSG.format(1), exectools.retry, 1, fail_function)
-        assertRaisesRegex(
-            Exception, self.ERROR_MSG.format(2), exectools.retry, 2, fail_function)
+        assertRaisesRegex(Exception, self.ERROR_MSG.format(1), exectools.retry, 1, fail_function)
+        assertRaisesRegex(Exception, self.ERROR_MSG.format(2), exectools.retry, 2, fail_function)
 
     def test_wait(self):
         """
@@ -62,9 +67,13 @@ class RetryTestCase(IsolatedAsyncioTestCase):
         # loop 3 times, writing into the collector each try and wait
         assertRaisesRegex = self.assertRaisesRegex if hasattr(self, 'assertRaisesRegex') else self.assertRaisesRegexp
         assertRaisesRegex(
-            Exception, self.ERROR_MSG.format(3),
-            exectools.retry, 3, lambda: calls.append("f"),
-            wait_f=lambda n: calls.extend(("w", str(n))))
+            Exception,
+            self.ERROR_MSG.format(3),
+            exectools.retry,
+            3,
+            lambda: calls.append("f"),
+            wait_f=lambda n: calls.extend(("w", str(n))),
+        )
 
         # check that the test and wait loop operated as expected
         self.assertEqual(calls, expected_calls)
@@ -74,170 +83,197 @@ class RetryTestCase(IsolatedAsyncioTestCase):
         Verify that the retry task return value is passed back out faithfully.
         """
         obj = {}
-        func = lambda: obj
+
+        def func():
+            return obj
+
         self.assertIs(exectools.retry(1, func, check_f=lambda _: True), obj)
 
 
-class TestCmdExec(unittest.TestCase):
-    """
-    """
-
-    def setUp(self):
-        self.test_dir = tempfile.mkdtemp(prefix="ocp-cd-test-logs")
-        self.test_file = os.path.join(self.test_dir, "test_file")
-        logging.basicConfig(filename=self.test_file, level=logging.INFO)
-        self.logger = logging.getLogger()
-
-    def tearDown(self):
-        logging.shutdown()
-        reload(logging)
-        shutil.rmtree(self.test_dir)
-
-    @unittest.skip("assertion failing, check if desired behavior changed")
-    def test_cmd_assert_success(self):
-        """
-        """
-
-        try:
-            exectools.cmd_assert("/bin/true")
-        except IOError as error:
-            self.Fail("/bin/truereturned failure: {}".format(error))
-
-        # check that the log file has all of the tests.
-        log_file = open(self.test_file, 'r')
-        lines = log_file.readlines()
-        log_file.close()
-
-        self.assertEqual(len(lines), 4)
-
-    @unittest.skip("assertion failing, check if desired behavior changed")
-    def test_cmd_assert_fail(self):
-        """
-        """
-
-        # Try a failing command 3 times, at 1 sec intervals
-        with self.assertRaises(IOError):
-            exectools.cmd_assert("/usr/bin/false", 3, 1)
-
-        # check that the log file has all of the tests.
-        log_file = open(self.test_file, 'r')
-        lines = log_file.readlines()
-        log_file.close()
-
-        self.assertEqual(len(lines), 12)
-
-
-class TestGather(IsolatedAsyncioTestCase):
-    """
-    """
-
-    def setUp(self):
-        self.test_dir = tempfile.mkdtemp(prefix="ocp-cd-test-logs")
-        self.test_file = os.path.join(self.test_dir, "test_file")
-        logging.basicConfig(filename=self.test_file, level=logging.INFO)
-        self.logger = logging.getLogger()
-
-    def tearDown(self):
-        logging.shutdown()
-        reload(logging)
-        shutil.rmtree(self.test_dir)
-
-    @unittest.skip("assertion failing, check if desired behavior changed")
+class TestExectools(IsolatedAsyncioTestCase):
     def test_gather_success(self):
-        """
-        """
+        with mock.patch("subprocess.Popen") as MockPopen:
+            mock_popen = MockPopen.return_value
+            mock_popen.communicate.return_value = (b"hello there\n", b"")
+            mock_popen.returncode = 0
 
-        (status, stdout, stderr) = exectools.cmd_gather(
-            "/usr/bin/echo hello there")
-        status_expected = 0
-        stdout_expected = "hello there\n"
-        stderr_expected = ""
+            with self.assertLogs(level=logging.DEBUG) as cm:
+                status, stdout, stderr = exectools.cmd_gather(["/usr/bin/echo", "hello", "there"], timeout=3000)
+                self.assertEqual(status, 0)
+                self.assertEqual(stdout, "hello there\n")
+                self.assertEqual(stderr, "")
+                MockPopen.assert_called_once_with(
+                    ["/usr/bin/echo", "hello", "there"],
+                    cwd=None,
+                    env=mock.ANY,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                )
+                mock_popen.communicate.assert_called_once_with(timeout=3000)
+                self.assertTrue(
+                    any(line for line in cm.output if "Executing:cmd_gather: /usr/bin/echo hello there" in line)
+                )
+                self.assertTrue(
+                    any(line for line in cm.output if "Exited with: 0\nstdout>>hello there\n<<\nstderr>><<" in line)
+                )
 
-        self.assertEqual(status_expected, status)
-        self.assertEqual(stdout, stdout_expected)
-        self.assertEqual(stderr, stderr_expected)
+    def test_gather_timeout(self):
+        with mock.patch("subprocess.Popen") as MockPopen:
+            mock_popen = MockPopen.return_value
+            mock_popen.communicate.side_effect = subprocess.TimeoutExpired("cmd", 3000)
 
-        # check that the log file has all of the tests.
+            with self.assertLogs(level=logging.DEBUG) as cm:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    status, stdout, stderr = exectools.cmd_gather(["/usr/bin/sleep", "10"], timeout=3000)
+                MockPopen.assert_called_once_with(
+                    ["/usr/bin/sleep", "10"],
+                    cwd=None,
+                    env=mock.ANY,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                )
+                mock_popen.communicate.assert_any_call(timeout=3000)
+                mock_popen.communicate.assert_any_call()
+                self.assertTrue(any(line for line in cm.output if "Executing:cmd_gather: /usr/bin/sleep 10" in line))
 
-        log_file = open(self.test_file, 'r')
-        lines = log_file.readlines()
-
-        self.assertEqual(len(lines), 6)
-
-    @unittest.skip("assertion failing, check if desired behavior changed")
     def test_gather_fail(self):
-        """
-        """
+        with mock.patch("subprocess.Popen") as MockPopen:
+            mock_popen = MockPopen.return_value
+            mock_popen.communicate.return_value = (b"", b"error")
+            mock_popen.returncode = 1
 
-        (status, stdout, stderr) = exectools.cmd_gather(
-            ["/usr/bin/sed", "-e", "f"])
+            with self.assertLogs(level=logging.DEBUG) as cm:
+                status, stdout, stderr = exectools.cmd_gather(["/usr/bin/false"], timeout=3000)
+                self.assertEqual(status, 1)
+                self.assertEqual(stdout, "")
+                self.assertEqual(stderr, "error")
+                MockPopen.assert_called_once_with(
+                    ["/usr/bin/false"],
+                    cwd=None,
+                    env=mock.ANY,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                )
+                mock_popen.communicate.assert_called_once_with(timeout=3000)
+                self.assertTrue(any(line for line in cm.output if "Executing:cmd_gather: /usr/bin/false" in line))
+                self.assertTrue(
+                    any(line for line in cm.output if "Exited with error: 1\nstdout>><<\nstderr>>error<<\n" in line)
+                )
 
-        status_expected = 1
-        stdout_expected = ""
-        stderr_expected = "/usr/bin/sed: -e expression #1, char 1: unknown command: `f'\n"
+    def test_cmd_assert_success(self):
+        with mock.patch("artcommonlib.exectools.cmd_gather") as cmd_gather:
+            cmd_gather.return_value = (0, "hello there", "")
+            exectools.cmd_assert(["/usr/bin/echo", "hello", "there"])
+            cmd_gather.assert_called_once_with(
+                ["/usr/bin/echo", "hello", "there"],
+                set_env=None,
+                realtime=False,
+                strip=False,
+                log_stdout=False,
+                log_stderr=True,
+                timeout=None,
+                cwd=None,
+            )
 
-        self.assertEqual(status_expected, status)
-        self.assertEqual(stdout, stdout_expected)
-        self.assertEqual(stderr, stderr_expected)
+    @mock.patch("artcommonlib.exectools.cmd_gather")
+    @mock.patch("time.sleep")
+    def test_cmd_assert_success_with_retries(self, mock_sleep: mock.MagicMock, cmd_gather: mock.MagicMock):
+        cmd_gather.side_effect = [(1, "", "error"), (0, "hello there", "")]
+        exectools.cmd_assert(["/usr/bin/echo", "hello", "there"], retries=2)
+        self.assertEqual(cmd_gather.call_count, 2)
+        mock_sleep.assert_called_once_with(60)
 
-        # check that the log file has all of the tests.
-        log_file = open(self.test_file, 'r')
-        lines = log_file.readlines()
-
-        self.assertEqual(len(lines), 6)
+    @mock.patch("artcommonlib.exectools.cmd_gather")
+    @mock.patch("time.sleep")
+    def test_cmd_assert_fail_with_retries(self, mock_sleep: mock.MagicMock, cmd_gather: mock.MagicMock):
+        cmd_gather.side_effect = [(1, "", "error"), (1, "", "error")]
+        with self.assertRaises(ChildProcessError):
+            exectools.cmd_assert(["/usr/bin/false"], retries=2)
+        mock_sleep.assert_called_once_with(60)
+        self.assertEqual(cmd_gather.call_count, 2)
 
     async def test_cmd_gather_async(self):
         cmd = ["uname", "-a"]
         fake_cwd = "/foo/bar"
         fake_stdout = b"fake_stdout"
         fake_stderr = b"fake_stderr"
-        with mock.patch("asyncio.create_subprocess_exec") as create_subprocess_exec, \
-                mock.patch("artcommonlib.pushd.Dir.getcwd", return_value=fake_cwd):
+        with mock.patch("asyncio.subprocess.create_subprocess_exec") as create_subprocess_exec:
             proc = create_subprocess_exec.return_value
             proc.returncode = 0
             proc.communicate.return_value = (fake_stdout, fake_stderr)
 
-            rc, out, err = await exectools.cmd_gather_async(cmd, text_mode=True)
-            create_subprocess_exec.assert_called_once_with(*cmd, cwd=fake_cwd, env=None, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.DEVNULL)
+            rc, out, err = await exectools.cmd_gather_async(
+                cmd,
+                cwd=fake_cwd,
+                env=None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
+            )
+            create_subprocess_exec.assert_awaited_once_with(
+                *cmd,
+                cwd=fake_cwd,
+                env=None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
+            )
             self.assertEqual(rc, 0)
             self.assertEqual(out, fake_stdout.decode("utf-8"))
             self.assertEqual(err, fake_stderr.decode("utf-8"))
 
-            create_subprocess_exec.reset_mock()
-            rc, out, err = await exectools.cmd_gather_async(cmd, text_mode=False)
-            create_subprocess_exec.assert_called_once_with(*cmd, cwd=fake_cwd, env=None, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.DEVNULL)
-            self.assertEqual(rc, 0)
-            self.assertEqual(out, fake_stdout)
-            self.assertEqual(err, fake_stderr)
-
     async def test_cmd_assert_async(self):
         cmd = ["uname", "-a"]
         fake_cwd = "/foo/bar"
-        with mock.patch("artcommonlib.exectools.cmd_gather_async") as cmd_gather_async:
-            cmd_gather_async.return_value = (0, "fake_stdout", "fake_stderr")
+        with mock.patch("asyncio.subprocess.create_subprocess_exec") as create_subprocess_exec:
+            proc = create_subprocess_exec.return_value
+            proc.wait.return_value = 0
 
-            out, err = await exectools.cmd_assert_async(cmd, cwd=fake_cwd, text_mode=True)
-            cmd_gather_async.assert_called_once_with(cmd, text_mode=True, cwd=fake_cwd, set_env=None, strip=False, log_stdout=False, log_stderr=True)
-            self.assertEqual(out, "fake_stdout")
-            self.assertEqual(err, "fake_stderr")
-
-        with mock.patch("artcommonlib.exectools.cmd_gather_async") as cmd_gather_async:
-            cmd_gather_async.return_value = (1, "fake_stdout", "fake_stderr")
-            with self.assertRaises(ChildProcessError):
-                out, err = await exectools.cmd_assert_async(cmd, cwd=fake_cwd, text_mode=True)
-            cmd_gather_async.assert_called_once_with(cmd, text_mode=True, cwd=fake_cwd, set_env=None, strip=False, log_stdout=False, log_stderr=True)
-            self.assertEqual(out, "fake_stdout")
-            self.assertEqual(err, "fake_stderr")
+            rc = await exectools.cmd_assert_async(cmd, cwd=fake_cwd)
+            create_subprocess_exec.assert_awaited_once_with(*cmd, cwd=fake_cwd)
+            self.assertEqual(rc, 0)
 
     def test_parallel_exec(self):
         items = [1, 2, 3]
-        results = exectools.parallel_exec(
-            lambda k, v: k,
-            items, n_threads=4)
+        results = exectools.parallel_exec(lambda k, v: k, items, n_threads=4)
         results = results.get()
         self.assertEqual(results, items)
 
+    async def test_limit_concurrency(self):
+        """Test that limit_concurrency actually limits concurrent execution"""
+        concurrent_count = 0
+        max_concurrent = 0
+
+        @exectools.limit_concurrency(limit=2)
+        async def test_func(name):
+            nonlocal concurrent_count, max_concurrent
+            concurrent_count += 1
+            max_concurrent = max(max_concurrent, concurrent_count)
+
+            await asyncio.sleep(0.1)  # Simulate work
+
+            concurrent_count -= 1
+            return name
+
+        # Run 5 tasks with limit=2
+        tasks = [test_func(f"task{i}") for i in range(5)]
+
+        start_time = time.time()
+        results = await asyncio.gather(*tasks)
+        duration = time.time() - start_time
+
+        # Should never have more than 2 concurrent executions
+        self.assertEqual(max_concurrent, 2)
+
+        # All tasks should complete
+        self.assertEqual(len(results), 5)
+
+        # With limit=2 and 5 tasks of 0.1s each, should take at least 0.25s
+        self.assertGreaterEqual(duration, 0.25)
+
 
 if __name__ == "__main__":
-
     unittest.main()
