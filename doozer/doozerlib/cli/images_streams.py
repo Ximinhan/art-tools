@@ -460,7 +460,7 @@ def images_streams_gen_buildconfigs(runtime, streams, output, as_user, apply, li
     to know the image is in use. These daemonsets can like be eliminated when CI infra moves fully to
     4.x.
     """
-    runtime.initialize(clone_distgits=False, clone_source=False)
+    runtime.initialize(clone_distgits=False, clone_source=False, build_system='konflux')
     runtime.assert_mutation_is_permitted()
 
     major = runtime.group_config.vars['MAJOR']
