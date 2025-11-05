@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from collections import OrderedDict
@@ -245,6 +246,23 @@ class ImageMetadata(Metadata):
         return self.image_name.replace("/", "-")
 
     def pull_url(self):
+        if self.runtime.build_system == 'konflux':
+            # For Konflux builds, get the latest build record from Konflux DB
+            build_record = asyncio.run(
+                self.runtime.konflux_db.get_latest_build(
+                    name=self.distgit_key,
+                    group=self.runtime.group,
+                    outcome='success',
+                    assembly=self.runtime.assembly or 'stream',
+                    el_target=f'el{self.branch_el_target()}',
+                    engine='konflux',
+                )
+            )
+            # Konflux builds store the complete pullspec in image_pullspec field
+            if build_record.image_pullspec:
+                return build_record.image_pullspec
+            else:
+                raise IOError(f'No image pullspec found in Konflux build record for {self.distgit_key}')
         # Don't trust what is the Dockerfile for version & release. This field may not even be present.
         # Query brew to find the most recently built release for this component version.
         _, version, release = self.get_latest_build_info(el_target=self.branch_el_target())
