@@ -504,6 +504,7 @@ class BuildMicroShiftPipeline:
         if self.runtime.dry_run:
             cmd.append("--dry-run")
         set_env = self._doozer_env_vars.copy()
+        set_env["REQUESTS_CA_BUNDLE"] = "/etc/pki/tls/certs/ca-bundle.crt"
         if custom_payloads:
             set_env["MICROSHIFT_PAYLOAD_X86_64"] = custom_payloads["x86_64"]["pullspec"]
             set_env["MICROSHIFT_PAYLOAD_AARCH64"] = custom_payloads["aarch64"]["pullspec"]
