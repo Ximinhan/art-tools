@@ -15,7 +15,7 @@ from artcommonlib.konflux.konflux_build_record import KonfluxBuildOutcome, Konfl
 from artcommonlib.konflux.package_rpm_finder import PackageRpmFinder
 from artcommonlib.model import Missing, Model
 from artcommonlib.release_util import isolate_el_version_in_release
-from artcommonlib.util import get_assembly_release_date_async
+from artcommonlib.util import get_assembly_release_date
 from requests.adapters import HTTPAdapter
 from ruamel.yaml import YAML
 from semver import VersionInfo
@@ -282,7 +282,7 @@ class GenAssemblyCli:
         self._get_rhcos_container()
         await self._select_rpms()
         self._calculate_previous_list()
-        return await self._generate_assembly_definition()
+        return self._generate_assembly_definition()
 
     @staticmethod
     def _exit_with_error(msg):
@@ -785,6 +785,7 @@ class GenAssemblyCli:
         else:  # konflux
             advisories = {
                 'rpm': -1,
+                'rhcos': -1,
             }
             # for konflux, prerelease advisories are noted in the `shipment` field.
             # No need to add it to the advisories map.
@@ -849,7 +850,7 @@ class GenAssemblyCli:
 
         return advisories, release_jira
 
-    async def _generate_assembly_definition(self) -> dict:
+    def _generate_assembly_definition(self) -> dict:
         image_member_overrides, rpm_member_overrides = self._get_member_overrides()
 
         group_info = {}
@@ -868,7 +869,7 @@ class GenAssemblyCli:
 
         if self.runtime.build_system == 'konflux':
             group_info['shipment'] = self._get_shipment_info()
-            group_info['release_date'] = await self._get_release_date()
+            group_info['release_date'] = self._get_release_date()
 
         if self.final_previous_list:
             group_info['upgrades'] = ','.join(map(str, self.final_previous_list))
@@ -899,14 +900,14 @@ class GenAssemblyCli:
             },
         }
 
-    async def _get_release_date(self):
+    def _get_release_date(self):
         if self.release_date:
             return self.release_date
         if self.assembly_type != AssemblyTypes.STANDARD:
             raise ValueError("For non standard release you need to manually set release date from job")
         self.logger.info("Release date not provided. Fetching release date from release schedule...")
         try:
-            self.release_date = await get_assembly_release_date_async(self.gen_assembly_name)
+            self.release_date = get_assembly_release_date(self.gen_assembly_name, self.runtime.group)
         except Exception as ex:
             raise ValueError(f"Failed to fetch release date from release schedule for {self.gen_assembly_name}: {ex}")
         self.logger.info("Release date: %s", self.release_date)
@@ -1034,5 +1035,20 @@ class GenAssemblyCli:
             shipment.pop('url', None)
         elif self.assembly_type != AssemblyTypes.CUSTOM:
             shipment = self._get_default_shipment()
-
+            advisories = shipment['advisories']
+            # If shipment advisories already exist, reuse them
+            if self.gen_assembly_name in self.releases_config.releases:
+                release = self.releases_config.releases[self.gen_assembly_name]
+                previous_advisories = {ad["kind"]: ad for ad in release.assembly.group.shipment.advisories.primitive()}
+                if previous_advisories:
+                    for advisory in advisories:
+                        # preGA advisories (prerelease) associated with an assembly should not be reused
+                        # they should be shipped or dropped if not shipping
+                        if advisory["kind"] == "prerelease":
+                            continue
+                        # Reuse advisory if it exists in previous advisories
+                        previous_ad = previous_advisories.get(advisory["kind"])
+                        if not previous_ad:
+                            continue
+                        advisory.update(previous_ad)
         return shipment

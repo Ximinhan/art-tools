@@ -9,6 +9,7 @@ from pyartcd.pipelines import (
     build_merged_fbc,
     build_microshift,
     build_microshift_bootc,
+    build_oadp,
     build_plashets,
     build_rhcos,
     build_sync,
@@ -17,10 +18,13 @@ from pyartcd.pipelines import (
     fbc_import_from_index,
     gen_assembly,
     images_health,
+    oadp_scan_konflux,
     ocp4,
     ocp4_konflux,
     ocp4_scan,
     ocp4_scan_konflux,
+    okd4,
+    okd_images_health,
     olm_bundle,
     olm_bundle_konflux,
     operator_sdk_sync,
@@ -34,11 +38,12 @@ from pyartcd.pipelines import (
     scan_fips,
     scan_for_kernel_bugs,
     sigstore_sign,
+    sync_rhcos_bfb,
     tag_rpms,
     tarball_sources,
     update_golang,
 )
-from pyartcd.pipelines.scheduled import schedule_ocp4_scan, schedule_ocp4_scan_konflux
+from pyartcd.pipelines.scheduled import schedule_oadp_scan, schedule_ocp4_scan, schedule_ocp4_scan_konflux
 
 
 def main(args: Optional[Sequence[str]] = None):

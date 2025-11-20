@@ -7,13 +7,17 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import click
+from artcommonlib.constants import KONFLUX_DEFAULT_NAMESPACE
 from artcommonlib.konflux.konflux_build_record import (
     KonfluxBuildOutcome,
     KonfluxBuildRecord,
     KonfluxBundleBuildRecord,
 )
 from artcommonlib.konflux.konflux_db import KonfluxDb
+from artcommonlib.model import Model
 from artcommonlib.telemetry import start_as_current_span_async
+from artcommonlib.util import deep_merge, validate_build_priority
+from artcommonlib.variants import BuildVariant
 from opentelemetry import trace
 
 from doozerlib import constants
@@ -81,6 +85,7 @@ class KonfluxRebaseCli:
             repo_type=self.repo_type,
             upcycle=self.upcycle,
             force_private_bit=self.embargoed,
+            image_repo=self.image_repo,
         )
 
         await rebaser.rpm_lockfile_generator.ensure_repositories_loaded(metas, base_dir)
@@ -94,7 +99,6 @@ class KonfluxRebaseCli:
                         self.version,
                         self.release,
                         force_yum_updates=self.force_yum_updates,
-                        image_repo=self.image_repo,
                         commit_message=self.message,
                         push=self.push,
                     )
@@ -107,6 +111,8 @@ class KonfluxRebaseCli:
                 image_name = metas[index].distgit_key
                 failed_images.append(image_name)
                 LOGGER.error(f"Failed to rebase {image_name}: {result}")
+                LOGGER.error(f"Stack trace for {image_name}:")
+                LOGGER.error(''.join(traceback.format_exception(type(result), result, result.__traceback__)))
         if failed_images:
             runtime.state['images:konflux:rebase'] = {'failed-images': failed_images}
             raise DoozerFatalError(f"Failed to rebase images: {failed_images}")
@@ -141,6 +147,11 @@ class KonfluxRebaseCli:
     help="Repo group type to use (e.g. signed, unsigned).",
 )
 @click.option('--image-repo', default=constants.KONFLUX_DEFAULT_IMAGE_REPO, help='Image repo for base images')
+@click.option(
+    '--network-mode',
+    type=click.Choice(['hermetic', 'internal-only', 'open']),
+    help='Override network mode for Konflux builds. Takes precedence over image and group config settings.',
+)
 @option_commit_message
 @option_push
 @pass_runtime
@@ -153,12 +164,16 @@ async def images_konflux_rebase(
     force_yum_updates: bool,
     repo_type: str,
     image_repo: str,
+    network_mode: Optional[str],
     message: str,
     push: bool,
 ):
     """
     Refresh a group's konflux content from source content.
     """
+    if network_mode:
+        runtime.network_mode_override = network_mode
+
     cli = KonfluxRebaseCli(
         runtime=runtime,
         version=version,
@@ -185,6 +200,8 @@ class KonfluxBuildCli:
         skip_checks: bool,
         dry_run: bool,
         plr_template: str,
+        build_priority: Optional[str],
+        variant: BuildVariant,
     ):
         self.runtime = runtime
         self.konflux_kubeconfig = konflux_kubeconfig
@@ -195,11 +212,23 @@ class KonfluxBuildCli:
         self.skip_checks = skip_checks
         self.dry_run = dry_run
         self.plr_template = plr_template
+        self.build_priority = build_priority
+        self.variant = variant
+
+        validate_build_priority(self.build_priority)
 
     @start_as_current_span_async(TRACER, "images:konflux:build")
     async def run(self):
         runtime = self.runtime
         runtime.initialize(mode='images', clone_distgits=False)
+
+        if self.variant is BuildVariant.OKD:
+            group_config = self.runtime.group_config.copy()
+            if group_config['okd']:
+                LOGGER.info('Build images using OKD group configuration')
+                group_config = deep_merge(group_config, group_config['okd'])
+                runtime.group_config = Model(group_config)
+
         runtime.konflux_db.bind(KonfluxBuildRecord)
         assert runtime.source_resolver is not None, "source_resolver is not initialized. Doozer bug?"
         metas = runtime.ordered_image_metas()
@@ -208,9 +237,16 @@ class KonfluxBuildCli:
         span = trace.get_current_span()
         span.update_name(f"images:konflux:build.{len(metas)}metas")
         span.set_attribute("doozer.images.count", len(metas))
+
+        if self.variant is BuildVariant.OKD:
+            major, minor = runtime.get_major_minor_fields()
+            group = f'okd-{major}.{minor}'
+        else:
+            group = runtime.group
+
         config = KonfluxImageBuilderConfig(
             base_dir=Path(runtime.working_dir, constants.WORKING_SUBDIR_KONFLUX_BUILD_SOURCES),
-            group_name=runtime.group,
+            group_name=group,
             kubeconfig=self.konflux_kubeconfig,
             context=self.konflux_context,
             namespace=self.konflux_namespace,
@@ -219,6 +255,7 @@ class KonfluxBuildCli:
             skip_checks=self.skip_checks,
             dry_run=self.dry_run,
             plr_template=self.plr_template,
+            build_priority=self.build_priority,
         )
         builder = KonfluxImageBuilder(config=config, record_logger=runtime.record_logger)
         tasks = []
@@ -249,7 +286,7 @@ class KonfluxBuildCli:
 @click.option(
     '--konflux-namespace',
     metavar='NAMESPACE',
-    default=constants.KONFLUX_DEFAULT_NAMESPACE,
+    default=KONFLUX_DEFAULT_NAMESPACE,
     help='The namespace to use for Konflux cluster connections.',
 )
 @click.option('--image-repo', default=constants.KONFLUX_DEFAULT_IMAGE_REPO, help='Push images to the specified repo.')
@@ -260,6 +297,25 @@ class KonfluxBuildCli:
     required=False,
     default=constants.KONFLUX_DEFAULT_IMAGE_BUILD_PLR_TEMPLATE_URL,
     help='Use a custom PipelineRun template to build the bundle. Overrides the default template from openshift-priv/art-konflux-template',
+)
+@click.option(
+    '--build-priority',
+    type=str,
+    metavar='PRIORITY',
+    default='auto',
+    required=True,
+    help='Kueue build priority. Use "auto" for automatic resolution from image/group config, or specify a number 1-10 (where 1 is highest priority). Takes precedence over group and image config settings.',
+)
+@click.option(
+    '--network-mode',
+    type=click.Choice(['hermetic', 'internal-only', 'open']),
+    help='Override network mode for Konflux builds. Takes precedence over image and group config settings.',
+)
+@click.option(
+    '--variant',
+    type=click.Choice([v.value for v in BuildVariant]),
+    default=BuildVariant.OCP.value,
+    help='Build variant.',
 )
 @pass_runtime
 @click_coroutine
@@ -272,7 +328,13 @@ async def images_konflux_build(
     skip_checks: bool,
     dry_run: bool,
     plr_template: str,
+    build_priority: Optional[str],
+    network_mode: Optional[str],
+    variant: str,
 ):
+    if network_mode:
+        runtime.network_mode_override = network_mode
+
     cli = KonfluxBuildCli(
         runtime=runtime,
         konflux_kubeconfig=konflux_kubeconfig,
@@ -283,6 +345,8 @@ async def images_konflux_build(
         skip_checks=skip_checks,
         dry_run=dry_run,
         plr_template=plr_template,
+        build_priority=build_priority,
+        variant=BuildVariant(variant),
     )
     await cli.run()
 
@@ -507,7 +571,7 @@ class KonfluxBundleCli:
 @click.option(
     '--konflux-namespace',
     metavar='NAMESPACE',
-    default=constants.KONFLUX_DEFAULT_NAMESPACE,
+    default=KONFLUX_DEFAULT_NAMESPACE,
     help='The namespace to use for Konflux cluster connections.',
 )
 @click.option('--image-repo', default=constants.KONFLUX_DEFAULT_IMAGE_REPO, help='Push images to the specified repo.')

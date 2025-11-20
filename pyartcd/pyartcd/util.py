@@ -169,6 +169,23 @@ def get_rpm_if_pinned_directly(releases_config: Dict, assembly_name: str, rpm_na
     return next((rpm['metadata']['is'] for rpm in pinned_rpms if rpm['distgit_key'] == rpm_name), dict())
 
 
+def get_image_if_pinned_directly(releases_config: Dict, assembly_name: str, image_name: str) -> str:
+    # this does not consider inherited assemblies
+    # use with caution
+    try:
+        pinned_images = Model(releases_config).releases[assembly_name].assembly.members.images
+    except (KeyError, AttributeError):
+        # Assembly structure doesn't exist
+        return ""
+
+    image_metadata = next(
+        (image['metadata']['is'] for image in pinned_images if image['distgit_key'] == image_name), None
+    )
+    if image_metadata:
+        return image_metadata['nvr']  # Let it fail if 'nvr' key isn't found
+    return ""
+
+
 async def kinit():
     logger.info('Initializing ocp-build kerberos credentials')
 
@@ -247,7 +264,7 @@ def get_changes(yaml_data: dict) -> dict:
 
 
 async def get_freeze_automation(
-    version: str,
+    group: str,
     doozer_data_path: str = constants.OCP_BUILD_DATA_URL,
     doozer_working: str = '',
     doozer_data_gitref: str = '',
@@ -256,7 +273,7 @@ async def get_freeze_automation(
     Returns freeze_automation flag for a specific group
     """
 
-    group_param = f'--group=openshift-{version}'
+    group_param = f'--group={group}'
     if doozer_data_gitref:
         group_param += f'@{doozer_data_gitref}'
 
@@ -333,8 +350,10 @@ async def is_build_permitted(
     """
 
     # Get 'freeze_automation' flag
+    # get_freeze_automation now expects a full group name like 'openshift-4.15'
+    group = f'openshift-{version}'
     freeze_automation = await get_freeze_automation(
-        version=version,
+        group=group,
         doozer_data_path=data_path,
         doozer_working=doozer_working,
         doozer_data_gitref=doozer_data_gitref,
@@ -644,12 +663,19 @@ async def invalidate_cloudfront_cache(invalidation_path):
 
 
 async def mirror_to_s3(
-    source: Union[str, Path], dest: str, exclude: Optional[str] = None, include: Optional[str] = None, dry_run=False
+    source: Union[str, Path],
+    dest: str,
+    exclude: Optional[str] = None,
+    include: Optional[str] = None,
+    dry_run: bool = False,
+    delete: bool = False,
 ):
     """
     Copy to AWS S3
     """
     cmd = ["aws", "s3", "sync", "--no-progress", "--exact-timestamps"]
+    if delete:
+        cmd.append("--delete")
     paths = ['--', f'{source}', f'{dest}']
     if exclude is not None:
         cmd.append(f"--exclude={exclude}")
@@ -698,6 +724,10 @@ async def get_signing_mode(
         group_config = await load_group_config(
             group=group, assembly=assembly, doozer_data_path=doozer_data_path, doozer_data_gitref=doozer_data_gitref
         )
+
+    # For non-OpenShift groups, always use signed repos regardless of phase
+    if group and not group.startswith('openshift-'):
+        return 'signed'
 
     phase = SoftwareLifecyclePhase.from_name(group_config['software_lifecycle']['phase'])
     return 'signed' if phase >= SoftwareLifecyclePhase.SIGNING else 'unsigned'
@@ -755,10 +785,16 @@ async def get_microshift_builds(group, assembly, env):
     return [n for n in nvrs if isolate_assembly_in_release(n) == assembly]
 
 
-def mass_rebuild_score(version: str) -> int:
-    """For the ocp_version (e.g. `4.16`) return an integer score value
-    Higher the score, higher the priority
+def mass_rebuild_score(version: str, okd: bool = False) -> int:
     """
+    For the ocp_version (e.g. `4.16`) return an integer score value
+    Higher the score, higher the priority.
+    For OKD, the score is half that of OCP for the same version.
+    """
+
+    if okd:
+        return round(float(version) * 50)  # '4.16' -> 208
+
     return round(float(version) * 100)  # '4.16' -> 416
 
 
@@ -788,6 +824,35 @@ async def get_group_images(
         ]
         _, out, _ = await exectools.cmd_gather_async(command)
         return json.loads(out)['images']
+
+
+async def get_group_rpms(
+    group: str,
+    assembly: str,
+    doozer_data_path: str = constants.OCP_BUILD_DATA_URL,
+    doozer_data_gitref: str = '',
+) -> List[str]:
+    """
+    Get the list of RPMs for a given group and assembly.
+    """
+
+    with TemporaryDirectory() as doozer_working:
+        group_param = f'--group={group}'
+        if doozer_data_gitref:
+            group_param += f'@{doozer_data_gitref}'
+        command = [
+            'doozer',
+            f'--working-dir={doozer_working}',
+            f'--data-path={doozer_data_path}',
+            group_param,
+            f'--assembly={assembly}',
+            'rpms:print',
+            '--output=rpms.txt',
+        ]
+        await exectools.cmd_assert_async(command)
+        with open('rpms.txt', 'r') as f:
+            out = f.read()
+        return out.splitlines()
 
 
 async def increment_rebase_fail_counter(image, version, build_system):

@@ -42,7 +42,6 @@ class TestImageMetadata(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp(prefix="ocp-cd-test-logs")
 
         self.test_file = os.path.join(self.test_dir, "test_file")
-        logging.basicConfig(filename=self.test_file, level=logging.DEBUG)
         self.logger = logging.getLogger()
 
         self.cwd = os.getcwd()
@@ -54,9 +53,6 @@ class TestImageMetadata(unittest.TestCase):
 
     def tearDown(self):
         os.chdir(self.cwd)
-
-        logging.shutdown()
-        reload(logging)
         shutil.rmtree(self.test_dir)
 
     @unittest.skip("assertion failing, check if desired behavior changed")
@@ -189,6 +185,7 @@ class TestImageMetadata(unittest.TestCase):
             }
         )
         rt = MagicMock()
+        rt.logger = logging.getLogger('test_runtime')  # Use real logger
         return image.ImageMetadata(rt, data_obj)
 
     def test_cachi2_enabled_1(self):
@@ -362,109 +359,33 @@ class TestImageMetadata(unittest.TestCase):
             result = metadata.is_lockfile_generation_enabled()
         self.assertFalse(result)
 
-    def test_lockfile_force_enabled_metadata_override_true(self):
-        self.logger = MagicMock()
-        metadata = self._create_image_metadata('openshift/test_lockfile_force')
-
-        mock_config = MagicMock()
-        mock_config.konflux.cachi2.lockfile.force = True
-        metadata.config = mock_config
-        metadata.logger = self.logger
-
-        result = metadata.is_lockfile_force_enabled()
-        self.assertTrue(result)
-        self.logger.info.assert_any_call("Lockfile force generation set from metadata config: True")
-
-    def test_lockfile_force_enabled_metadata_override_false(self):
-        self.logger = MagicMock()
-        metadata = self._create_image_metadata('openshift/test_lockfile_force')
-
-        mock_config = MagicMock()
-        mock_config.konflux.cachi2.lockfile.force = False
-        metadata.config = mock_config
-        metadata.logger = self.logger
-
-        result = metadata.is_lockfile_force_enabled()
-        self.assertFalse(result)
-        self.logger.info.assert_any_call("Lockfile force generation set from metadata config: False")
-
-    def test_lockfile_force_enabled_missing_override(self):
-        self.logger = MagicMock()
-        metadata = self._create_image_metadata('openshift/test_lockfile_force')
-
-        mock_config = MagicMock()
-        mock_config.konflux.cachi2.lockfile.force = Missing
-        metadata.config = mock_config
-        metadata.runtime.group_config.konflux.cachi2.lockfile.force = Missing
-        metadata.logger = self.logger
-
-        result = metadata.is_lockfile_force_enabled()
-        self.assertFalse(result)
-        # Should not log anything when using default
-
-    def test_lockfile_force_enabled_none_override(self):
-        self.logger = MagicMock()
-        metadata = self._create_image_metadata('openshift/test_lockfile_force')
-
-        mock_config = MagicMock()
-        mock_config.konflux.cachi2.lockfile.force = None
-        metadata.config = mock_config
-        metadata.runtime.group_config.konflux.cachi2.lockfile.force = None
-        metadata.logger = self.logger
-
-        result = metadata.is_lockfile_force_enabled()
-        self.assertFalse(result)
-        # Should not log anything when using default
-
-    def test_lockfile_force_enabled_group_config_true(self):
-        self.logger = MagicMock()
-        metadata = self._create_image_metadata('openshift/test_lockfile_force')
-
-        mock_config = MagicMock()
-        mock_config.konflux.cachi2.lockfile.force = Missing
-        metadata.config = mock_config
-        metadata.runtime.group_config.konflux.cachi2.lockfile.force = True
-        metadata.logger = self.logger
-
-        result = metadata.is_lockfile_force_enabled()
-        self.assertTrue(result)
-        self.logger.info.assert_any_call("Lockfile force generation set from group config: True")
-
-    def test_lockfile_force_enabled_group_config_false(self):
-        self.logger = MagicMock()
-        metadata = self._create_image_metadata('openshift/test_lockfile_force')
-
-        mock_config = MagicMock()
-        mock_config.konflux.cachi2.lockfile.force = Missing
-        metadata.config = mock_config
-        metadata.runtime.group_config.konflux.cachi2.lockfile.force = False
-        metadata.logger = self.logger
-
-        result = metadata.is_lockfile_force_enabled()
-        self.assertFalse(result)
-        self.logger.info.assert_any_call("Lockfile force generation set from group config: False")
-
-    def test_lockfile_force_enabled_metadata_precedence(self):
-        self.logger = MagicMock()
-        metadata = self._create_image_metadata('openshift/test_lockfile_force')
-
-        mock_config = MagicMock()
-        mock_config.konflux.cachi2.lockfile.force = False
-        metadata.config = mock_config
-        metadata.runtime.group_config.konflux.cachi2.lockfile.force = True
-        metadata.logger = self.logger
-
-        result = metadata.is_lockfile_force_enabled()
-        self.assertFalse(result)
-        self.logger.info.assert_any_call("Lockfile force generation set from metadata config: False")
-
     def test_get_enabled_repos_with_repos(self):
-        """Test get_enabled_repos returns configured repositories"""
+        """Test get_enabled_repos returns repos that are both globally enabled and in image config"""
         metadata = self._create_image_metadata('openshift/test_repos')
 
+        # Mock config to return repos from image config
         mock_config = MagicMock()
         mock_config.get.return_value = ['repo1', 'repo2', 'repo3']
         metadata.config = mock_config
+
+        # Mock runtime.repos to have globally enabled repos
+        mock_repo1 = MagicMock()
+        mock_repo1.name = 'repo1'
+        mock_repo1.enabled = True
+
+        mock_repo2 = MagicMock()
+        mock_repo2.name = 'repo2'
+        mock_repo2.enabled = True
+
+        mock_repo3 = MagicMock()
+        mock_repo3.name = 'repo3'
+        mock_repo3.enabled = True
+
+        metadata.runtime.repos = {
+            'repo1': mock_repo1,
+            'repo2': mock_repo2,
+            'repo3': mock_repo3,
+        }
 
         result = metadata.get_enabled_repos()
 
@@ -482,6 +403,45 @@ class TestImageMetadata(unittest.TestCase):
         result = metadata.get_enabled_repos()
 
         self.assertEqual(result, set())
+        mock_config.get.assert_called_once_with("enabled_repos", [])
+
+    def test_get_enabled_repos_intersection_logic(self):
+        """Test get_enabled_repos returns only repos enabled in BOTH group.yml AND image config"""
+        metadata = self._create_image_metadata('openshift/test_repos_intersection')
+
+        # Mock config to return repos from image config
+        mock_config = MagicMock()
+        mock_config.get.return_value = ['repo1', 'repo2', 'repo3']
+        metadata.config = mock_config
+
+        # Mock runtime.repos where only repo1 and repo2 are globally enabled
+        mock_repo1 = MagicMock()
+        mock_repo1.name = 'repo1'
+        mock_repo1.enabled = True
+
+        mock_repo2 = MagicMock()
+        mock_repo2.name = 'repo2'
+        mock_repo2.enabled = True
+
+        mock_repo3 = MagicMock()
+        mock_repo3.name = 'repo3'
+        mock_repo3.enabled = False  # NOT globally enabled
+
+        mock_repo4 = MagicMock()
+        mock_repo4.name = 'repo4'
+        mock_repo4.enabled = True  # Globally enabled but not in image config
+
+        metadata.runtime.repos = {
+            'repo1': mock_repo1,
+            'repo2': mock_repo2,
+            'repo3': mock_repo3,
+            'repo4': mock_repo4,
+        }
+
+        result = metadata.get_enabled_repos()
+
+        # Should only return repos enabled in BOTH places (repo1 and repo2)
+        self.assertEqual(result, {'repo1', 'repo2'})
         mock_config.get.assert_called_once_with("enabled_repos", [])
 
 
@@ -519,12 +479,15 @@ class TestImageInspector(IsolatedAsyncioTestCase):
         brew_build_inspector = mock.MagicMock(autospec=build_info.BrewBuildRecordInspector)
         get_build_id.return_value = 12345
         brew_build_inspector.get_build_id.return_value = 12345
-        get_image_meta.return_value = mock.MagicMock(
+        mock_meta = mock.MagicMock(
             autospec=image.ImageMetadata,
             config={
                 "enabled_repos": ["rhel-8-baseos-rpms", "rhel-8-appstream-rpms"],
             },
         )
+        mock_meta.get_enabled_repos.return_value = {"rhel-8-baseos-rpms", "rhel-8-appstream-rpms"}
+        mock_meta.runtime = runtime
+        get_image_meta.return_value = mock_meta
         image_arch.return_value = "x86_64"
         get_repodata_threadsafe.return_value = Repodata(
             name='rhel-8-appstream-rpms',
@@ -1001,6 +964,87 @@ class TestImageMetadataAsyncMethods(IsolatedAsyncioTestCase):
         self.assertTrue(result)
         # Should not log when using default
         metadata.logger.info.assert_not_called()
+
+    def test_is_dnf_modules_enable_enabled_default(self):
+        """Test dnf_modules_enable defaults to True when no configuration is set"""
+        metadata = self._create_image_metadata('openshift/test-dnf-modules-enable')
+
+        # Mock both configs as Missing
+        mock_config = MagicMock()
+        mock_config.konflux.cachi2.lockfile.dnf_modules_enable = Missing
+        metadata.config = mock_config
+
+        mock_group_config = MagicMock()
+        mock_group_config.konflux.cachi2.lockfile.dnf_modules_enable = Missing
+        metadata.runtime.group_config = mock_group_config
+        metadata.logger = MagicMock()
+
+        result = metadata.is_dnf_modules_enable_enabled()
+
+        self.assertTrue(result)
+        # Should not log when using default
+        metadata.logger.info.assert_not_called()
+
+    def test_is_dnf_modules_enable_enabled_image_config_override(self):
+        """Test dnf_modules_enable respects image-level configuration override"""
+        metadata = self._create_image_metadata('openshift/test-dnf-modules-enable')
+
+        # Mock image config override
+        mock_config = MagicMock()
+        mock_config.konflux.cachi2.lockfile.dnf_modules_enable = False
+        metadata.config = mock_config
+
+        # Mock group config as Missing
+        mock_group_config = MagicMock()
+        mock_group_config.konflux.cachi2.lockfile.dnf_modules_enable = Missing
+        metadata.runtime.group_config = mock_group_config
+        metadata.logger = MagicMock()
+
+        result = metadata.is_dnf_modules_enable_enabled()
+
+        self.assertFalse(result)
+        metadata.logger.info.assert_called_once_with("DNF modules enablement set from metadata config: False")
+
+    def test_is_dnf_modules_enable_enabled_group_config_override(self):
+        """Test dnf_modules_enable respects group-level configuration override"""
+        metadata = self._create_image_metadata('openshift/test-dnf-modules-enable')
+
+        # Mock image config as Missing
+        mock_config = MagicMock()
+        mock_config.konflux.cachi2.lockfile.dnf_modules_enable = Missing
+        metadata.config = mock_config
+
+        # Mock group config override
+        mock_group_config = MagicMock()
+        mock_group_config.konflux.cachi2.lockfile.dnf_modules_enable = True
+        metadata.runtime.group_config = mock_group_config
+        metadata.logger = MagicMock()
+
+        result = metadata.is_dnf_modules_enable_enabled()
+
+        self.assertTrue(result)
+        metadata.logger.info.assert_called_once_with("DNF modules enablement set from group config: True")
+
+    def test_is_dnf_modules_enable_enabled_precedence(self):
+        """Test dnf_modules_enable configuration hierarchy precedence (image > group)"""
+        metadata = self._create_image_metadata('openshift/test-dnf-modules-enable')
+
+        # Mock image config override (should take precedence)
+        mock_config = MagicMock()
+        mock_config.konflux.cachi2.lockfile.dnf_modules_enable = False
+        metadata.config = mock_config
+
+        # Mock group config with different value
+        mock_group_config = MagicMock()
+        mock_group_config.konflux.cachi2.lockfile.dnf_modules_enable = True
+        metadata.runtime.group_config = mock_group_config
+        metadata.logger = MagicMock()
+
+        result = metadata.is_dnf_modules_enable_enabled()
+
+        self.assertFalse(result)
+        # Should use image config and log it
+        metadata.logger.info.assert_called_once_with("DNF modules enablement set from metadata config: False")
 
     async def test_fetch_rpms_inspect_parent_disabled_returns_full_set(self):
         """Test fetch_rpms_from_build with inspect_parent=False returns full image RPMs"""

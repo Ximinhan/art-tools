@@ -1,22 +1,34 @@
 import asyncio
+import base64
+import json
 import logging
 import os
 import re
+import sys
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, OrderedDict, Tuple, Union
 
 import aiohttp
 import requests
-from artcommonlib.constants import RELEASE_SCHEDULES
-from artcommonlib.exectools import cmd_assert_async, cmd_gather_async
+import requests_gssapi
+from artcommonlib import logutil
+from artcommonlib.constants import (
+    KONFLUX_DEFAULT_NAMESPACE,
+    PRODUCT_KUBECONFIG_MAP,
+    PRODUCT_NAMESPACE_MAP,
+    RELEASE_SCHEDULES,
+)
+from artcommonlib.exectools import cmd_assert_async, cmd_gather_async, limit_concurrency
 from artcommonlib.model import ListModel, Missing
 from ruamel.yaml import YAML
 from semver import VersionInfo
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 LOGGER = logging.getLogger(__name__)
+KONFLUX_LOGGER = logutil.get_logger(__name__)
 
 
 def get_utc_now_formatted_str(microseconds: bool = False):
@@ -180,7 +192,10 @@ def get_assembly_release_date(assembly, group):
 
     :raises ValueError: If the assembly release date is not found
     """
-    release_schedules = requests.get(
+    s = requests.Session()
+    auth = requests_gssapi.HTTPSPNEGOAuth(mutual_authentication=requests_gssapi.OPTIONAL)
+    s.post('https://pp.engineering.redhat.com/oidc/authenticate', auth=auth)
+    release_schedules = s.get(
         f'{RELEASE_SCHEDULES}/{group}.z/?fields=all_ga_tasks', headers={'Accept': 'application/json'}
     )
     try:
@@ -202,6 +217,8 @@ async def get_assembly_release_date_async(release_name: str):
     version = VersionInfo.parse(release_name)
     release_train = f'openshift-{version.major}.{version.minor}.z'
     async with aiohttp.ClientSession() as session:
+        auth = requests_gssapi.HTTPSPNEGOAuth(mutual_authentication=requests_gssapi.OPTIONAL)
+        await session.post('https://pp.engineering.redhat.com/oidc/authenticate', auth=auth)
         async with session.get(
             f'{RELEASE_SCHEDULES}/{release_train}/?fields=all_ga_tasks', headers={'Accept': 'application/json'}
         ) as response:
@@ -218,7 +235,10 @@ def is_release_next_week(group):
     """
     Check if there release of group need to release in the near week
     """
-    release_schedules = requests.get(
+    s = requests.Session()
+    auth = requests_gssapi.HTTPSPNEGOAuth(mutual_authentication=requests_gssapi.OPTIONAL)
+    s.post('https://pp.engineering.redhat.com/oidc/authenticate', auth=auth)
+    release_schedules = s.get(
         f'{RELEASE_SCHEDULES}/{group}.z/?fields=all_ga_tasks', headers={'Accept': 'application/json'}
     )
     for release in release_schedules.json()['all_ga_tasks']:
@@ -235,7 +255,10 @@ def get_inflight(assembly, group):
     inflight_release = None
     assembly_release_date = get_assembly_release_date(assembly, group)
     major, minor = get_ocp_version_from_group(group)
-    release_schedules = requests.get(
+    s = requests.Session()
+    auth = requests_gssapi.HTTPSPNEGOAuth(mutual_authentication=requests_gssapi.OPTIONAL)
+    s.post('https://pp.engineering.redhat.com/oidc/authenticate', auth=auth)
+    release_schedules = s.get(
         f'{RELEASE_SCHEDULES}/openshift-{major}.{minor - 1}.z/?fields=all_ga_tasks',
         headers={'Accept': 'application/json'},
     )
@@ -322,6 +345,24 @@ def isolate_major_minor_in_group(group_name: str) -> Tuple[Optional[int], Option
     if not match:
         return None, None
     return int(match[1]), int(match[2])
+
+
+def extract_group_from_nvr(nvr: str) -> Optional[str]:
+    """
+    Extract the group from an NVR by matching -vMAJOR.MINOR pattern.
+
+    Example NVR: "ose-azure-file-csi-driver-container-v4.13.0-202409181807.p0.g15e6f80.assembly.stream.el8"
+    Returns: "openshift-4.13"
+
+    :param nvr: Build NVR string
+    :return: Group string like "openshift-4.13" or None if pattern not found
+    """
+    # Match -vMAJOR.MINOR pattern (e.g., -v4.13, -v4.18)
+    match = re.search(r'-v(\d+)\.(\d+)\.', nvr)
+    if match:
+        major, minor = match.groups()
+        return f"openshift-{major}.{minor}"
+    return None
 
 
 async def run_limited_unordered(func, args: Iterable, limit: int) -> List:
@@ -449,11 +490,20 @@ def detect_package_managers(metadata, dest_dir: Path):
 
 
 @retry(reraise=True, wait=wait_fixed(10), stop=stop_after_attempt(3))
-async def get_konflux_slsa_attestation(pullspec: str, registry_auth_file: Optional[str] = None) -> str:
+async def get_konflux_data(pullspec: str, mode: str = "attestation", registry_auth_file: Optional[str] = None) -> str:
     """
-    Retrieve the SLSA attestation: https://konflux.pages.redhat.com/docs/users/metadata/attestations.html
+    Retrieve Konflux data (attestation or signature) for a given pullspec.
+
+    :param pullspec: Container image pullspec
+    :param mode: Type of data to download ('attestation' or 'signature')
+    :param registry_auth_file: Optional registry auth file path
+    :return: Downloaded data as string
+    :raises ValueError: If mode is not 'attestation' or 'signature'
     """
-    cmd = f"cosign download attestation {pullspec}"
+    if mode not in ('attestation', 'signature'):
+        raise ValueError(f"mode must be 'attestation' or 'signature', got: {mode}")
+
+    cmd = f"cosign download {mode} {pullspec}"
     env = os.environ.copy()
     if registry_auth_file:
         LOGGER.debug("Using registry auth file: %s", registry_auth_file)
@@ -463,7 +513,39 @@ async def get_konflux_slsa_attestation(pullspec: str, registry_auth_file: Option
     return out.strip()
 
 
-async def sync_to_quay(source_pullspec, destination_repo):
+async def fetch_slsa_attestation(
+    image_pullspec: str, build_name: str, registry_auth_file: Optional[str] = None
+) -> Optional[Dict]:
+    """
+    Fetch SLSA attestation for the given image pullspec.
+
+    :param image_pullspec: Container image pullspec
+    :param build_name: Build name for logging purposes
+    :param registry_auth_file: Optional registry auth file path
+    :return: Parsed SLSA attestation as dict, or None if failed
+    """
+    try:
+        # Get SLSA attestation for the build
+        LOGGER.info(f'Fetching SLSA attestation for {image_pullspec}')
+        attestation = await get_konflux_data(
+            pullspec=image_pullspec,
+            mode="attestation",
+            registry_auth_file=registry_auth_file,
+        )
+        return json.loads(base64.b64decode(json.loads(attestation)["payload"]).decode("utf-8"))
+
+    except ChildProcessError:
+        LOGGER.warning(f'Failed to fetch SLSA attestation for {build_name}')
+        return None
+
+    except (JSONDecodeError, Exception) as e:
+        LOGGER.warning('Failed to parse SLSA attestation for %s: %s', build_name, e)
+        return None
+
+
+@limit_concurrency(limit=32)
+@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_fixed(5), retry=retry_if_exception_type(ChildProcessError))
+async def sync_to_quay(source_pullspec, destination_repo, tags=None):
     LOGGER.info(f"Syncing image from {source_pullspec} to {destination_repo}")
     cmd = [
         'oc',
@@ -478,7 +560,14 @@ async def sync_to_quay(source_pullspec, destination_repo):
     if konflux_registry_auth_file:
         cmd += [f'--registry-config={konflux_registry_auth_file}']
 
-    await asyncio.wait_for(cmd_assert_async(cmd), timeout=7200)
+    try:
+        await asyncio.wait_for(cmd_assert_async(cmd, stdout=sys.stderr), timeout=1800)
+        LOGGER.info(f"Syncing from {source_pullspec} to {destination_repo} completed")
+    except TimeoutError:
+        LOGGER.warning(
+            f"Timeout occurred while syncing image from {source_pullspec} to {destination_repo} after 30 minutes"
+        )
+        raise
 
     # Sync the builds to a "sha" tag as well to prevent it from being garbage collected in quay
     shasum = source_pullspec.split("@sha256:")[1]
@@ -493,4 +582,159 @@ async def sync_to_quay(source_pullspec, destination_repo):
     ]
     if konflux_registry_auth_file:
         cmd += [f'--registry-config={konflux_registry_auth_file}']
-    await asyncio.wait_for(cmd_assert_async(cmd), timeout=7200)
+    try:
+        await asyncio.wait_for(cmd_assert_async(cmd, stdout=sys.stderr), timeout=1800)
+        LOGGER.info(f"Tagging from {destination_repo}@sha256:{shasum} to {destination_repo}:sha256-{shasum} completed")
+    except TimeoutError:
+        LOGGER.warning(
+            f"Timeout occurred while tagging image from {destination_repo}@sha256:{shasum} to {destination_repo}:sha256-{shasum} after 30 minutes"
+        )
+        raise
+
+    # Mirror optional tags if provided
+    if tags:
+        for tag in tags:
+            LOGGER.info(f"Tagging image from {destination_repo}@sha256:{shasum} to {destination_repo}:{tag}")
+            cmd = [
+                'oc',
+                'image',
+                'mirror',
+                '--keep-manifest-list',
+                f"{destination_repo}@sha256:{shasum}",
+                f"{destination_repo}:{tag}",
+            ]
+            if konflux_registry_auth_file:
+                cmd += [f'--registry-config={konflux_registry_auth_file}']
+            try:
+                await asyncio.wait_for(cmd_assert_async(cmd, stdout=sys.stderr), timeout=1800)
+                LOGGER.info(f"Tagging from {destination_repo}@sha256:{shasum} to {destination_repo}:{tag} completed")
+            except TimeoutError:
+                LOGGER.warning(
+                    f"Timeout occurred while tagging image from {destination_repo}@sha256:{shasum} to {destination_repo}:{tag} after 30 minutes"
+                )
+                raise
+
+
+def validate_build_priority(build_priority):
+    """
+    Validate build priority value.
+
+    :param build_priority: Priority value to validate
+    :return: None if valid
+    :raises: ValueError if invalid
+    """
+    if build_priority == "auto":
+        return
+
+    if build_priority is None:
+        raise ValueError("Build priority shouldn't be None")
+
+    try:
+        priority_int = int(build_priority)
+        if not (1 <= priority_int <= 10):
+            raise ValueError(f"Build priority must be 'auto' or a number between 1-10, got: {build_priority}")
+    except ValueError as e:
+        if "invalid literal" in str(e):
+            raise ValueError(f"Build priority must be 'auto' or a number between 1-10, got: {build_priority}")
+        raise
+
+
+def normalize_group_name_for_k8s(group_name: str) -> str:
+    """
+    Normalize a group name to comply with Kubernetes DNS label rules.
+
+    Kubernetes DNS label rules:
+    - Must be lowercase alphanumeric or '-'
+    - Must start and end with alphanumeric character
+    - Cannot be longer than 63 characters
+    - Cannot have consecutive '-'
+
+    Args:
+        group_name: The group name to normalize (e.g., "Test_Group-1.5")
+
+    Returns:
+        Normalized group name (e.g., "test-group-1-5")
+    """
+    if not group_name:
+        return ""
+
+    # Convert to lowercase
+    normalized = group_name.lower()
+
+    # Replace dots and any non-alphanumeric characters (except '-') with '-'
+    normalized = re.sub(r'[^a-z0-9\-]', '-', normalized)
+
+    # Collapse consecutive '-' into a single '-'
+    normalized = re.sub(r'-+', '-', normalized)
+
+    # Trim leading/trailing non-alphanumeric characters (including '-')
+    normalized = re.sub(r'^[^a-z0-9]+|[^a-z0-9]+$', '', normalized)
+
+    # Truncate to 63 characters if needed (leave room for timestamp suffix)
+    # Reserve space for timestamp format like "-20251031141128-1" (18 chars)
+    max_group_length = 63 - 18 - 1  # -1 for the connecting dash
+    if len(normalized) > max_group_length:
+        normalized = normalized[:max_group_length]
+        # Ensure we don't end with a dash after truncation
+        normalized = normalized.rstrip('-')
+
+    return normalized
+
+
+def resolve_konflux_kubeconfig_by_product(product: str, provided_kubeconfig: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the Konflux kubeconfig path based on product type.
+
+    Args:
+        product: The product type (e.g., "ocp", "oadp", "mta", "rhmtc", "logging")
+        provided_kubeconfig: Explicitly provided kubeconfig path (takes precedence)
+
+    Returns:
+        Resolved kubeconfig path or None to rely on oc login
+    """
+    if provided_kubeconfig:
+        return provided_kubeconfig
+
+    env_var = PRODUCT_KUBECONFIG_MAP.get(product)
+    if env_var:
+        kubeconfig = os.environ.get(env_var)
+        if kubeconfig:
+            KONFLUX_LOGGER.info(f"Using kubeconfig from {env_var} for product '{product}'")
+            return kubeconfig
+        KONFLUX_LOGGER.warning(f"Environment variable {env_var} is not set for product '{product}'")
+    else:
+        KONFLUX_LOGGER.warning(
+            f"No kubeconfig mapping found for product '{product}'. Available products: {list(PRODUCT_KUBECONFIG_MAP.keys())}"
+        )
+
+    available_env_vars = list(PRODUCT_KUBECONFIG_MAP.values())
+    KONFLUX_LOGGER.info(
+        f"No kubeconfig specified for product '{product}'. "
+        f"Available env vars: {', '.join(available_env_vars)}. Will rely on oc being logged in to the cluster."
+    )
+    return None
+
+
+def resolve_konflux_namespace_by_product(product: str, provided_namespace: Optional[str] = None) -> str:
+    """
+    Resolve the Konflux namespace based on product type.
+
+    Args:
+        product: The product type (e.g., "ocp", "oadp", "mta", "rhmtc", "logging")
+        provided_namespace: Explicitly provided namespace (takes precedence)
+
+    Returns:
+        Resolved namespace (guaranteed to return a valid namespace)
+    """
+    if provided_namespace:
+        return provided_namespace
+
+    namespace = PRODUCT_NAMESPACE_MAP.get(product)
+    if namespace:
+        KONFLUX_LOGGER.info(f"Using namespace '{namespace}' for product '{product}'")
+        return namespace
+
+    KONFLUX_LOGGER.warning(
+        f"No namespace mapping found for product '{product}'. Available products: {list(PRODUCT_NAMESPACE_MAP.keys())}. Using default: '{KONFLUX_DEFAULT_NAMESPACE}'"
+    )
+    return KONFLUX_DEFAULT_NAMESPACE

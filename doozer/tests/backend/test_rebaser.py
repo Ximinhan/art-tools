@@ -58,6 +58,7 @@ class TestRebaser(TestCase):
         metadata.get_konflux_network_mode.return_value = "open"
         metadata.config.konflux.cachito.mode = Missing
         metadata.config.final_stage_user = Missing
+        metadata.is_lockfile_generation_enabled.return_value = False
 
         dfp = DockerfileParser(path=self.directory.name)
         dfp.content = """
@@ -75,10 +76,11 @@ FROM base1
 ENV ART_BUILD_ENGINE=konflux
 ENV ART_BUILD_DEPS_METHOD=cachi2
 ENV ART_BUILD_NETWORK=open
+RUN go clean -cache || true
 ENV ART_BUILD_DEPS_MODE=default
 USER 0
 RUN mkdir -p /tmp/art/yum_temp; mv /etc/yum.repos.d/*.repo /tmp/art/yum_temp/ || true
-COPY .oit/unsigned.repo /etc/yum.repos.d/
+COPY .oit/art-unsigned.repo /etc/yum.repos.d/
 RUN curl https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem
 ADD https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem /tmp/art
 # End Konflux-specific steps
@@ -90,10 +92,11 @@ FROM base2
 ENV ART_BUILD_ENGINE=konflux
 ENV ART_BUILD_DEPS_METHOD=cachi2
 ENV ART_BUILD_NETWORK=open
+RUN go clean -cache || true
 ENV ART_BUILD_DEPS_MODE=default
 USER 0
 RUN mkdir -p /tmp/art/yum_temp; mv /etc/yum.repos.d/*.repo /tmp/art/yum_temp/ || true
-COPY .oit/unsigned.repo /etc/yum.repos.d/
+COPY .oit/art-unsigned.repo /etc/yum.repos.d/
 RUN curl https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem
 ADD https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem /tmp/art
 # End Konflux-specific steps
@@ -103,12 +106,12 @@ RUN commands
 
 # Start Konflux-specific steps
 USER 0
-RUN rm -f /etc/yum.repos.d/* && cp /tmp/art/yum_temp/* /etc/yum.repos.d/ || true
+RUN rm -f /etc/yum.repos.d/art-* && mv /tmp/art/yum_temp/* /etc/yum.repos.d/ || true
 RUN rm -rf /tmp/art
 USER 2000
 # End Konflux-specific steps
 """
-        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned")
+        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned", "test-repo")
         rebaser._add_build_repos(dfp=dfp, metadata=metadata, dest_dir=Path("."))
 
         self.assertEqual(dfp.content, expected)
@@ -121,6 +124,7 @@ USER 2000
         metadata.get_konflux_network_mode.return_value = "open"
         metadata.config.konflux.cachito.mode = Missing
         metadata.config.final_stage_user = "3000"
+        metadata.is_lockfile_generation_enabled.return_value = False
 
         dfp = DockerfileParser(path=self.directory.name)
         dfp.content = """
@@ -138,10 +142,11 @@ FROM base1
 ENV ART_BUILD_ENGINE=konflux
 ENV ART_BUILD_DEPS_METHOD=cachi2
 ENV ART_BUILD_NETWORK=open
+RUN go clean -cache || true
 ENV ART_BUILD_DEPS_MODE=default
 USER 0
 RUN mkdir -p /tmp/art/yum_temp; mv /etc/yum.repos.d/*.repo /tmp/art/yum_temp/ || true
-COPY .oit/unsigned.repo /etc/yum.repos.d/
+COPY .oit/art-unsigned.repo /etc/yum.repos.d/
 RUN curl https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem
 ADD https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem /tmp/art
 # End Konflux-specific steps
@@ -153,10 +158,11 @@ FROM base2
 ENV ART_BUILD_ENGINE=konflux
 ENV ART_BUILD_DEPS_METHOD=cachi2
 ENV ART_BUILD_NETWORK=open
+RUN go clean -cache || true
 ENV ART_BUILD_DEPS_MODE=default
 USER 0
 RUN mkdir -p /tmp/art/yum_temp; mv /etc/yum.repos.d/*.repo /tmp/art/yum_temp/ || true
-COPY .oit/unsigned.repo /etc/yum.repos.d/
+COPY .oit/art-unsigned.repo /etc/yum.repos.d/
 RUN curl https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem
 ADD https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem /tmp/art
 # End Konflux-specific steps
@@ -166,12 +172,12 @@ RUN commands
 
 # Start Konflux-specific steps
 USER 0
-RUN rm -f /etc/yum.repos.d/* && cp /tmp/art/yum_temp/* /etc/yum.repos.d/ || true
+RUN rm -f /etc/yum.repos.d/art-* && mv /tmp/art/yum_temp/* /etc/yum.repos.d/ || true
 RUN rm -rf /tmp/art
 USER 3000
 # End Konflux-specific steps
 """
-        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned")
+        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned", "test-repo")
         rebaser._add_build_repos(dfp=dfp, metadata=metadata, dest_dir=Path("."))
 
         self.assertEqual(dfp.content, expected)
@@ -202,6 +208,7 @@ FROM base1
 ENV ART_BUILD_ENGINE=konflux
 ENV ART_BUILD_DEPS_METHOD=cachi2
 ENV ART_BUILD_NETWORK=hermetic
+RUN go clean -cache || true
 ENV ART_BUILD_DEPS_MODE=default
 # End Konflux-specific steps
 LABEL foo="bar baz"
@@ -212,6 +219,7 @@ FROM base2
 ENV ART_BUILD_ENGINE=konflux
 ENV ART_BUILD_DEPS_METHOD=cachi2
 ENV ART_BUILD_NETWORK=hermetic
+RUN go clean -cache || true
 ENV ART_BUILD_DEPS_MODE=default
 # End Konflux-specific steps
 USER 2000
@@ -219,7 +227,7 @@ RUN commands
 
 USER 3000
 """
-        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned")
+        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned", "test-repo")
         rebaser._add_build_repos(dfp=dfp, metadata=metadata, dest_dir=Path(self.directory.name))
         dfp.content.strip()
         self.assertEqual(expected.strip(), dfp.content.strip())
@@ -234,6 +242,8 @@ USER 3000
         metadata.get_arches.return_value = ["x86_64", "aarch64"]
         metadata.config.konflux.cachito.mode = Missing
         metadata.config.final_stage_user = "3000"
+        metadata.branch_el_target.return_value = 9
+        metadata.get_lockfile_modules_to_install.return_value = set()
 
         dfp = DockerfileParser(path=self.directory.name)
         dfp.content = """
@@ -251,6 +261,7 @@ FROM base1
 ENV ART_BUILD_ENGINE=konflux
 ENV ART_BUILD_DEPS_METHOD=cachi2
 ENV ART_BUILD_NETWORK=hermetic
+RUN go clean -cache || true
 ENV ART_BUILD_DEPS_MODE=default
 # End Konflux-specific steps
 LABEL foo="bar baz"
@@ -261,6 +272,7 @@ FROM base2
 ENV ART_BUILD_ENGINE=konflux
 ENV ART_BUILD_DEPS_METHOD=cachi2
 ENV ART_BUILD_NETWORK=hermetic
+RUN go clean -cache || true
 ENV ART_BUILD_DEPS_MODE=default
 # End Konflux-specific steps
 USER 2000
@@ -268,7 +280,7 @@ RUN commands
 
 USER 3000
 """
-        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned")
+        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned", "test-repo")
         rebaser._add_build_repos(dfp=dfp, metadata=metadata, dest_dir=Path(self.directory.name))
         dfp.content.strip()
         self.maxDiff = None
@@ -282,6 +294,7 @@ USER 3000
         metadata.get_konflux_network_mode.return_value = "open"
         metadata.config.konflux.cachito.mode = Missing
         metadata.config.final_stage_user = "3000"
+        metadata.is_lockfile_generation_enabled.return_value = False
 
         dfp = DockerfileParser(path=self.directory.name)
         dfp.content = """
@@ -297,10 +310,11 @@ FROM base1
 ENV ART_BUILD_ENGINE=konflux
 ENV ART_BUILD_DEPS_METHOD=cachi2
 ENV ART_BUILD_NETWORK=open
+RUN go clean -cache || true
 ENV ART_BUILD_DEPS_MODE=default
 USER 0
 RUN mkdir -p /tmp/art/yum_temp; mv /etc/yum.repos.d/*.repo /tmp/art/yum_temp/ || true
-COPY .oit/unsigned.repo /etc/yum.repos.d/
+COPY .oit/art-unsigned.repo /etc/yum.repos.d/
 RUN curl https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem
 ADD https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem /tmp/art
 # End Konflux-specific steps
@@ -311,10 +325,11 @@ FROM base2
 ENV ART_BUILD_ENGINE=konflux
 ENV ART_BUILD_DEPS_METHOD=cachi2
 ENV ART_BUILD_NETWORK=open
+RUN go clean -cache || true
 ENV ART_BUILD_DEPS_MODE=default
 USER 0
 RUN mkdir -p /tmp/art/yum_temp; mv /etc/yum.repos.d/*.repo /tmp/art/yum_temp/ || true
-COPY .oit/unsigned.repo /etc/yum.repos.d/
+COPY .oit/art-unsigned.repo /etc/yum.repos.d/
 RUN curl https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem
 ADD https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem /tmp/art
 # End Konflux-specific steps
@@ -323,12 +338,12 @@ RUN commands
 
 # Start Konflux-specific steps
 USER 0
-RUN rm -f /etc/yum.repos.d/* && cp /tmp/art/yum_temp/* /etc/yum.repos.d/ || true
+RUN rm -f /etc/yum.repos.d/art-* && mv /tmp/art/yum_temp/* /etc/yum.repos.d/ || true
 RUN rm -rf /tmp/art
 USER 3000
 # End Konflux-specific steps
 """
-        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned")
+        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned", "test-repo")
         rebaser._add_build_repos(dfp=dfp, metadata=metadata, dest_dir=Path(self.directory.name))
 
         self.assertEqual(dfp.content.strip(), expected.strip())
@@ -339,7 +354,7 @@ USER 3000
         metadata.is_lockfile_generation_enabled.return_value = True
 
         mock_generator = AsyncMock()
-        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned")
+        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned", "test-repo")
         rebaser.rpm_lockfile_generator = mock_generator
         rebaser._logger = MagicMock()
 
@@ -354,7 +369,7 @@ USER 3000
         metadata.is_lockfile_generation_enabled.return_value = False
 
         mock_generator = AsyncMock()
-        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned")
+        rebaser = KonfluxRebaser(MagicMock(), MagicMock(), MagicMock(), "unsigned", "test-repo")
         rebaser.rpm_lockfile_generator = mock_generator
         rebaser._logger = MagicMock()
 
@@ -536,3 +551,61 @@ USER 3000
                 except ValueError:
                     # If version parsing fails, it should be handled gracefully
                     pass
+
+    def test_get_module_enablement_commands_disabled_by_config(self):
+        """Test _get_module_enablement_commands returns empty list when dnf_modules_enable is disabled"""
+        rebaser = KonfluxRebaser(
+            runtime=MagicMock(), base_dir=Path("/tmp"), source_resolver=MagicMock(), repo_type="test"
+        )
+        rebaser._logger = MagicMock()
+
+        # Create mock metadata with dnf_modules_enable disabled
+        mock_metadata = MagicMock()
+        mock_metadata.distgit_key = "test-image"
+        mock_metadata.is_lockfile_generation_enabled.return_value = True
+        mock_metadata.is_dnf_modules_enable_enabled.return_value = False
+
+        result = rebaser._get_module_enablement_commands(mock_metadata)
+
+        # Should return empty list
+        self.assertEqual(result, [])
+
+        # Should log that module enablement is disabled
+        rebaser._logger.info.assert_called_once_with("DNF module enablement disabled for test-image")
+
+        # Should not call other metadata methods since we returned early
+        mock_metadata.branch_el_target.assert_not_called()
+        mock_metadata.get_lockfile_modules_to_install.assert_not_called()
+
+    def test_get_module_enablement_commands_enabled_by_config(self):
+        """Test _get_module_enablement_commands generates commands when dnf_modules_enable is enabled"""
+        rebaser = KonfluxRebaser(
+            runtime=MagicMock(), base_dir=Path("/tmp"), source_resolver=MagicMock(), repo_type="test"
+        )
+        rebaser._logger = MagicMock()
+
+        # Create mock metadata with dnf_modules_enable enabled
+        mock_metadata = MagicMock()
+        mock_metadata.distgit_key = "test-image"
+        mock_metadata.is_lockfile_generation_enabled.return_value = True
+        mock_metadata.is_dnf_modules_enable_enabled.return_value = True
+        mock_metadata.branch_el_target.return_value = 9  # RHEL 9
+        mock_metadata.get_lockfile_modules_to_install.return_value = {"postgresql:15", "maven:3.8"}
+
+        result = rebaser._get_module_enablement_commands(mock_metadata)
+
+        # Should return command list
+        self.assertEqual(len(result), 1)
+        self.assertIn("RUN dnf module enable -y", result[0])
+        self.assertIn("maven:3.8", result[0])
+        self.assertIn("postgresql:15", result[0])
+
+        # Should log the modules being enabled
+        rebaser._logger.info.assert_called_once()
+        log_message = rebaser._logger.info.call_args[0][0]
+        self.assertIn("Enabling modules for test-image", log_message)
+
+        # Should have called all metadata methods
+        mock_metadata.is_dnf_modules_enable_enabled.assert_called_once()
+        mock_metadata.branch_el_target.assert_called_once()
+        mock_metadata.get_lockfile_modules_to_install.assert_called_once()

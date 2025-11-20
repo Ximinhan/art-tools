@@ -5,6 +5,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime
 from typing import Dict, Optional, Set, Tuple
 
 import click
@@ -108,6 +109,46 @@ def images_streams_mirror(runtime, streams, only_if_missing, live_test_mode, for
     runtime.initialize(clone_distgits=False, clone_source=False)
     runtime.assert_mutation_is_permitted()
 
+    def mirror_image(cmd_start: str, upstream_dest: str):
+        full_cmd_1 = f'{cmd_start} {upstream_dest}'
+        if dry_run:
+            print(f'For {upstream_entry_name}, would have run: {full_cmd_1}')
+        else:
+            exectools.cmd_assert(full_cmd_1, retries=3, realtime=True)
+
+        if upstream_dest.startswith('registry.ci.openshift.org/'):
+            # If the image is being mirrored the CI imagestreams, we must also mirror it
+            # to the quay.io/openshift/ci (aka QCI) repository. QCI is the location from which
+            # imagestream references will be resolved for CI operations. Eventually, the
+            # internal registry on the app.ci cluster will not be used at all.
+            # upstream_dest might look something like: registry.ci.openshift.org/ocp/{MAJOR}.{MINOR}:base-rhel9
+            # We want to transform this into: quay.io/openshift/ci:<datetime>_prune_art__ocp_{MAJOR}.{MINOR}:base-rhel9
+            # This tag convention allows images to be pruned over time if they are no longer being
+            # used. See https://github.com/openshift/release/blob/244558fe310225fa8d9895c0c70a279cc104c612/hack/qci_registry_pruner.py#L3-L25
+            # We also mirror to a floating tag that will be overwritten as new images are
+            # mirrored: quay.io/openshift/ci:art__ocp_{MAJOR}.{MINOR}:base-rhel9 . This ensures that
+            # at least one copy of the image will stay around until a new version is mirrored
+            # to the same tag, regardless of whether the prune tag is removed.
+
+            _, org_repo_tag = upstream_dest.split('/', 1)  # isolate "ocp/{MAJOR}.{MINOR}:base-rhel9"
+
+            # Use re.sub() to replace any character in the set [:/] with '_'
+            org_repo_tag = re.sub(r"[:/]", "_", org_repo_tag)  # => ocp_{MAJOR}.{MINOR}_base-rhel9
+            prune_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            prunable_qci_upstream_dest = f"quay.io/openshift/ci:{prune_timestamp}_prune_art__{org_repo_tag}"
+            full_cmd_2 = f'{cmd_start} {prunable_qci_upstream_dest}'
+            if dry_run:
+                print(f'For {upstream_entry_name}, would have run: {full_cmd_2}')
+            else:
+                exectools.cmd_assert(full_cmd_2, retries=3, realtime=True)
+
+            floating_qci_upstream_dest = f"quay.io/openshift/ci:art__{org_repo_tag}"
+            full_cmd_3 = f'{cmd_start} {floating_qci_upstream_dest}'
+            if dry_run:
+                print(f'For {upstream_entry_name}, would have run: {full_cmd_3}')
+            else:
+                exectools.cmd_assert(full_cmd_3, retries=3, realtime=True)
+
     upstreaming_entries = _get_upstreaming_entries(runtime, streams)
 
     for upstream_entry_name, config in upstreaming_entries.items():
@@ -125,7 +166,7 @@ def images_streams_mirror(runtime, streams, only_if_missing, live_test_mode, for
             # image exists yet. If the image does not yet exist, this code should fail
             # quietly.
             if config.upstream_image_mirror is not Missing:
-                check_cmd = f'oc image info {config.upstream_image}'
+                check_cmd = f'oc image info --filter-by-os=amd64 {config.upstream_image}'
                 rc, _, _ = exectools.cmd_gather(check_cmd)
                 if rc != 0:
                     print(
@@ -133,13 +174,10 @@ def images_streams_mirror(runtime, streams, only_if_missing, live_test_mode, for
                     )
                 else:
                     for upstream_image_mirror_dest in config.upstream_image_mirror:
-                        priv_cmd = f'oc image mirror {config.upstream_image} {upstream_image_mirror_dest}'
+                        priv_cmd = f'oc image mirror {config.upstream_image}'
                         if runtime.registry_config_dir is not None:
                             priv_cmd += f" --registry-config={get_docker_config_json(runtime.registry_config_dir)}"
-                        if dry_run:
-                            print(f'For {upstream_entry_name}, would have run: {priv_cmd}')
-                        else:
-                            exectools.cmd_assert(priv_cmd, retries=3, realtime=True)
+                        mirror_image(priv_cmd, upstream_image_mirror_dest)
 
             # If the configuration specifies an upstream_image_base, then ART is responsible for mirroring
             # that location and NOT the upstream_image. A buildconfig from gen-buildconfig is responsible
@@ -158,7 +196,7 @@ def images_streams_mirror(runtime, streams, only_if_missing, live_test_mode, for
                 src_image_pullspec = runtime.resolve_brew_image_url(src_image)
 
             if only_if_missing:
-                check_cmd = f'oc image info {upstream_dest}'
+                check_cmd = f'oc image info --filter-by-os=amd64 {upstream_dest}'
                 rc, check_out, check_err = exectools.cmd_gather(check_cmd)
                 if mirror_arm:
                     check_cmd_arm = f'oc image info {upstream_dest}-arm64'
@@ -180,25 +218,19 @@ def images_streams_mirror(runtime, streams, only_if_missing, live_test_mode, for
             if config.mirror_manifest_list is True:
                 as_manifest_list = '--keep-manifest-list'
 
-            cmd = f'oc image mirror {as_manifest_list} {src_image_pullspec} {upstream_dest}'
+            cmd = f'oc image mirror {as_manifest_list} {src_image_pullspec}'
 
             if runtime.registry_config_dir is not None:
                 cmd += f" --registry-config={get_docker_config_json(runtime.registry_config_dir)}"
-            if dry_run:
-                print(f'For {upstream_entry_name}, would have run: {cmd}')
-            else:
-                exectools.cmd_assert(cmd, retries=3, realtime=True)
+            mirror_image(cmd, upstream_dest)
 
             # mirror arm64 builder and base images for CI
             if mirror_arm:
                 # oc image mirror will filter out missing arches (as long as the manifest is there) regardless of specifying --skip-missing
-                arm_cmd = f'oc image mirror --filter-by-os linux/arm64 {src_image_pullspec} {upstream_dest}-arm64'
+                arm_cmd = f'oc image mirror --filter-by-os linux/arm64 {src_image_pullspec}'
                 if runtime.registry_config_dir is not None:
                     arm_cmd += f" --registry-config={get_docker_config_json(runtime.registry_config_dir)}"
-                if dry_run:
-                    print(f'For {upstream_entry_name}, would have run: {arm_cmd}')
-                else:
-                    exectools.cmd_assert(arm_cmd, retries=3, realtime=True, timeout=1800)
+                mirror_image(arm_cmd, f'{upstream_dest}-arm64')
 
 
 @images_streams.command(
@@ -925,9 +957,6 @@ This ticket was created by ART pipline run [sync-ci-images|{jenkins_build_url}]
             'issuetype': {'name': 'Bug'},
             'labels': ['art:reconciliation', f'art:package:{image_meta.get_component_name()}'],
             'versions': [{'name': release_version}],  # Affects Version/s
-            'customfield_12319940': [
-                {'name': Model(runtime.gitdata.load_data(key='bug').data).target_release[-1]}
-            ],  # customfield_12319940 is Target Version in jira
             'components': [{'name': component}],
             'summary': summary,
             'description': description,
@@ -938,7 +967,24 @@ This ticket was created by ART pipline run [sync-ci-images|{jenkins_build_url}]
             issue = jira_client.create_issue(
                 fields,
             )
-            # check depend issues and set depend to a higher version issue if ture
+            try:
+                # retrieve the target version string (e.g., 'z' or '4.21.0')
+                target_version_segment = Model(runtime.gitdata.load_data(key='bug').data).target_release[-1]
+
+                # Build the update payload using the retrieved string
+                issue_update = {
+                    'customfield_12319940': [{'name': target_version_segment}],
+                }
+                runtime.logger.info(
+                    f"Attempting to update issue {issue.key} Target Version to: {target_version_segment}"
+                )
+                issue.update(fields=issue_update)
+                runtime.logger.info(f"Successfully updated Target Version for issue {issue.key}.")
+
+            except Exception as e:
+                runtime.logger.error(f"An error occurred while updating the Target Version on issue {issue.key}: {e}")
+
+            # check depend issues and set depend to a higher version issue if true
             look_for_summary = f'Update {major}.{minor + 1} {image_meta.name} image to be consistent with ART'
             depend_issues = search_issues(f"project={project} AND summary ~ '{look_for_summary}'")
             # jira title search is fuzzy, so we need to check if an issue is really the one we want
@@ -999,6 +1045,12 @@ This ticket was created by ART pipline run [sync-ci-images|{jenkins_build_url}]
     help='Do not consider what is in master branch when determining what branch to target',
 )
 @click.option(
+    '--force-merge',
+    default=False,
+    is_flag=True,
+    help='DANGER! Use only with approval. Do not wait for standard CI PR merge. Call merge API directly.',
+)
+@click.option(
     '--ignore-missing-images', default=False, is_flag=True, help='Do not exit if an image is missing upstream.'
 )
 @click.option('--draft-prs', default=False, is_flag=True, help='Open PRs as draft PRs')
@@ -1022,6 +1074,7 @@ def images_streams_prs(
     bug,
     interstitial,
     ignore_ci_master,
+    force_merge,
     ignore_missing_images,
     draft_prs,
     moist_run,
@@ -1564,6 +1617,9 @@ If you have any questions about this pull request, please reach out to `@release
                     yellow_print(
                         f'A PR is already open requesting desired reconciliation with ART: {existing_pr.html_url}'
                     )
+                    if force_merge:
+                        existing_pr.merge()
+                        yellow_print(f'Force merge is enabled. Triggering merge for: {existing_pr.html_url}')
                 continue
 
             # Otherwise, we need to create a pull request

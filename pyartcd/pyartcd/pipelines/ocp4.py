@@ -219,6 +219,15 @@ class Ocp4Pipeline:
         jenkins.update_description('Pinned builds (whether source changed or not).<br/>')
         self.runtime.logger.info('Pinned builds (whether source changed or not)')
 
+        if self.version in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+            self.runtime.logger.info(
+                'Skipping RPM rebase and build for %s since it is being handled by ocp4-konflux', {self.version}
+            )
+            self.build_plan.build_rpms = None
+            self.build_plan.rpms_included = []
+            self.build_plan.rpms_excluded = []
+
+        # Update description with building RPMs
         if not self.build_plan.build_rpms:
             jenkins.update_description('RPMs: not building.<br/>')
 
@@ -231,6 +240,7 @@ class Ocp4Pipeline:
         else:
             jenkins.update_description('RPMs: building all.<br/>')
 
+        # Update title with building RPMs
         if self.build_plan.rpms_included:
             jenkins.update_title(self._display_tag_for(self.build_plan.rpms_included, 'RPM'))
 
@@ -240,8 +250,10 @@ class Ocp4Pipeline:
         elif self.build_plan.build_rpms:
             jenkins.update_title(' [all RPMs]')
 
-        jenkins.update_description('Will create RPM compose.<br/>')
+        else:
+            jenkins.update_title(' [no RPMs]')
 
+        # Update description with building images
         if not self.build_plan.build_images:
             jenkins.update_description('Images: not building.<br/>')
 
@@ -262,6 +274,7 @@ class Ocp4Pipeline:
         else:
             jenkins.update_description('Images: building all.<br/>')
 
+        # Update title with building images
         if self.build_plan.images_included:
             jenkins.update_title(self._display_tag_for(self.build_plan.images_included, 'image'))
 
@@ -270,6 +283,13 @@ class Ocp4Pipeline:
 
         elif self.build_plan.build_images:
             jenkins.update_title(' [all images]')
+
+        else:
+            jenkins.update_title(' [no images]')
+
+        # Update description with plashets info
+        if not self.skip_plashets:
+            jenkins.update_description('Will create RPM compose.<br/>')
 
     def _report(self, msg: str):
         """
@@ -366,8 +386,9 @@ class Ocp4Pipeline:
         If automation is "scheduled", job was triggered by hand and there were RPMs in the build plan: return True
         """
 
+        # get_freeze_automation now accepts the full group name
         automation_state: str = await util.get_freeze_automation(
-            version=self.version,
+            group=f'openshift-{self.version}',
             doozer_data_path=self.data_path,
             doozer_working=self.runtime.doozer_working,
             doozer_data_gitref=self.data_gitref,
@@ -455,6 +476,10 @@ class Ocp4Pipeline:
         Update rebase fail counters for images that failed to rebase.
         """
 
+        if self.assembly == 'test':
+            # Ignore for test assembly
+            return
+
         # Reset fail counters for images that were rebased successfully
         successful_images = []
         if self.build_images.lower() == 'all':
@@ -484,7 +509,7 @@ class Ocp4Pipeline:
 
         if len(failed_images) <= 10:
             jenkins.update_description(f'Failed images: {", ".join(failed_images)}<br/>')
-        else:
+        elif len(failed_images) > 10:
             jenkins.update_description(f'{len(failed_images)} images failed. Check record.log for details<br/>')
 
         self.runtime.logger.warning('Failed images: %s', ', '.join(failed_images))
@@ -561,7 +586,12 @@ class Ocp4Pipeline:
             self.runtime.logger.warning('apiserver rebuilt: mirroring streams to CI...')
 
             # Make sure our api.ci token is fresh
-            await oc.registry_login(self.runtime)
+            await oc.registry_login()
+
+            # Log into QCI registry
+            await oc.qci_registry_login()
+
+            # Mirror out ART equivalent images to CI
             cmd = self._doozer_base_command.copy()
             cmd.extend(['images:streams', 'mirror'])
             await exectools.cmd_assert_async(cmd)
@@ -645,6 +675,12 @@ class Ocp4Pipeline:
             )
 
     async def _sweep(self):
+        if self.version not in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+            self.runtime.logger.info(
+                'Skipping bug sweep for %s since it is being handled by ocp4-konflux', {self.version}
+            )
+            return
+
         if self.all_image_build_failed:
             self.runtime.logger.warning('All image builds failed: skipping sweep')
             return
@@ -751,8 +787,9 @@ class Ocp4Pipeline:
 
         # Build plashets
         if not self.skip_plashets and self.version not in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+            group_param = f"openshift-{self.version}"
             jenkins.start_build_plashets(
-                version=self.version,
+                group=group_param,
                 release=self.release,
                 assembly=self.assembly,
                 data_path=self.data_path,
@@ -780,7 +817,9 @@ class Ocp4Pipeline:
         await self._sync_images()
 
         # Find MODIFIED bugs for the target-releases, and set them to ON_QA
-        await self._sweep()
+        # but only if there were RPMs or images built
+        if self.build_plan.build_rpms or self.build_plan.build_images:
+            await self._sweep()
 
         # All good
         self._report_success()

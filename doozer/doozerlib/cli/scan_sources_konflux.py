@@ -3,9 +3,11 @@ import base64
 import json
 import logging
 import os
+import random
 import tempfile
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from json import JSONDecodeError
 from typing import Dict, List, Optional, cast
 
 import aiohttp
@@ -16,6 +18,7 @@ import pycares
 import yaml
 from artcommonlib import exectools
 from artcommonlib.arch_util import brew_arch_for_go_arch, go_arch_for_brew_arch
+from artcommonlib.constants import KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS
 from artcommonlib.exectools import cmd_gather_async
 from artcommonlib.konflux.konflux_build_record import Engine, KonfluxBuildOutcome, KonfluxBuildRecord
 from artcommonlib.konflux.package_rpm_finder import PackageRpmFinder
@@ -24,13 +27,15 @@ from artcommonlib.pushd import Dir
 from artcommonlib.release_util import isolate_timestamp_in_release
 from artcommonlib.rhcos import get_primary_container_name
 from artcommonlib.rpm_utils import parse_nvr
-from artcommonlib.util import deep_merge
+from artcommonlib.util import deep_merge, fetch_slsa_attestation
 from async_lru import alru_cache
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 from doozerlib import rhcos, util
 from doozerlib.build_info import KonfluxBuildRecordInspector
 from doozerlib.cli import cli, click_coroutine, pass_runtime
 from doozerlib.cli import release_gen_payload as rgp
+from doozerlib.constants import KONFLUX_DEFAULT_IMAGE_BUILD_PLR_TEMPLATE_URL
 from doozerlib.exceptions import DoozerFatalError
 from doozerlib.image import ImageMetadata
 from doozerlib.metadata import Metadata, RebuildHint, RebuildHintCode
@@ -40,6 +45,7 @@ from doozerlib.source_resolver import SourceResolver
 from doozerlib.util import oc_image_info_for_arch_async__caching
 
 DEFAULT_THRESHOLD_HOURS = 6
+TASK_BUNDLE_AGE_THRESHOLD_DAYS = 10
 
 
 class ConfigScanSources:
@@ -85,16 +91,22 @@ class ConfigScanSources:
         self.latest_image_build_records_map: Dict[str, KonfluxBuildRecord] = {}
         self.latest_rpm_build_records_map: Dict[str, Dict[str, KonfluxBuildRecord]] = {}
         self.image_tree = {}
-        self.changing_rpms = set()
+        self.changing_rpm_names = set()
         self.rhcos_status = []
         self.registry_auth_file = os.getenv("KONFLUX_ART_IMAGES_AUTH_FILE")
+        self.current_task_bundles: Dict[str, str] = {}
 
     async def run(self):
         # Try to rebase into openshift-priv to reduce upstream merge -> downstream build time
         if self.rebase_priv:
-            # TODO: to be removed once this job is the only one we use for scanning
-            raise DoozerFatalError('ocp4-scan for Konflux is not yet allowed to rebase into openshfit-priv!')
-            self.rebase_into_priv()
+            major, minor = self.runtime.get_major_minor_fields()
+            version = f'{major}.{minor}'
+            if version not in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+                self.logger.warning(
+                    'ocp4-scan for Konflux is not allowed to rebase into openshfit-priv version %s', version
+                )
+            else:
+                self.rebase_into_priv()
 
         # Gather latest builds for ART-managed RPMs
         await self.find_latest_rpms_builds()
@@ -102,14 +114,21 @@ class ConfigScanSources:
         # Find RPMs built by ART that need to be rebuilt
         await self.check_changing_rpms()
 
+        # Get current task bundle SHAs from GitHub
+        self.current_task_bundles = await self.get_current_task_bundle_shas()
+
         # Build an image dependency tree to scan across levels of inheritance. This should save us some time,
         # as when an image is found in need for a rebuild, we can also mark its children or operators without checking
         self.image_tree = self.generate_dependency_tree(self.runtime.image_tree)
         for level in sorted(self.image_tree.keys()):
             await self.scan_images(self.image_tree[level])
 
-        # Check RHCOS status if the kubeconfig is provided
-        if self.ci_kubeconfig:
+        # Check RHCOS status if the kubeconfig is provided and group is openshift-*
+        if (
+            self.ci_kubeconfig
+            and self.runtime.group.startswith("openshift-")
+            and self.runtime.group != 'openshift-4.21'
+        ):
             await self.detect_rhcos_status()
 
         # Print the output report
@@ -232,6 +251,10 @@ class ConfigScanSources:
         raise IOError(f'Could not determine ancestry between public and private upstreams for {repo_name}')
 
     def rebase_into_priv(self):
+        if self.dry_run:
+            self.logger.info('Would have rebased into openshift-priv')
+            return
+
         self.logger.info('Rebasing public upstream contents into openshift-priv')
         upstream_mappings = exectools.parallel_exec(
             lambda meta, _: (
@@ -436,6 +459,9 @@ class ConfigScanSources:
         # Check for changes in extra packages
         await self.scan_extra_packages(image_meta)
 
+        # Check for outdated task bundles
+        await self.scan_task_bundle_changes(image_meta)
+
     def find_upstream_commit_hash(self, meta: Metadata):
         """
         Get the upstream latest commit hash using git ls-remote
@@ -476,25 +502,16 @@ class ConfigScanSources:
         self.logger.debug(f"Network mode of {image_meta.name} in config is {network_mode}")
         build_record = self.latest_image_build_records_map[image_meta.distgit_key]
 
-        # get_konflux_slsa_attestation command will raise an exception if it cannot find the attestation
-        try:
-            attestation = await artcommonlib.util.get_konflux_slsa_attestation(
-                pullspec=build_record.image_pullspec,
-                registry_auth_file=self.registry_auth_file,
-            )
-
-        except ChildProcessError as e:
-            self.logger.warning('Failed to download SLSA attestation: %s', e)
+        # Fetch the SLSA attestation for the latest build
+        attestation = await fetch_slsa_attestation(
+            build_record.image_pullspec, build_record.name, self.registry_auth_file
+        )
+        if not attestation:
+            self.logger.warning('Skipping network mode check for %s', image_meta.distgit_key)
             return
 
-        try:
-            # Equivalent bash code: jq -r ' .payload | @base64d | fromjson | .predicate.invocation.parameters.hermetic'
-            payload_json = json.loads(base64.b64decode(json.loads(attestation)["payload"]).decode("utf-8"))
-        except Exception as e:
-            raise IOError(f"Failed to parse SLSA attestation for {build_record.image_pullspec}: {e}")
-
         # Inspect the SLSA attestation to see if the build is hermetic
-        is_hermetic = payload_json["predicate"]["invocation"]["parameters"]["hermetic"]
+        is_hermetic = attestation["predicate"]["invocation"]["parameters"]["hermetic"]
         is_hermetic = True if is_hermetic.lower() == "true" else False
 
         self.logger.debug(f"Hermetic mode for {build_record.image_pullspec} is set to: {is_hermetic}")
@@ -503,8 +520,8 @@ class ConfigScanSources:
             self.add_image_meta_change(
                 image_meta,
                 RebuildHint(
-                    code=RebuildHintCode.CONFIG_CHANGE,
-                    reason=f"Latest build {build_record.image_pullspec} network mode was {is_hermetic} but we need {network_mode}",
+                    code=RebuildHintCode.NETWORK_MODE_CHANGE,
+                    reason=f"Latest build {build_record.image_pullspec} network mode was {'hermetic' if is_hermetic else 'open'} but {network_mode} is required",
                 ),
             )
 
@@ -696,14 +713,16 @@ class ConfigScanSources:
             dep_rebase_time = isolate_timestamp_in_release(dependency_build_record.release)
             if not dep_rebase_time:  # no timestamp string in NVR?
                 self.logger.warning(
-                    'Could not determine dependency rebase time from release %s', dependency_build_record.release
+                    'Could not determine dependency %s rebase time from release %s',
+                    dep_key,
+                    dependency_build_record.release,
                 )
                 continue
 
             dep_rebase_time = datetime.strptime(dep_rebase_time, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
             if dep_rebase_time > rebase_time:
                 self.add_image_meta_change(
-                    image_meta, RebuildHint(RebuildHintCode.DEPENDENCY_NEWER, 'Dependency has a newer build')
+                    image_meta, RebuildHint(RebuildHintCode.DEPENDENCY_NEWER, f'Dependency {dep_key} has a newer build')
                 )
                 break
 
@@ -721,7 +740,16 @@ class ConfigScanSources:
             builder_image_url = self.runtime.resolve_brew_image_url(builder_image_name)
 
         # Find and map the builder image NVR
-        latest_builder_image_info = Model(await oc_image_info_for_arch_async__caching(builder_image_url))
+        # Use KONFLUX_OPERATOR_INDEX_AUTH_FILE for non-openshift groups (like OADP), otherwise use default
+        # Since OADP et. al. uses other streams like https://github.com/openshift-eng/ocp-build-data/blob/oadp-1.5/streams.yml#L13
+        builder_auth_file = (
+            (os.getenv("KONFLUX_OPERATOR_INDEX_AUTH_FILE") or self.registry_auth_file)
+            if not self.runtime.group.startswith("openshift-")
+            else self.registry_auth_file
+        )
+        latest_builder_image_info = Model(
+            await oc_image_info_for_arch_async__caching(builder_image_url, registry_config=builder_auth_file)
+        )
         builder_info_labels = latest_builder_image_info.config.config.Labels
         builder_nvr_list = [
             builder_info_labels['com.redhat.component'],
@@ -744,30 +772,13 @@ class ConfigScanSources:
         If it's not, query Brew API to get the Brew build result. Querying Brew API will eventually go away.
         """
 
-        # Look for the build record in Konflux DB. BigQuery is partitioned by start_time, so we need a reasonable
-        # time interval to look at. In most cases, we can infer the builder build date from its NVR, and use that
-        # as the search window lower boundary. In all other cases (e.g. nodejs builder, which has a NVR like
-        # nodejs-18-container-1-98), we can only use a default, broad search window. This is an expensive query,
-        # so an option might be to store this information in Redis
-        nvr_timestamp = isolate_timestamp_in_release(builder_build_nvr)
-        if nvr_timestamp:
-            start_search = datetime.strptime(nvr_timestamp, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-        else:
-            # Default search window: last 365 days
-            self.logger.warning('Could not extract timestamp from NVR %s', builder_build_nvr)
-            start_search = datetime.now(tz=timezone.utc) - timedelta(days=365)
-
-        build = await anext(
-            self.runtime.konflux_db.search_builds_by_fields(
-                start_search=start_search,
-                where={
-                    'nvr': builder_build_nvr,
-                    'group': self.runtime.group,
-                    'assembly': self.runtime.assembly,
-                },
-                limit=1,
-            ),
-            None,
+        # Look for the build record in Konflux DB using optimized NVR lookup.
+        # The cache-first approach with exponential windows handles time-based search automatically,
+        # eliminating the need to extract timestamps from NVRs or specify search windows.
+        build = await self.runtime.konflux_db.get_latest_build(
+            nvr=builder_build_nvr,
+            group=self.runtime.group,
+            assembly=self.runtime.assembly,
         )
         if build:
             return build.start_time
@@ -831,7 +842,7 @@ class ConfigScanSources:
     async def scan_rpm_changes(self, image_meta: ImageMetadata):
         # Check if the build used any of the ART built rpms that are changing
         build_record = self.latest_image_build_records_map[image_meta.distgit_key]
-        for rpm in self.changing_rpms:
+        for rpm in self.changing_rpm_names:
             if rpm in {parse_nvr(package)['name']: package for package in build_record.installed_packages}:
                 self.add_image_meta_change(
                     image_meta,
@@ -905,6 +916,269 @@ class ConfigScanSources:
                         f'which changed at event {extra_latest_tagging_event}',
                     )
 
+    def _extract_task_bundles_from_attestation(self, attestation: Dict) -> Dict[str, str]:
+        """
+        Extract task bundles from SLSA attestation materials.
+        Returns a dict mapping task names to their SHA256 digests.
+        """
+        try:
+            # Parse attestation to get materials (task bundles)
+            # For example
+            # $ cosign download attestation <build pullspec> | jq -r ' .payload | @base64d | fromjson | .predicate.materials'
+            # [{
+            #     "digest": {
+            #       "sha256": "4a601aeec58a1dd89c271e728fd8f0d84777825b46940c3aec27f15bab3edacf"
+            #     },
+            #     "uri": "quay.io/konflux-ci/tekton-catalog/task-git-clone-oci-ta"
+            #   },
+            # ...]
+            materials = attestation["predicate"]["materials"]
+
+        except Exception as e:
+            self.logger.warning("Failed to parse SLSA attestation for task bundle check: %s", e)
+            return {}
+
+        # Extract tekton-catalog task bundles
+        self.logger.info(f'Extracting task bundles from {len(materials)} materials in SLSA attestation')
+        task_bundles = {}
+        for material in materials:
+            uri = material.get("uri", "")
+            if "quay.io/konflux-ci/tekton-catalog/" in uri:
+                task_name = uri.split("/")[-1]
+                task_sha = material.get("digest", {}).get("sha256", "")
+                if task_sha:
+                    task_bundles[task_name] = task_sha
+
+        return task_bundles
+
+    async def check_task_bundle_age(self, task_name: str, used_sha: str, current_sha: str):
+        """
+        Check if a single task bundle is old enough to warrant a rebuild.
+        Returns a tuple with task info and age if old enough, None otherwise.
+        """
+        self.logger.info(
+            f'Task bundle {task_name} version differs: used={used_sha[:12]}... vs current={current_sha[:12]}...'
+        )
+
+        task_age_days = await self.get_task_bundle_age_days(task_name, used_sha)
+        if not task_age_days:
+            return None
+
+        if task_age_days >= TASK_BUNDLE_AGE_THRESHOLD_DAYS:
+            return task_name, used_sha, current_sha, task_age_days
+        else:
+            self.logger.info(
+                f'Task bundle {task_name} is only {task_age_days} days old (< {TASK_BUNDLE_AGE_THRESHOLD_DAYS} days), skipping rebuild'
+            )
+            return None
+
+    @skip_check_if_changing
+    async def scan_task_bundle_changes(self, image_meta: ImageMetadata):
+        """
+        Check if task bundles used in the build are outdated compared to current versions
+        and if old task bundles are more than {TASK_BUNDLE_AGE_THRESHOLD_DAYS} days old, trigger a rebuild.
+        """
+        # Skip if image is not being released
+        for_release = image_meta.config.for_release
+        if for_release is False:
+            self.logger.info(f"Skipping scanning task bundle for {image_meta.distgit_key} since its unreleased")
+            return
+
+        self.logger.info(f'Scanning task bundle changes for {image_meta.distgit_key}')
+        build_record = self.latest_image_build_records_map[image_meta.distgit_key]
+
+        # Fetch SLSA attestation
+        attestation = await fetch_slsa_attestation(
+            build_record.image_pullspec, build_record.name, self.registry_auth_file
+        )
+        if not attestation:
+            self.logger.warning('Skipping task bundle check for %s', image_meta.distgit_key)
+            return
+
+        # Extract task bundles from attestation
+        task_bundles = self._extract_task_bundles_from_attestation(attestation)
+        if not task_bundles:
+            self.logger.info(f'No tekton-catalog task bundles found in {build_record.image_pullspec}')
+            return
+
+        self.logger.info(f'Found {len(task_bundles)} task bundles: {list(task_bundles.keys())}')
+
+        # Get current task bundle SHAs from GitHub
+        current_task_bundles = self.current_task_bundles
+        if not current_task_bundles:
+            self.logger.warning('Current task bundle SHAs not available, skipping task bundle check')
+            return
+
+        self.logger.info(f'Retrieved {len(current_task_bundles)} current task bundles from GitHub')
+
+        # Check each task bundle for outdated versions
+        self.logger.info(f'Comparing task bundle versions for {image_meta.distgit_key}')
+
+        # Filter out task bundles that are up-to-date or not found in current template
+        outdated_task_bundles = []
+        for task_name, used_sha in task_bundles.items():
+            current_sha = current_task_bundles.get(task_name)
+            if not current_sha:
+                self.logger.info(f'Task {task_name} not found in current template')
+                continue
+
+            if used_sha == current_sha:
+                self.logger.info(f'Task bundle {task_name} is up to date (SHA: {used_sha[:12]}...)')
+                continue
+
+            outdated_task_bundles.append((task_name, used_sha, current_sha))
+
+        if not outdated_task_bundles:
+            return
+
+        # Check if any outdated task bundles are old enough and apply staggered rebuild logic once
+        # Execute all age checks in parallel
+        age_check_results = await asyncio.gather(
+            *[
+                self.check_task_bundle_age(task_name, used_sha, current_sha)
+                for task_name, used_sha, current_sha in outdated_task_bundles
+            ]
+        )
+
+        # Filter out None results to get only old enough task bundles
+        old_outdated_tasks = [result for result in age_check_results if result is not None]
+
+        if not old_outdated_tasks:
+            return
+
+        # Apply staggered rebuild logic once for all old outdated tasks
+        # Use the oldest task for probability calculation
+        oldest_task = max(old_outdated_tasks, key=lambda x: x[3])
+        task_name, used_sha, current_sha, task_age_days = oldest_task
+
+        self.logger.info(
+            f'Found {len(old_outdated_tasks)} outdated task bundles >= {TASK_BUNDLE_AGE_THRESHOLD_DAYS} days old, '
+            f'applying staggered rebuild logic based on oldest task {task_name} ({task_age_days} days old)'
+        )
+
+        # Staggered rebuild logic: probability increases as age increases
+        #   - At 10 days: 1 in 21 chance (~5%)
+        #   - At 15 days: 1 in 16 chance (~6%)
+        #   - At 20 days: 1 in 11 chance (~9%)
+        #   - At 25 days: 1 in 6 chance (~17%)
+        #   - At 29 days: 1 in 2 chance (50%)
+        #   - At 30+ days: Always rebuild (100%)
+        rebuild_probability_denominator = max(30 - task_age_days, 1)
+        probability_percentage = (1.0 / rebuild_probability_denominator) * 100
+        random_number = random.randint(1, rebuild_probability_denominator)
+        should_rebuild = random_number == 1
+
+        self.logger.info(
+            f'Staggered rebuild probability: {probability_percentage:.1f}% (1/{rebuild_probability_denominator}), '
+            f'generated random number: {random_number}, rebuild decision: {should_rebuild}'
+        )
+
+        if not should_rebuild:
+            self.logger.info(
+                f'Staggered rebuild logic decided not to rebuild despite {len(old_outdated_tasks)} outdated task bundles '
+                f'(probability was {probability_percentage:.1f}% based on oldest task {task_name})'
+            )
+            return
+
+        # Trigger rebuild using the oldest task as the reason
+        self.logger.info(
+            f'Triggering rebuild for {image_meta.distgit_key} due to outdated task bundles '
+            f'(oldest: {task_name}, {task_age_days} days old)'
+        )
+        rebuild_hint = RebuildHint(
+            RebuildHintCode.TASK_BUNDLE_OUTDATED,
+            f'Task bundle {task_name} is {task_age_days} days old (>={TASK_BUNDLE_AGE_THRESHOLD_DAYS} days) '
+            f'and newer version is available (staggered rebuild)',
+        )
+        self.add_image_meta_change(image_meta, rebuild_hint)
+
+    @retry(reraise=True, stop=stop_after_attempt(10), wait=wait_fixed(5))
+    async def get_current_task_bundle_shas(self) -> Dict[str, str]:
+        """
+        Fetch current task bundle SHAs from the art-konflux-template GitHub repository
+        """
+        self.logger.info(f'Fetching task bundle template from {KONFLUX_DEFAULT_IMAGE_BUILD_PLR_TEMPLATE_URL}')
+        try:
+            async with self.session.get(
+                KONFLUX_DEFAULT_IMAGE_BUILD_PLR_TEMPLATE_URL, headers={'Authorization': f'Bearer {self.github_token}'}
+            ) as response:
+                response.raise_for_status()
+                yaml_content = await response.text()
+
+            # Parse YAML to extract task bundle references
+            self.logger.info('Parsing YAML content to extract task bundle references')
+            yaml_data = yaml.safe_load(yaml_content)
+            task_bundles = {}
+
+            # Look for task references in the YAML
+            self._extract_task_refs(yaml_data, task_bundles)
+            self.logger.info(f'Successfully extracted {len(task_bundles)} task bundle references from GitHub template')
+            return task_bundles
+
+        except Exception as e:
+            self.logger.error(f'Failed to fetch current task bundle SHAs: {e}')
+            return {}
+
+    def _extract_task_refs(self, obj, task_bundles: Dict[str, str]):
+        """
+        Recursively extract task bundle references from YAML data.
+        """
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key == 'taskRef' and isinstance(value, dict):
+                    resolver = value.get('resolver')
+                    if resolver == 'bundles':
+                        params = value.get('params', [])
+                        name_param = next((p for p in params if p.get('name') == 'name'), None)
+                        bundle_param = next((p for p in params if p.get('name') == 'bundle'), None)
+                        if name_param and bundle_param:
+                            bundle_url = bundle_param.get('value', '')
+                            if 'quay.io/konflux-ci/tekton-catalog/' in bundle_url and '@sha256:' in bundle_url:
+                                # Extract task name from bundle URL like "quay.io/konflux-ci/tekton-catalog/task-init:0.2@sha256:..."
+                                # The task name is between the last '/' and the first ':' or '@'
+                                url_parts = bundle_url.split('/')
+                                if len(url_parts) >= 4:
+                                    task_part = url_parts[-1]  # e.g., "task-init:0.2@sha256:..."
+                                    actual_task_name = (
+                                        task_part.split(':')[0] if ':' in task_part else task_part.split('@')[0]
+                                    )
+                                    sha = bundle_url.split('@sha256:')[1]
+                                    task_bundles[actual_task_name] = sha
+                else:
+                    self._extract_task_refs(value, task_bundles)
+        elif isinstance(obj, list):
+            for item in obj:
+                self._extract_task_refs(item, task_bundles)
+
+    async def get_task_bundle_age_days(self, task_name: str, sha: str) -> Optional[int]:
+        """
+        Get the age of a task bundle in days using oc image info
+        """
+        pullspec = f"quay.io/konflux-ci/tekton-catalog/{task_name}@sha256:{sha}"
+        self.logger.info(f'Getting age for task bundle {task_name} using pullspec {pullspec}')
+        try:
+            cmd = f"oc image info {pullspec} -o json"
+            _, out, _ = await cmd_gather_async(cmd)
+
+            image_info = json.loads(out)
+            created_str = image_info.get('config', {}).get('created', '')
+            if not created_str:
+                return None
+
+            # Parse creation time and calculate age
+            created_time = datetime.fromisoformat(created_str.rstrip('Z')).replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            age_days = (now - created_time).days
+
+            self.logger.info(
+                f'Task bundle {task_name} was created on {created_time.strftime("%Y-%m-%d")}, age: {age_days} days'
+            )
+            return age_days
+
+        except Exception as e:
+            self.logger.warning(f'Failed to get age for task bundle {task_name}@{sha}: {e}')
+            return None
+
     async def check_changing_rpms(self):
         """
         For each RPM built by ART, determine if the current upstream source commit hash
@@ -913,16 +1187,13 @@ class ConfigScanSources:
         """
 
         async def find_rpm_commit_hash(rpm: RPMMetadata):
-            with Dir(rpm.distgit_repo().dg_path):
-                _, out, _ = await cmd_gather_async(['git', 'log', '-n', '1', '--pretty=%B'], cwd=Dir.getcwd())
-
+            with Dir(rpm.distgit_repo().source_path()):
                 try:
-                    return [
-                        line.split(' ') for line in out.splitlines() if line.startswith('io.openshift.build.commit.id')
-                    ][0][-1]
+                    _, out, _ = await cmd_gather_async(['git', 'rev-parse', 'HEAD'], cwd=Dir.getcwd())
+                    return out.strip()
 
-                except IndexError:
-                    raise DoozerFatalError('Could not determine commitish for rpm %s', rpm.rpm_name)
+                except Exception as e:
+                    raise DoozerFatalError('Could not determine commitish for rpm %s: %s', rpm.rpm_name, e)
 
         async def check_rpm_target(rpm_meta: RPMMetadata, el_target):
             rpm_name = rpm_meta.name
@@ -932,7 +1203,45 @@ class ConfigScanSources:
             # RPM has never been built
             if not latest_build_record:
                 self.logger.warning('No build found for RPM %s in %s', rpm_name, self.runtime.group)
-                self.changing_rpms.add(rpm_name)
+                self.add_rpm_meta_change(
+                    rpm_meta,
+                    RebuildHint(
+                        code=RebuildHintCode.NO_LATEST_BUILD,
+                        reason=f'Component {rpm_name} has no latest build for assembly {self.runtime.assembly}',
+                    ),
+                )
+                return
+
+            # Check if most recent build failed
+            latest_failed_build_record = await rpm_meta.get_latest_build(
+                el_target=el_target, engine=Engine.BREW.value, outcome=KonfluxBuildOutcome.FAILURE
+            )
+            rebuild_interval = self.runtime.group_config.scan_freshness.threshold_hours or 6
+            now = datetime.now(timezone.utc)
+
+            if latest_failed_build_record and latest_failed_build_record.start_time > latest_build_record.start_time:
+                # There is a failed build more recent than the latest successful one
+                self.logger.warning('Latest build for RPM %s in %s has failed', rpm_name, self.runtime.group)
+
+                if latest_failed_build_record.start_time + timedelta(hours=rebuild_interval) > now:
+                    # Latest failed build is too recent: delay next attempt
+                    self.add_rpm_meta_change(
+                        rpm_meta,
+                        RebuildHint(
+                            code=RebuildHintCode.DELAYING_NEXT_ATTEMPT,
+                            reason=f'Waiting at least {rebuild_interval} hours after last failed build',
+                        ),
+                    )
+
+                else:
+                    # It's been long enough since the last failed build: try again
+                    self.add_rpm_meta_change(
+                        rpm_meta,
+                        RebuildHint(
+                            code=RebuildHintCode.LAST_BUILD_FAILED,
+                            reason=f'Latest build {latest_failed_build_record.nvr} for {rpm_name} has failed',
+                        ),
+                    )
                 return
 
             # Scan for any build in this assembly which includes the git commit.
@@ -943,7 +1252,13 @@ class ConfigScanSources:
 
             if not upstream_commit_build_record:
                 self.logger.warning('No build for RPM %s from upstream commit %s', rpm_name, upstream_commit_hash)
-                self.changing_rpms.add(rpm_name)
+                self.add_rpm_meta_change(
+                    rpm_meta,
+                    RebuildHint(
+                        code=RebuildHintCode.NEW_UPSTREAM_COMMIT,
+                        reason=f'New upstream commit {upstream_commit_hash} for {rpm_name} needs to be built',
+                    ),
+                )
                 return
 
             # Does most recent build match the one from the latest upstream commit?
@@ -952,7 +1267,14 @@ class ConfigScanSources:
                 self.logger.warning(
                     'Latest build for RPM %s does not match upstream commit %s', rpm_name, upstream_commit_hash
                 )
-                self.changing_rpms.add(rpm_name)
+                self.add_rpm_meta_change(
+                    rpm_meta,
+                    RebuildHint(
+                        code=RebuildHintCode.UPSTREAM_COMMIT_MISMATCH,
+                        reason=f'Latest build {latest_build_record.nvr} does not match upstream commit build '
+                        f'{upstream_commit_build_record.nvr}; commit reverted?',
+                    ),
+                )
                 return
 
         tasks = []
@@ -994,6 +1316,14 @@ class ConfigScanSources:
                 RebuildHint(RebuildHintCode.ANCESTOR_CHANGING, f'Ancestor {meta.distgit_key} is changing'),
             )
 
+    def add_rpm_meta_change(self, meta: RPMMetadata, rebuild_hint: RebuildHint):
+        # If the rebuild hint does not require a rebuild, do nothing
+        if not rebuild_hint.rebuild:
+            return
+
+        self.changing_rpm_names.add(meta.distgit_key)
+        self.add_assessment_reason(meta, rebuild_hint)
+
     def is_image_enabled(self, image_name: str) -> bool:
         image_meta = self.runtime.image_map[image_name]
         mode = image_meta.config.konflux.mode
@@ -1022,7 +1352,7 @@ class ConfigScanSources:
                 status = dict(name=f"{version}-{brew_arch}{'-priv' if private else ''}")
                 if self.runtime.group_config.rhcos.get("layered_rhcos", False):
                     tagged_rhcos_value = self.tagged_rhcos_node_digest(primary_container, version, brew_arch, private)
-                    latest_rhcos_value = self.latest_rhcos_node_shasum(version, brew_arch, private)
+                    latest_rhcos_value = self.latest_rhcos_node_shasum(arch)
                 else:
                     tagged_rhcos_value = self.tagged_rhcos_id(primary_container, version, brew_arch, private)
                     latest_rhcos_value = self.latest_rhcos_build_id(version, brew_arch, private)
@@ -1089,7 +1419,7 @@ class ConfigScanSources:
 
         return shasum
 
-    def latest_rhcos_node_shasum(self, version, arch, private) -> Optional[str]:
+    def latest_rhcos_node_shasum(self, arch) -> Optional[str]:
         """get latest node image from quay.io/openshift-release-dev/ocp-v4.0-art-dev:4.x-9.x-node-image"""
         go_arch = go_arch_for_brew_arch(arch)
         rhcos_index = next(
@@ -1143,11 +1473,11 @@ class ConfigScanSources:
 
     def generate_report(self):
         image_results = []
-        changing_image_names = [name for name in self.changing_image_names]
 
         # Filter out images that are disabled or wip at the konflux level
-        changing_image_names = list(filter(lambda image_name: self.is_image_enabled(image_name), changing_image_names))
-
+        changing_image_names = list(
+            filter(lambda image_name: self.is_image_enabled(image_name), self.changing_image_names)
+        )
         for image_meta in self.all_image_metas:
             dgk = image_meta.distgit_key
             is_changing = dgk in changing_image_names
@@ -1160,9 +1490,22 @@ class ConfigScanSources:
                     }
                 )
 
+        rpm_results = []
+        for rpm_meta in self.all_rpm_metas:
+            dgk = rpm_meta.distgit_key
+            is_changing = dgk in self.changing_rpm_names
+            if is_changing:
+                rpm_results.append(
+                    {
+                        'name': dgk,
+                        'changed': is_changing,
+                        'reason': self.assessment_reason.get(f'{rpm_meta.qualified_key}+{is_changing}'),
+                    }
+                )
+
         results = dict(
             images=image_results,
-            rpms=[meta.distgit_key for meta in self.changing_rpms],
+            rpms=rpm_results,
             rhcos=self.rhcos_status,
         )
 
@@ -1228,11 +1571,7 @@ async def config_scan_source_changes_konflux(runtime: Runtime, ci_kubeconfig, as
 
     # Initialize group config: we need this to determine the canonical builders behavior
     runtime.initialize(config_only=True)
-
-    if runtime.group_config.canonical_builders_from_upstream:
-        runtime.initialize(mode="both", clone_distgits=True)
-    else:
-        runtime.initialize(mode='both', clone_distgits=False)
+    runtime.initialize(mode='both', clone_distgits=False)
 
     async with aiohttp.ClientSession() as session:
         await ConfigScanSources(

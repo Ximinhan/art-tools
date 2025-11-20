@@ -5,7 +5,13 @@ from typing import Optional
 
 import click
 from artcommonlib import logutil
-from artcommonlib.util import get_utc_now_formatted_str, new_roundtrip_yaml_handler
+from artcommonlib.constants import KONFLUX_DEFAULT_NAMESPACE
+from artcommonlib.util import (
+    get_utc_now_formatted_str,
+    new_roundtrip_yaml_handler,
+    resolve_konflux_kubeconfig_by_product,
+    resolve_konflux_namespace_by_product,
+)
 from doozerlib.backend.konflux_client import (
     API_VERSION,
     KIND_APPLICATION,
@@ -14,7 +20,7 @@ from doozerlib.backend.konflux_client import (
     KIND_SNAPSHOT,
     KonfluxClient,
 )
-from doozerlib.constants import KONFLUX_DEFAULT_NAMESPACE, KONFLUX_UI_HOST
+from doozerlib.constants import KONFLUX_UI_HOST
 from kubernetes.dynamic import ResourceInstance, exceptions
 
 from elliottlib.cli.common import cli, click_coroutine
@@ -44,9 +50,9 @@ class CreateReleaseCli:
         konflux_config: dict,
         image_repo_pull_secret: dict,
         dry_run: bool,
+        kind: str,
         job_url: str = None,
         force: bool = False,
-        kind: str = None,
     ):
         self.runtime = runtime
         self.config_path = config_path
@@ -65,8 +71,27 @@ class CreateReleaseCli:
         self.force = force
         self.kind = kind
 
+    @staticmethod
+    def _validate_release_notes_for_openshift(group: str, release_notes):
+        """Validate that release notes fields are non-empty for openshift- groups."""
+        if not group.startswith("openshift-"):
+            return
+
+        if not (release_notes and hasattr(release_notes, '__dict__')):
+            return
+
+        required_fields = ['synopsis', 'topic', 'description', 'solution']
+        empty_fields = [field for field in required_fields if not (getattr(release_notes, field, None) or '').strip()]
+
+        if empty_fields:
+            raise ValueError(
+                f"For openshift- groups, the following releaseNotes fields cannot be empty: {', '.join(empty_fields)}"
+            )
+
     async def run(self) -> Optional[ResourceInstance]:
-        self.runtime.initialize(build_system='konflux', with_shipment=True)
+        # Initialize runtime if not already initialized (for direct class usage in tests)
+        if not getattr(self.runtime, 'initialized', False):
+            self.runtime.initialize(build_system='konflux', with_shipment=True)
 
         LOGGER.info(f"Loading {self.config_path}...")
         config_raw = self.runtime.shipment_gitdata.load_yaml_file(self.config_path)
@@ -95,6 +120,10 @@ class CreateReleaseCli:
                 f"same as runtime.assembly={self.runtime.assembly}"
             )
 
+        # Validate release notes for openshift- groups
+        if config.shipment.data and config.shipment.data.releaseNotes:
+            self._validate_release_notes_for_openshift(self.runtime.group, config.shipment.data.releaseNotes)
+
         # Ensure CRDs are accessible
         try:
             await self.konflux_client._get_api(API_VERSION, KIND_APPLICATION)
@@ -111,9 +140,7 @@ class CreateReleaseCli:
         except exceptions.NotFoundError:
             raise RuntimeError(f"Cannot access {meta.application} in the cluster. Does it exist?")
 
-        major, minor = self.runtime.get_major_minor()
-        kind_str = f"-{self.kind}" if self.kind else ""
-        release_name = f"ose-{major}-{minor}{kind_str}-{self.release_env}-{get_utc_now_formatted_str()}"
+        release_name = self.get_object_name()
 
         env_config: ShipmentEnv = getattr(config.shipment.environments, self.release_env)
         if env_config.shipped() and not self.force:
@@ -150,6 +177,10 @@ class CreateReleaseCli:
             LOGGER.info("Successfully created Release %s", release_url)
         return created_release
 
+    def get_object_name(self) -> str:
+        assembly_str = self.runtime.assembly.replace(".", "-")
+        return f"{self.runtime.product}-{self.release_env}-{assembly_str}-{self.kind}-{get_utc_now_formatted_str()}"
+
     async def create_snapshot(self, shipment: Shipment) -> dict:
         """
         Create a Konflux Snapshot manifest from the given shipment's snapshot spec.
@@ -157,9 +188,7 @@ class CreateReleaseCli:
         if not (shipment.snapshot and shipment.snapshot.spec.components):
             raise ValueError("A valid snapshot must be provided")
 
-        major, minor = self.runtime.get_major_minor()
-        kind_str = f"-{self.kind}" if self.kind else ""
-        snapshot_name = f"ose-{major}-{minor}{kind_str}-{get_utc_now_formatted_str()}"
+        snapshot_name = self.get_object_name()
 
         # Prepare metadata with labels and optional annotations
         metadata = {
@@ -171,11 +200,7 @@ class CreateReleaseCli:
             },
         }
 
-        # Add annotation if job URL is provided
-        if self.job_url:
-            metadata["annotations"] = {
-                "art.redhat.com/job-url": self.job_url,
-            }
+        metadata["annotations"] = self.get_annotations()
 
         snapshot_obj = {
             "apiVersion": API_VERSION,
@@ -234,11 +259,7 @@ class CreateReleaseCli:
             "labels": {"appstudio.openshift.io/application": release_config.application},
         }
 
-        # Add annotation if job URL is provided
-        if self.job_url:
-            metadata["annotations"] = {
-                "art.redhat.com/job-url": self.job_url,
-            }
+        metadata["annotations"] = self.get_annotations()
 
         release_obj = {
             "apiVersion": API_VERSION,
@@ -254,6 +275,16 @@ class CreateReleaseCli:
 
         return release_obj
 
+    def get_annotations(self) -> dict:
+        annotations = {
+            "art.redhat.com/assembly": self.runtime.assembly,
+            "art.redhat.com/env": self.release_env,
+            "art.redhat.com/kind": self.kind,
+        }
+        if self.job_url:
+            annotations["art.redhat.com/job-url"] = self.job_url
+        return annotations
+
 
 @cli.group("release", short_help="Commands for managing Konflux Releases")
 def konflux_release_cli():
@@ -266,7 +297,7 @@ def konflux_release_cli():
 @click.option(
     '--konflux-kubeconfig',
     metavar='KUBECONF_PATH',
-    help='Path to the kubeconfig file to use for Konflux cluster connections.',
+    help='Path to the kubeconfig file to use for Konflux cluster connections. If not provided, will be auto-detected based on group (e.g., KONFLUX_SA_KUBECONFIG for openshift- groups, OADP_KONFLUX_SA_KUBECONFIG for oadp- groups).',
 )
 @click.option(
     '--konflux-context',
@@ -276,8 +307,7 @@ def konflux_release_cli():
 @click.option(
     '--konflux-namespace',
     metavar='NAMESPACE',
-    default=KONFLUX_DEFAULT_NAMESPACE,
-    help='The namespace to use for Konflux cluster connections.',
+    help='The namespace to use for Konflux cluster connections. If not provided, will be auto-detected based on group (e.g., ocp-art-tenant for openshift- groups, art-oadp-tenant for oadp- groups).',
 )
 @click.option(
     '--pull-secret',
@@ -310,7 +340,8 @@ def konflux_release_cli():
 @click.option(
     '--kind',
     metavar='KIND',
-    help='The kind of release being created (e.g. "image"), only used for naming the snapshot and release objects',
+    required=True,
+    help='The kind of release being created (e.g. "image", "metadata", "fbc" etc)',
 )
 @click.pass_obj
 @click_coroutine
@@ -334,15 +365,16 @@ async def new_release_cli(
     "https://gitlab.cee.redhat.com/hybrid-platforms/art/ocp-shipment-data@add_4.18.2_test_release"
     release new --env stage --config shipment/ocp/openshift-4.18/openshift-4-18/4.18.2.202503210000.yml
     """
-    if not konflux_kubeconfig:
-        konflux_kubeconfig = os.environ.get('KONFLUX_SA_KUBECONFIG')
+    # Initialize runtime to populate runtime.product before using resolver functions
+    runtime.initialize(build_system='konflux', with_shipment=True)
 
-    if not konflux_kubeconfig:
-        raise ValueError("Must pass kubeconfig using --konflux-kubeconfig or KONFLUX_SA_KUBECONFIG env var")
+    # Resolve kubeconfig and namespace using utility functions
+    resolved_kubeconfig = resolve_konflux_kubeconfig_by_product(runtime.product, konflux_kubeconfig)
+    resolved_namespace = resolve_konflux_namespace_by_product(runtime.product, konflux_namespace)
 
     konflux_config = {
-        'kubeconfig': konflux_kubeconfig,
-        'namespace': konflux_namespace,
+        'kubeconfig': resolved_kubeconfig,
+        'namespace': resolved_namespace,
         'context': konflux_context,
     }
 

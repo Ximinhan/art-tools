@@ -3,12 +3,13 @@ aiofiles
 aiohttp[speedups] >= 3.6
 aiohttp_retry
 aioredlock >= 0.7.3
+asyncstdlib
 click == 8.1.8
 awscli >= 1.37.0
 contextvars
 errata-tool ~= 1.31.0
 cryptography
-ghapi
+ghapi ~= 1.0.6, != 1.0.7  # https://github.com/AnswerDotAI/ghapi/issues/197
 jenkinsapi >= 0.3.13  # https://github.com/pycontribs/jenkinsapi/issues/833
 jira >= 3.4.1  # https://github.com/pycontribs/jira/issues/1486
 openshift-client ~= 2.0.1

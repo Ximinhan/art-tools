@@ -1,14 +1,14 @@
 import os
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, PropertyMock, patch
 
 from artcommonlib.assembly import AssemblyTypes
 from artcommonlib.exceptions import VerificationError
 from artcommonlib.model import Model
-
 from pyartcd.pipelines.promote import PromotePipeline
 
 
@@ -436,7 +436,7 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
             }
         )
 
-        with self.assertRaisesRegex(VerificationError, "doesn't have a live ID"):
+        with self.assertRaisesRegex(VerificationError, "Could not find live ID from image advisory"):
             await pipeline.run()
         load_group_config.assert_awaited_once()
         load_releases_config.assert_awaited_once_with(
@@ -1579,6 +1579,333 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
         self.assertEqual(actual["digest"], "fake:deadbeef-dest-multi")
 
     @patch("pyartcd.jira_client.JIRAClient.from_url", return_value=None)
+    @patch("pyartcd.pipelines.promote.PromotePipeline.check_blocker_bugs")
+    @patch(
+        "pyartcd.pipelines.promote.util.load_releases_config",
+        return_value={
+            "releases": {"4.10.99": {"assembly": {"type": "standard"}}},
+        },
+    )
+    @patch(
+        "pyartcd.pipelines.promote.util.load_group_config",
+        return_value=Model(
+            {
+                "upgrades": "4.10.98,4.9.99",
+                "advisories": {"image": 2},
+                "shipment": {"url": "https://gitlab.com/redhat/shipment-mr/123"},
+                "arches": ["x86_64", "s390x"],
+            }
+        ),
+    )
+    async def test_run_with_shipment_config_and_image_advisory_conflict(
+        self, load_group_config: AsyncMock, load_releases_config: AsyncMock, check_blocker_bugs: AsyncMock, _
+    ):
+        runtime = MagicMock(
+            config={
+                "build_config": {
+                    "ocp_build_data_url": "https://example.com/ocp-build-data.git",
+                },
+                "jira": {
+                    "url": "https://issues.redhat.com/",
+                },
+            },
+            working_dir=Path("/path/to/working"),
+            dry_run=False,
+        )
+        runtime.new_slack_client.return_value = AsyncMock()
+        runtime.new_slack_client.return_value.say.return_value = {'message': {'ts': ''}}
+        runtime.new_slack_client.return_value.bind_channel = MagicMock()
+
+        pipeline = await PromotePipeline.create(
+            runtime, group="openshift-4.10", assembly="4.10.99", signing_env="prod", skip_sigstore=True
+        )
+        pipeline.change_advisory_state_qe = AsyncMock()
+
+        with self.assertRaisesRegex(ValueError, "Shipment config is defined but image advisory is also defined"):
+            await pipeline.run()
+        load_group_config.assert_awaited_once()
+        load_releases_config.assert_awaited_once_with(
+            group='openshift-4.10', data_path='https://example.com/ocp-build-data.git'
+        )
+
+    @patch("pyartcd.jira_client.JIRAClient.from_url", return_value=None)
+    @patch("pyartcd.pipelines.promote.PromotePipeline.check_blocker_bugs")
+    @patch(
+        "pyartcd.pipelines.promote.util.load_releases_config",
+        return_value={
+            "releases": {"4.10.99": {"assembly": {"type": "standard"}}},
+        },
+    )
+    @patch(
+        "pyartcd.pipelines.promote.util.load_group_config",
+        return_value=Model(
+            {
+                "upgrades": "4.10.98,4.9.99",
+                "shipment": {"url": ""},  # Empty URL
+                "arches": ["x86_64", "s390x"],
+            }
+        ),
+    )
+    async def test_run_with_shipment_config_missing_url(
+        self, load_group_config: AsyncMock, load_releases_config: AsyncMock, check_blocker_bugs: AsyncMock, _
+    ):
+        runtime = MagicMock(
+            config={
+                "build_config": {
+                    "ocp_build_data_url": "https://example.com/ocp-build-data.git",
+                },
+                "jira": {
+                    "url": "https://issues.redhat.com/",
+                },
+            },
+            working_dir=Path("/path/to/working"),
+            dry_run=False,
+        )
+        runtime.new_slack_client.return_value = AsyncMock()
+        runtime.new_slack_client.return_value.say.return_value = {'message': {'ts': ''}}
+        runtime.new_slack_client.return_value.bind_channel = MagicMock()
+
+        pipeline = await PromotePipeline.create(
+            runtime, group="openshift-4.10", assembly="4.10.99", signing_env="prod", skip_sigstore=True
+        )
+
+        with self.assertRaisesRegex(ValueError, "Shipment config is defined but url is not defined"):
+            await pipeline.run()
+        load_group_config.assert_awaited_once()
+        load_releases_config.assert_awaited_once_with(
+            group='openshift-4.10', data_path='https://example.com/ocp-build-data.git'
+        )
+
+    @patch("pyartcd.jira_client.JIRAClient.from_url", return_value=None)
+    @patch("pyartcd.pipelines.promote.PromotePipeline.check_blocker_bugs")
+    @patch("pyartcd.pipelines.promote.get_shipment_config_from_mr", return_value=None)
+    @patch(
+        "pyartcd.pipelines.promote.util.load_releases_config",
+        return_value={
+            "releases": {"4.10.99": {"assembly": {"type": "standard"}}},
+        },
+    )
+    @patch(
+        "pyartcd.pipelines.promote.util.load_group_config",
+        return_value=Model(
+            {
+                "upgrades": "4.10.98,4.9.99",
+                "shipment": {"url": "https://gitlab.com/redhat/shipment-mr/123"},
+                "arches": ["x86_64", "s390x"],
+            }
+        ),
+    )
+    async def test_run_with_shipment_config_not_found(
+        self,
+        load_group_config: AsyncMock,
+        load_releases_config: AsyncMock,
+        get_shipment_config_mock: Mock,
+        check_blocker_bugs: AsyncMock,
+        _,
+    ):
+        runtime = MagicMock(
+            config={
+                "build_config": {
+                    "ocp_build_data_url": "https://example.com/ocp-build-data.git",
+                },
+                "jira": {
+                    "url": "https://issues.redhat.com/",
+                },
+            },
+            working_dir=Path("/path/to/working"),
+            dry_run=False,
+        )
+        runtime.new_slack_client.return_value = AsyncMock()
+        runtime.new_slack_client.return_value.say.return_value = {'message': {'ts': ''}}
+        runtime.new_slack_client.return_value.bind_channel = MagicMock()
+
+        pipeline = await PromotePipeline.create(
+            runtime, group="openshift-4.10", assembly="4.10.99", signing_env="prod", skip_sigstore=True
+        )
+
+        with self.assertRaisesRegex(ValueError, "Could not find image shipment config in merge request"):
+            await pipeline.run()
+        get_shipment_config_mock.assert_called_once_with("https://gitlab.com/redhat/shipment-mr/123", "image")
+        load_group_config.assert_awaited_once()
+        load_releases_config.assert_awaited_once_with(
+            group='openshift-4.10', data_path='https://example.com/ocp-build-data.git'
+        )
+
+    @patch("pyartcd.jira_client.JIRAClient.from_url", return_value=None)
+    @patch("pyartcd.pipelines.promote.PromotePipeline.check_blocker_bugs")
+    @patch("pyartcd.pipelines.promote.get_shipment_config_from_mr")
+    @patch(
+        "pyartcd.pipelines.promote.util.load_releases_config",
+        return_value={
+            "releases": {"4.10.99": {"assembly": {"type": "standard"}}},
+        },
+    )
+    @patch(
+        "pyartcd.pipelines.promote.util.load_group_config",
+        return_value=Model(
+            {
+                "upgrades": "4.10.98,4.9.99",
+                "shipment": {"url": "https://gitlab.com/redhat/shipment-mr/123"},
+                "arches": ["x86_64", "s390x"],
+            }
+        ),
+    )
+    async def test_run_with_shipment_config_missing_live_id(
+        self,
+        load_group_config: AsyncMock,
+        load_releases_config: AsyncMock,
+        get_shipment_config_mock: Mock,
+        check_blocker_bugs: AsyncMock,
+        _,
+    ):
+        # Mock shipment config without live_id
+        mock_shipment = MagicMock()
+        mock_shipment.shipment.data.releaseNotes.live_id = None
+        get_shipment_config_mock.return_value = mock_shipment
+
+        runtime = MagicMock(
+            config={
+                "build_config": {
+                    "ocp_build_data_url": "https://example.com/ocp-build-data.git",
+                },
+                "jira": {
+                    "url": "https://issues.redhat.com/",
+                },
+            },
+            working_dir=Path("/path/to/working"),
+            dry_run=False,
+        )
+        runtime.new_slack_client.return_value = AsyncMock()
+        runtime.new_slack_client.return_value.say.return_value = {'message': {'ts': ''}}
+        runtime.new_slack_client.return_value.bind_channel = MagicMock()
+
+        pipeline = await PromotePipeline.create(
+            runtime, group="openshift-4.10", assembly="4.10.99", signing_env="prod", skip_sigstore=True
+        )
+
+        with self.assertRaisesRegex(ValueError, "Could not find live ID in image shipment config"):
+            await pipeline.run()
+        get_shipment_config_mock.assert_called_once_with("https://gitlab.com/redhat/shipment-mr/123", "image")
+        load_group_config.assert_awaited_once()
+        load_releases_config.assert_awaited_once_with(
+            group='openshift-4.10', data_path='https://example.com/ocp-build-data.git'
+        )
+
+    @patch("pyartcd.jira_client.JIRAClient.from_url", return_value=None)
+    @patch("pyartcd.pipelines.promote.PromotePipeline.check_blocker_bugs")
+    @patch("pyartcd.pipelines.promote.get_shipment_config_from_mr")
+    @patch("pyartcd.pipelines.promote.datetime")
+    @patch(
+        "pyartcd.pipelines.promote.util.load_releases_config",
+        return_value={
+            "releases": {"4.10.99": {"assembly": {"type": "standard"}}},
+        },
+    )
+    @patch(
+        "pyartcd.pipelines.promote.util.load_group_config",
+        return_value=Model(
+            {
+                "upgrades": "4.10.98,4.9.99",
+                "shipment": {"url": "https://gitlab.com/redhat/shipment-mr/123"},
+                "arches": ["x86_64", "s390x"],
+                "description": "whatever",
+                "advisories": {},  # No image advisory defined
+            }
+        ),
+    )
+    async def test_run_with_shipment_config_valid(
+        self,
+        load_group_config: AsyncMock,
+        load_releases_config: AsyncMock,
+        datetime_mock: Mock,
+        get_shipment_config_mock: Mock,
+        check_blocker_bugs: AsyncMock,
+        _,
+    ):
+        # Mock shipment config with valid data
+        mock_shipment = MagicMock()
+        mock_shipment.shipment.data.releaseNotes.live_id = "13660"
+        mock_shipment.shipment.data.releaseNotes.type = "RHBA"
+        get_shipment_config_mock.return_value = mock_shipment
+
+        # Mock datetime.now() to return fixed year
+        datetime_mock.now.return_value.strftime.return_value = "2025"
+
+        runtime = MagicMock(
+            config={
+                "build_config": {
+                    "ocp_build_data_url": "https://example.com/ocp-build-data.git",
+                },
+                "jira": {
+                    "url": "https://issues.redhat.com/",
+                },
+            },
+            working_dir=Path("/path/to/working"),
+            dry_run=False,
+        )
+        runtime.new_slack_client.return_value = AsyncMock()
+        runtime.new_slack_client.return_value.say.return_value = {'message': {'ts': ''}}
+        runtime.new_slack_client.return_value.bind_channel = MagicMock()
+
+        pipeline = await PromotePipeline.create(
+            runtime,
+            group="openshift-4.10",
+            assembly="4.10.99",
+            skip_mirror_binaries=True,
+            signing_env="prod",
+            skip_sigstore=True,
+        )
+
+        # Patch pipeline methods to avoid side-effects and assert metadata propagation into arch promotion
+        pipeline.verify_attached_bugs = AsyncMock(return_value=None)
+        pipeline.get_image_stream_tag = AsyncMock(return_value=None)
+        pipeline.tag_release = AsyncMock(return_value=None)
+        pipeline.wait_for_stable = AsyncMock(return_value=None)
+        pipeline.send_image_list_email = AsyncMock(return_value=None)
+        pipeline.is_accepted = AsyncMock(return_value=True)
+        pipeline.ocp_doomsday_backup = AsyncMock(return_value=None)
+        pipeline.create_cincinnati_prs = AsyncMock(return_value=None)
+        pipeline.send_promote_complete_email = Mock()
+        # Ensure legacy advisory-path is bypassed when shipment config is present
+        pipeline.get_advisory_info = AsyncMock()
+        # Disable heterogeneous path to avoid unrelated logic and ensure homogeneous path executes
+        pipeline.no_multi = True
+        # Avoid signing (uses redis lock) and client extraction
+        pipeline.skip_signing = True
+        pipeline.extract_and_publish_clients = AsyncMock(return_value=[])
+        # Intercept arch promotion to assert metadata contents
+        pipeline._promote_arch = AsyncMock(
+            return_value={
+                "image": "quay.io/openshift-release-dev/ocp-release:4.10.99-x86_64",
+                "digest": "fake:digest",
+                "metadata": {"version": "4.10.99"},
+            }
+        )
+
+        try:
+            await pipeline.run()
+        except Exception:
+            # The rest of the pipeline may raise for unrelated reasons; we only care
+            # that shipment config was processed and metadata was propagated into arch promotion.
+            pass
+
+        # Verify that get_shipment_config_from_mr was called with correct parameters
+        get_shipment_config_mock.assert_called_once_with("https://gitlab.com/redhat/shipment-mr/123", "image")
+
+        # Verify that datetime.now() was called to get the year
+        datetime_mock.now.assert_called_once()
+        datetime_mock.now.return_value.strftime.assert_called_once_with("%Y")
+
+        # Verify that arch promotion received metadata containing the constructed advisory URL
+        expected_url = "https://access.redhat.com/errata/RHBA-2025:13660"
+        self.assertGreaterEqual(pipeline._promote_arch.await_count, 1)
+        metadata_args = [c.args[5] for c in pipeline._promote_arch.await_args_list]
+        self.assertTrue(any(m and m.get("url") == expected_url for m in metadata_args))
+
+        # Ensure the legacy advisory info path was not used
+        pipeline.get_advisory_info.assert_not_called()
+
+    @patch("pyartcd.jira_client.JIRAClient.from_url", return_value=None)
     def test_build_create_symlink(self, _):
         runtime = MagicMock(
             config={
@@ -1601,3 +1928,57 @@ class TestPromotePipeline(IsolatedAsyncioTestCase):
             self.assertTrue(os.path.exists(os.path.join(temp_dir, 'openshift-client-linux.tar.gz')))
             self.assertTrue(os.path.exists(os.path.join(temp_dir, 'openshift-client-mac.tar.gz')))
             self.assertTrue(os.path.exists(os.path.join(temp_dir, 'openshift-install-mac.tar.gz')))
+
+    @patch("pyartcd.jira_client.JIRAClient.from_url", return_value=None)
+    @patch("os.getenv")
+    async def test_update_shipment_with_payload_shas_missing_gitlab_token(self, mock_getenv: Mock, _):
+        """Test error when GITLAB_TOKEN is missing"""
+        mock_getenv.return_value = None  # No GITLAB_TOKEN
+
+        runtime = MagicMock()
+        runtime.working_dir = Path("/tmp")
+        runtime.dry_run = False
+
+        pipeline = PromotePipeline(runtime, group="openshift-4.19", assembly="4.19.0", signing_env="prod")
+
+        payload_shas = {"x86_64": "sha256:abc123"}
+        shipment_url = "https://gitlab.example.com/project/-/merge_requests/123"
+
+        with self.assertRaisesRegex(ValueError, "GITLAB_TOKEN environment variable is required"):
+            await pipeline.update_shipment_with_payload_shas(shipment_url, payload_shas)
+
+    @patch("pyartcd.jira_client.JIRAClient.from_url", return_value=None)
+    @patch("pyartcd.pipelines.promote.get_shipment_configs_from_mr")
+    @patch("pyartcd.pipelines.promote.gitlab.Gitlab")
+    @patch("os.getenv")
+    async def test_update_shipment_with_payload_shas_no_image_shipment(
+        self, mock_getenv: Mock, mock_gitlab_class: Mock, mock_get_shipment_configs: Mock, _
+    ):
+        """Test when no image shipment is found in MR"""
+        mock_getenv.side_effect = lambda key: {"GITLAB_TOKEN": "fake-token"}.get(key)
+
+        # Setup GitLab mocks to prevent real network calls
+        mock_gitlab = MagicMock()
+        mock_gitlab_class.return_value = mock_gitlab
+
+        # No image shipment in configs
+        mock_get_shipment_configs.return_value = {"rpm": MagicMock()}
+
+        runtime = MagicMock()
+        runtime.working_dir = Path("/tmp")
+        runtime.dry_run = False
+        runtime.logger = MagicMock()
+
+        pipeline = PromotePipeline(runtime, group="openshift-4.19", assembly="4.19.0", signing_env="prod")
+        # Mock the RPM advisory generation to prevent doozer calls
+        pipeline._get_rpm_advisory = AsyncMock(return_value=None)
+
+        payload_shas = {"x86_64": "sha256:abc123"}
+        shipment_url = "https://gitlab.example.com/project/-/merge_requests/123"
+
+        await pipeline.update_shipment_with_payload_shas(shipment_url, payload_shas)
+
+        # Should log warning about missing IMAGE_ADVISORY generation
+        runtime.logger.warning.assert_any_call(
+            "Cannot generate IMAGE_ADVISORY: missing image shipment or type/live_id data"
+        )
