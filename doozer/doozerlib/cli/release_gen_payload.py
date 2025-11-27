@@ -2371,7 +2371,7 @@ class PayloadGenerator:
             entry = payload_entries.get(payload_tag_name, None)
 
             if not entry:
-                raise IOError(f"Did not find {nightly} payload tag {payload_tag_name} in computed assembly payload")
+                raise IOError(f"Did not find {nightly} payload tag {payload_tag_name} in computed assembly payload, payload entry is {payload_entries}")
 
             if entry.image_inspector:
                 if entry.image_inspector.get_digest() != pullspec_sha:
