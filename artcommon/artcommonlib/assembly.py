@@ -128,8 +128,9 @@ def assembly_config_struct(releases_config: Model, assembly: typing.Optional[str
     The key may refer to a list or dict (set default value appropriately).
     """
     if not assembly or not isinstance(releases_config, Model):
-        return Missing
-    key_struct = assembly_field(releases_config.primitive(), assembly, key, default)
+        key_struct = default
+    else:
+        key_struct = assembly_field(releases_config.primitive(), assembly, key, default)
     if isinstance(default, dict):
         return Model(dict_to_model=key_struct)
     elif isinstance(default, list):
@@ -317,6 +318,9 @@ def assembly_basis_event(
         time_str = target_assembly.basis.time
         if not isinstance(time_str, str):
             raise ValueError(f"Invalid time format for assembly {assembly}: {time_str}")
+        # Handle 'Z' suffix for UTC which is not supported in Python 3.10's fromisoformat
+        if time_str.endswith('Z'):
+            time_str = time_str[:-1] + '+00:00'
         dt = datetime.fromisoformat(time_str)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)

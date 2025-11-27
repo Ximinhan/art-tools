@@ -334,7 +334,7 @@ class SourceResolver:
         LOGGER.info('Checking if target branch {} exists in {}'.format(branch, git_url))
 
         try:
-            out, _ = exectools.cmd_assert('git ls-remote --heads {} {}'.format(git_url, branch), retries=3)
+            out, _ = exectools.cmd_assert('git ls-remote --heads {} refs/heads/{}'.format(git_url, branch), retries=3)
         except Exception as err:
             # We don't expect and exception if the branch does not exist; just an empty string
             LOGGER.error('Error attempting to find target branch {} hash: {}'.format(branch, err))
@@ -469,7 +469,21 @@ class SourceResolver:
                         target_pub_branch = upstream.get("public_branch")
 
             if target_priv_prefix:
-                return f'{target_pub_prefix}{remote_https[len(target_priv_prefix) :]}', target_pub_branch, True
+                repo_path = remote_https[len(target_priv_prefix) :]  # e.g., "/migtools-mig-operator"
+
+                # Extract public org name
+                pub_org = target_pub_prefix.split('/')[-1]  # e.g., "migtools"
+
+                # If public org is not "openshift", try removing org prefix from repo name
+                if pub_org != "openshift":
+                    repo_name = repo_path.lstrip('/')  # "migtools-mig-operator"
+                    if repo_name.startswith(f"{pub_org}-"):
+                        # Remove the org prefix: "migtools-mig-operator" → "mig-operator"
+                        repo_without_prefix = repo_name.removeprefix(f"{pub_org}-")
+                        return f'{target_pub_prefix}/{repo_without_prefix}', target_pub_branch, True
+
+                # Fallback to original behavior
+                return f'{target_pub_prefix}{repo_path}', target_pub_branch, True
 
         return remote_https, None, False
 

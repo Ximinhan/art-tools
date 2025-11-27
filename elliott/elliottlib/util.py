@@ -2,20 +2,23 @@ import asyncio
 import concurrent.futures
 import datetime
 import json
+import os
 import re
+import tempfile
 from collections import deque
 from itertools import chain
 from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool as ThreadPool
 from sys import getsizeof, stderr
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, cast
 
 import click
 import yaml
 from artcommonlib import exectools
 from artcommonlib.build_visibility import get_build_system
+from artcommonlib.constants import GOLANG_BUILDER_IMAGE_NAME, GOLANG_RPM_PACKAGE_NAME
 from artcommonlib.format_util import green_prefix, green_print, red_prefix
-from artcommonlib.konflux.konflux_build_record import KonfluxBuildRecord
+from artcommonlib.konflux.konflux_build_record import Engine, KonfluxBuildRecord
 from artcommonlib.konflux.konflux_db import KonfluxDb
 from artcommonlib.logutil import get_logger
 from errata_tool import Erratum
@@ -203,6 +206,23 @@ def minor_version_tuple(bz_target):
 
     match = re.match(r'^(\d+).(\d+)(.0|.z)?$', bz_target)
     return int(match.groups()[0]), int(match.groups()[1])
+
+
+def get_component_by_delivery_repo(runtime, delivery_repo_name: str) -> Optional[str]:
+    """Get the component name from the delivery repo name
+    For example, "openshift4/ose-sriov-network-device-plugin-rhel9" -> "sriov-network-device-plugin-container"
+    """
+    if not runtime.image_metas():
+        raise ValueError("No image metas found. Forgot to initialize runtime with mode='images'?")
+
+    # strip off the -rhel{digit} suffix
+    def _strip(name: str) -> str:
+        return re.sub(r"-rhel\d+$", "", name)
+
+    for image in runtime.image_metas():
+        if _strip(delivery_repo_name) in [_strip(r) for r in image.config.delivery.delivery_repo_names]:
+            return image.get_component_name()
+    return None
 
 
 def get_golang_version_from_build_log(log):
@@ -459,12 +479,12 @@ def get_golang_container_nvrs_brew(nvrs: List[Tuple[str, str, str]], logger) -> 
     return go_nvr_map
 
 
-def get_golang_container_nvrs_konflux(nvrs: List[Tuple[str, str, str]], logger) -> Dict[str, Dict[str, str]]:
+def get_golang_container_nvrs_konflux(nvrs: List[Tuple[str, str, str]], logger) -> dict[str, set[tuple[str, str, str]]]:
     """
     :param nvrs: a list of tuples containing (name, version, release) in order
     :param logger: logger
 
-    :return: a dict mapping go version string to a list of nvrs built from that go version
+    :return: a dict mapping go version string to a set of nvrs built from that go version
     """
     konflux_db = KonfluxDb()
     konflux_db.bind(KonfluxBuildRecord)
@@ -475,16 +495,39 @@ def get_golang_container_nvrs_konflux(nvrs: List[Tuple[str, str, str]], logger) 
         lambda: asyncio.run(konflux_db.get_build_records_by_nvrs(['{}-{}-{}'.format(*n) for n in nvrs]))
     ).result()
 
-    go_nvr_map = {}
-    for build in all_build_objs:
+    return get_golang_container_nvrs_for_konflux_record(cast(list[KonfluxBuildRecord], all_build_objs), logger)
+
+
+def get_golang_container_nvrs_for_konflux_record(
+    build_objs: Iterable[KonfluxBuildRecord], logger
+) -> dict[str, set[tuple[str, str, str]]]:
+    """
+    :param build_objs: a list of konflux build records
+    :param logger: logger
+
+    :return: a dict mapping go version string to a set of nvrs built from that go version
+    """
+    go_nvr_map: dict[str, set[tuple[str, str, str]]] = {}
+    for build in build_objs:
+        nvr_dict = parse_nvr(build.nvr)
+        nvr = (nvr_dict['name'], nvr_dict['version'], nvr_dict['release'])
         go_version = None
-        nvr = build.nvr
-        name = parse_nvr(nvr)['name']
-        if name == 'openshift-golang-builder-container' or 'go-toolset' in name:
-            # this assumes golang builder for image is still in brew
-            go_version = golang_builder_version(nvr, logger)
-            if not go_version:
-                raise ValueError(f'Cannot find go version for {name}')
+        # The golang-builder container needs special handling,
+        # because we need to look at included golang rpms instead of parent images.
+        # Unlike `get_golang_container_nvrs_brew`, we don't accept 'go-toolset*' containers
+        # because they don't exist in KonfluxDB.
+        if build.name == GOLANG_BUILDER_IMAGE_NAME:
+            go_package = next(
+                (
+                    pkg_nvr
+                    for pkg in build.installed_packages
+                    if (pkg_nvr := parse_nvr(pkg))['name'] == GOLANG_RPM_PACKAGE_NAME
+                ),
+                None,
+            )
+            if not go_package:
+                raise ValueError(f'Cannot find go version for {build.nvr}')
+            go_version = f"{go_package['version']}-{go_package['release']}"
             if go_version not in go_nvr_map:
                 go_nvr_map[go_version] = set()
             go_nvr_map[go_version].add(nvr)
@@ -693,3 +736,262 @@ def get_advisory_boilerplate(runtime, et_data, art_advisory_key, errata_type):
         advisory_boilerplate = boilerplate[art_advisory_key]
 
     return advisory_boilerplate
+
+
+async def extract_nvrs_from_fbc(fbc_pullspec: str, product: str) -> list[str]:
+    """
+    Extract NVRs from FBC image using ORAS workflow.
+    Reuses the logic from elliott snapshot CLI.
+    """
+    logger = get_logger(__name__)
+    logger.info(f"Extracting NVRs from FBC image: {fbc_pullspec}")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            # Step 1: Discover attached artifacts using ORAS
+            logger.info("Discovering attached artifacts...")
+            discover_cmd = ['oras', 'discover', '--format', 'json', fbc_pullspec]
+            rc, discover_output, discover_stderr = await exectools.cmd_gather_async(discover_cmd, cwd=temp_dir)
+
+            if rc != 0:
+                raise RuntimeError(
+                    f"ORAS discover command failed: {' '.join(discover_cmd)}\nReturn code: {rc}\nStdout: {discover_output}\nStderr: {discover_stderr}"
+                )
+
+            # Parse JSON and extract digest for the attached artifact
+            discover_data = json.loads(discover_output)
+            logger.debug(f"ORAS discover response: {discover_data}")
+
+            digest = None
+            referrers = discover_data.get('referrers', [])
+            logger.info(f"Found {len(referrers)} referrers")
+
+            for i, referrer in enumerate(referrers):
+                artifact_type = referrer.get('artifactType')
+                annotations = referrer.get('annotations', {})
+                attached_media_type = annotations.get('attachedMediaType', '')
+                logger.debug(
+                    f"Referrer {i}: artifactType={artifact_type}, attachedMediaType={attached_media_type}, digest={referrer.get('digest')}"
+                )
+
+                # Look specifically for the related-images artifact
+                if (
+                    artifact_type == 'application/vnd.konflux-ci.attached-artifact'
+                    and 'related-images' in attached_media_type
+                ):
+                    digest = referrer.get('digest')
+                    logger.info(f"Found related-images artifact with digest: {digest}")
+                    break
+
+            if not digest:
+                available_types = [r.get('artifactType') for r in referrers]
+                raise RuntimeError(
+                    f"No attached artifact found with expected type 'application/vnd.konflux-ci.attached-artifact'. Available types: {available_types}"
+                )
+
+            # Step 2: Pull the attached artifact
+            logger.info(f"Pulling attached artifact with digest: {digest}")
+            # Extract the base registry and repo from the original FBC pullspec
+            # We need to preserve the full repository path, only remove the tag/digest
+            if '@' in fbc_pullspec:
+                # Format: repo@digest
+                base_pullspec = fbc_pullspec.split('@')[0]
+            elif ':' in fbc_pullspec:
+                # Format: repo:tag - need to find the last : that separates tag
+                # Split by : and rejoin all but the last part (which is the tag)
+                parts = fbc_pullspec.split(':')
+                if len(parts) > 2:  # registry:port/repo:tag format
+                    # Find the tag part (everything after the last / and :)
+                    base_pullspec = ':'.join(parts[:-1])
+                else:
+                    base_pullspec = parts[0]
+            else:
+                base_pullspec = fbc_pullspec
+            artifact_pullspec = f"{base_pullspec}@{digest}"
+            pull_cmd = ['oras', 'pull', artifact_pullspec]
+            logger.info(f"Pulling from: {artifact_pullspec}")
+            rc, pull_output, pull_stderr = await exectools.cmd_gather_async(pull_cmd, cwd=temp_dir)
+
+            if rc != 0:
+                raise RuntimeError(
+                    f"ORAS pull command failed: {' '.join(pull_cmd)}\nReturn code: {rc}\nStdout: {pull_output}\nStderr: {pull_stderr}"
+                )
+
+            # Step 3: Read and process the catalog file
+            pulled_files = os.listdir(temp_dir)
+            logger.info(f"Files found in pulled artifact: {pulled_files}")
+
+            # Debug: Show the contents of each file for analysis
+            for file in pulled_files:
+                if file.endswith('.json'):
+                    logger.debug(f"Contents of {file}:")
+                    with open(os.path.join(temp_dir, file), 'r') as f:
+                        content = f.read()
+                        logger.debug(f"{file}: {content[:200]}...")  # First 200 chars
+
+            # Transform the URLs - require product name to be specified
+            if not product:
+                raise ValueError(
+                    "Product parameter is required to determine the registry namespace for image transformation"
+                )
+            registry_transform_pattern = rf'registry\.redhat\.io/{product}/[^@]*'
+
+            related_images = []
+            related_images_path = os.path.join(temp_dir, 'related-images.json')
+            if os.path.exists(related_images_path):
+                logger.info("Reading related-images.json...")
+                with open(related_images_path, 'r') as f:
+                    raw_images = json.load(f)
+
+                logger.info(f"Found {len(raw_images)} images in related-images.json")
+
+                for img_url in raw_images:
+                    # Check if the URL matches the product namespace pattern
+                    if f'registry.redhat.io/{product}/' in img_url:
+                        # Apply the transformation to quay.io/redhat-user-workloads/ocp-art-tenant/art-images
+                        transformed_url = re.sub(
+                            registry_transform_pattern,
+                            'quay.io/redhat-user-workloads/ocp-art-tenant/art-images',
+                            img_url,
+                        )
+                        related_images.append(transformed_url)
+                        logger.debug(f"Transformed: {img_url} -> {transformed_url}")
+                    else:
+                        related_images.append(img_url)
+                        logger.debug(f"Using as-is: {img_url}")
+
+                logger.info(f"Processed {len(related_images)} images from related-images.json")
+
+                # Print all transformed pull specs for debugging
+                logger.info("=== TRANSFORMED PULL SPECS ===")
+                for i, img in enumerate(related_images, 1):
+                    logger.info(f"{i:2d}. {img}")
+                logger.info("=== END TRANSFORMED PULL SPECS ===")
+
+            else:
+                catalog_json_path = os.path.join(temp_dir, 'catalog.json')
+                if os.path.exists(catalog_json_path):
+                    logger.warning(
+                        "related-images.json not found, falling back to catalog.json (this may extract many images)"
+                    )
+                    # Keep the existing catalog.json logic as fallback but warn about it
+                    with open(catalog_json_path, 'r') as f:
+                        catalog_content = f.read()
+
+                registry_pattern = r'registry\.redhat\.io/[^\s"\'<>]+|quay\.io/[^\s"\'<>]+'
+                found_images = re.findall(registry_pattern, catalog_content)
+
+                # Use the same product namespace for catalog.json fallback
+                for img_url in found_images:
+                    img_url = img_url.rstrip('",')
+                    # Check if the URL matches the product namespace pattern
+                    if f'registry.redhat.io/{product}/' in img_url:
+                        transformed_url = re.sub(
+                            registry_transform_pattern,
+                            'quay.io/redhat-user-workloads/ocp-art-tenant/art-images',
+                            img_url,
+                        )
+                        related_images.append(transformed_url)
+                    else:
+                        related_images.append(img_url)
+
+                    related_images = list(set(related_images))
+                    logger.warning(f"Extracted {len(related_images)} unique images from catalog.json")
+                else:
+                    raise RuntimeError(
+                        f"Neither related-images.json nor catalog.json found in pulled artifact. Available files: {pulled_files}"
+                    )
+
+            if not related_images:
+                logger.error("No image URLs found in catalog file")
+                raise RuntimeError("No image URLs extracted from FBC catalog")
+
+            # Step 4: Transform image URLs and extract NVRs in parallel
+            logger.info(f"Extracting NVRs from {len(related_images)} related images in parallel...")
+
+            async def extract_nvr_from_image(image_url: str) -> tuple[str, str, str]:
+                """Extract NVR from a single image. Returns (image_url, nvr_or_empty, error_msg_or_empty)"""
+                try:
+                    logger.debug(f"Running oc image info for: {image_url}")
+                    oc_cmd = ['oc', 'image', 'info', image_url, '--filter-by-os', 'amd64', '-o', 'json']
+
+                    # Add registry config for authentication if available
+                    konflux_art_images_auth_file = os.getenv("KONFLUX_ART_IMAGES_AUTH_FILE")
+                    if konflux_art_images_auth_file:
+                        oc_cmd.extend(['--registry-config', konflux_art_images_auth_file])
+
+                    _, image_info_output, _ = await exectools.cmd_gather_async(oc_cmd, cwd=temp_dir)
+                    image_info = json.loads(image_info_output)
+
+                    # Extract labels
+                    labels = image_info.get('config', {}).get('config', {}).get('Labels', {})
+                    component = labels.get('com.redhat.component')
+                    version = labels.get('version')
+                    release = labels.get('release')
+
+                    logger.debug(
+                        f"Image labels for {image_url} - component: {component}, version: {version}, release: {release}"
+                    )
+
+                    if component and version and release:
+                        nvr = f"{component}-{version}-{release}"
+                        logger.debug(f"✓ Extracted NVR from {image_url}: {nvr}")
+                        return (image_url, nvr, "")
+                    else:
+                        missing_labels = []
+                        if not component:
+                            missing_labels.append('com.redhat.component')
+                        if not version:
+                            missing_labels.append('version')
+                        if not release:
+                            missing_labels.append('release')
+                        error_msg = f"Missing required labels: {', '.join(missing_labels)}"
+                        logger.debug(f"✗ {error_msg} for {image_url}")
+                        return (image_url, "", error_msg)
+
+                except Exception as e:
+                    error_msg = f"Failed to get image info: {e}"
+                    logger.debug(f"✗ {error_msg} for {image_url}")
+                    return (image_url, "", error_msg)
+
+            # Run all oc image info commands in parallel
+            tasks = [extract_nvr_from_image(image_url) for image_url in related_images]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Process results
+            nvrs = []
+            failed_images = []
+
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    failed_images.append(f"{related_images[i]} (exception: {result})")
+                    continue
+
+                image_url, nvr, error_msg = result
+                if nvr:
+                    nvrs.append(nvr)
+                    logger.info(f"✓ Extracted NVR: {nvr}")
+                else:
+                    failed_images.append(f"{image_url} ({error_msg})")
+                    logger.warning(f"✗ Failed to extract NVR from {image_url}: {error_msg}")
+
+            logger.info(f"NVR extraction completed: {len(nvrs)} successful, {len(failed_images)} failed")
+            if failed_images:
+                logger.warning(f"Failed images: {failed_images}")
+
+            if not nvrs:
+                logger.error("No NVRs could be extracted from any images")
+                logger.error("This could be due to:")
+                logger.error("1. Images not being accessible (authentication required)")
+                logger.error("2. Incorrect image URL transformation")
+                logger.error("3. Images missing required labels")
+                logger.error("4. Network connectivity issues")
+                raise RuntimeError(
+                    f"Failed to extract NVRs from all {len(related_images)} images. Check logs for details."
+                )
+
+        except Exception:
+            raise
+
+    logger.info(f"Extracted {len(nvrs)} NVRs from FBC image")
+    return nvrs

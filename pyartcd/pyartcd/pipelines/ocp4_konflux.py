@@ -13,7 +13,6 @@ from artcommonlib import exectools, redis
 from artcommonlib.build_visibility import is_release_embargoed
 from artcommonlib.constants import KONFLUX_ART_IMAGES_SHARE, KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS
 from artcommonlib.util import new_roundtrip_yaml_handler, sync_to_quay, validate_build_priority
-from doozerlib.util import extract_version_fields
 
 from pyartcd import constants, jenkins, locks, util
 from pyartcd import record as record_util
@@ -46,12 +45,12 @@ class BuildPlan:
         self.image_build_strategy = image_build_strategy  # build all images or a subset
         self.images_included = []  # include list for images to build
         self.images_excluded = []  # exclude list for images to build
-        self.active_rpm_count = 0  # number of RPMs active in this version
+        self.active_image_count = 0  # number of images active in this version
 
         self.rpm_build_strategy = rpm_build_strategy  # build all RPMs or a subset
         self.rpms_included = []  # include list for RPMs to build
         self.rpms_excluded = []  # exclude list for RPMs to build
-        self.active_image_count = 0  # number of images active in this version
+        self.active_rpm_count = 0  # number of RPMs active in this version
 
     def __str__(self):
         return json.dumps(self.__dict__, indent=4, cls=EnumEncoder)
@@ -85,6 +84,7 @@ class KonfluxOcp4Pipeline:
         skip_plashets: bool = False,
         build_priority: str = None,
         use_mass_rebuild_locks: bool = False,
+        network_mode: Optional[str] = None,
     ):
         self.runtime = runtime
         self.assembly = assembly
@@ -101,6 +101,7 @@ class KonfluxOcp4Pipeline:
         self.skip_plashets = skip_plashets
         self.build_priority = build_priority
         self.use_mass_rebuild_locks = use_mass_rebuild_locks
+        self.network_mode = network_mode
 
         # If build plan includes more than half or excludes less than half or rebuilds everything, it's a mass rebuild
         self.mass_rebuild = False
@@ -123,6 +124,7 @@ class KonfluxOcp4Pipeline:
         self.rpm_list = [rpm.strip() for rpm in rpm_list.split(',')] if rpm_list else []
 
         self.group_images = []
+        self.rebase_failures = []
 
         self.slack_client = runtime.new_slack_client()
 
@@ -153,9 +155,13 @@ class KonfluxOcp4Pipeline:
             return [f'--{kind}={",".join(includes)}']
 
         elif build_strategy == BuildStrategy.EXCEPT:
-            return [f'--{kind}=', f'--exclude{",".join(excludes)}']
+            return [f'--{kind}=', f'--exclude={",".join(excludes)}']
 
     async def update_rebase_fail_counters(self, failed_images):
+        if self.assembly == 'test':
+            # Ignore for test assembly
+            return
+
         # Reset fail counters for images that were rebased successfully
         match self.build_plan.image_build_strategy:
             case BuildStrategy.ALL:
@@ -226,6 +232,8 @@ class KonfluxOcp4Pipeline:
                 f"--message='Updating Dockerfile version and release {version}-{input_release}'",
             ]
         )
+        if self.network_mode:
+            cmd.extend(['--network-mode', self.network_mode])
         if not self.runtime.dry_run:
             cmd.append('--push')
 
@@ -258,6 +266,9 @@ class KonfluxOcp4Pipeline:
                 # Append failed images to excluded ones
                 self.build_plan.images_excluded.extend(failed_images)
 
+            # Track rebase failures for later steps
+            self.rebase_failures = failed_images
+
     async def build_images(self):
         if not self.building_images():
             LOGGER.warning('No images will be built')
@@ -278,6 +289,8 @@ class KonfluxOcp4Pipeline:
                 "--konflux-namespace=ocp-art-tenant",
             ]
         )
+        if self.network_mode:
+            cmd.extend(['--network-mode', self.network_mode])
         if self.kubeconfig:
             cmd.extend(['--konflux-kubeconfig', self.kubeconfig])
         if self.plr_template:
@@ -317,9 +330,9 @@ class KonfluxOcp4Pipeline:
 
         built_images = [entry['name'] for entry in record_log['image_build_konflux'] if not int(entry['status'])]
         failed_images = [entry['name'] for entry in record_log['image_build_konflux'] if int(entry['status'])]
-        if len(failed_images) <= 10:
+        if 1 <= len(failed_images) <= 10:
             jenkins.update_description(f'Failed images: {", ".join(failed_images)}<br/>')
-        else:
+        elif len(failed_images) > 10:
             jenkins.update_description(f'{len(failed_images)} images failed. Check record.log for details<br/>')
 
         if not built_images:
@@ -535,11 +548,8 @@ class KonfluxOcp4Pipeline:
 
     async def initialize(self):
         jenkins.init_jenkins()
-        jenkins.update_title(f' - {self.version} ')
+        jenkins.update_title(f' - {self.version} [{self.assembly}] ')
         await self.init_build_plan()
-
-        if self.assembly.lower() == "test":
-            jenkins.update_title(" [TEST]")
 
     async def clean_up(self):
         LOGGER.info('Cleaning up Doozer source dirs')
@@ -549,6 +559,10 @@ class KonfluxOcp4Pipeline:
                 self.runtime.cleanup_sources('konflux_build_sources'),
             ]
         )
+
+        # If any image failed to rebase, raise an exception to make the pipeline unstable
+        if self.rebase_failures:
+            raise RuntimeError(f'Following images failed to rebase: {",".join(self.rebase_failures)}')
 
     def trigger_bundle_build(self):
         if self.skip_bundle_build:
@@ -652,7 +666,9 @@ class KonfluxOcp4Pipeline:
                 LOGGER.info(f"Not syncing {image_pullspec} because it is in an embargoed release")
                 return
 
-            await sync_to_quay(image_pullspec, KONFLUX_ART_IMAGES_SHARE)
+            image_tag = build["image_tag"]
+            latest_tag = f'{build["name"]}-{self.version}'
+            await sync_to_quay(image_pullspec, KONFLUX_ART_IMAGES_SHARE, [image_tag, latest_tag])
 
         await asyncio.gather(*[sync_build(build) for build in builds_to_mirror])
 
@@ -664,8 +680,9 @@ class KonfluxOcp4Pipeline:
 
         # Build plashets if needed
         if not self.skip_plashets and self.version in KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS:
+            group_param = f"openshift-{self.version}"
             jenkins.start_build_plashets(
-                version=self.version,
+                group=group_param,
                 release=self.release,
                 assembly=self.assembly,
                 data_path=self.data_path,
@@ -812,6 +829,11 @@ class KonfluxOcp4Pipeline:
     default=False,
     help='Use legacy mass rebuild locks instead of Kueue priorities (for fallback/revert scenarios).',
 )
+@click.option(
+    '--network-mode',
+    type=click.Choice(['hermetic', 'internal-only', 'open']),
+    help='Override network mode for Konflux builds. Takes precedence over image and group config settings.',
+)
 @pass_runtime
 @click_coroutine
 async def ocp4(
@@ -833,6 +855,7 @@ async def ocp4(
     skip_plashets,
     build_priority: Optional[str],
     use_mass_rebuild_locks: bool,
+    network_mode: Optional[str],
 ):
     if not kubeconfig:
         kubeconfig = os.environ.get('KONFLUX_SA_KUBECONFIG')
@@ -860,6 +883,7 @@ async def ocp4(
         skip_plashets=skip_plashets,
         build_priority=build_priority,
         use_mass_rebuild_locks=use_mass_rebuild_locks,
+        network_mode=network_mode,
     )
 
     if ignore_locks:

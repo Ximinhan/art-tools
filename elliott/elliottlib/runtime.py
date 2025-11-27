@@ -146,7 +146,13 @@ class Runtime(GroupRuntime):
         return Model(group_config)
 
     def initialize(
-        self, mode='none', no_group=False, disabled=None, build_system: str = None, with_shipment: bool = False
+        self,
+        mode='none',
+        no_group=False,
+        disabled=None,
+        build_system: str = None,
+        with_shipment: bool = False,
+        disable_konflux_db_cache=False,
     ):
         if self.initialized:
             return
@@ -161,7 +167,7 @@ class Runtime(GroupRuntime):
             if not os.path.isdir(self.working_dir):
                 os.makedirs(self.working_dir)
 
-        super().initialize(build_system)
+        super().initialize(build_system, disable_konflux_db_cache)
 
         if self.quiet and self.verbose:
             click.echo("Flags --quiet and --verbose are mutually exclusive")
@@ -301,7 +307,11 @@ class Runtime(GroupRuntime):
             )
 
         strict_mode = True
-        if not self.assembly or self.assembly in ['stream', 'test', 'microshift']:
+        if (
+            not self.assembly
+            or self.assembly in ['stream', 'test', 'microshift']
+            or not self.group.startswith('openshift-')
+        ):
             strict_mode = False
         self.assembly_type = assembly_type(self.get_releases_config(), self.assembly)
         self.assembly_basis_event = assembly_basis_event(
@@ -423,7 +433,7 @@ class Runtime(GroupRuntime):
 
     def resolve_shipment_metadata(self, strict=True):
         if strict and not self.shipment_path:
-            self.shipment_path = SHIPMENT_DATA_URL_TEMPLATE.format(self.product)
+            self.shipment_path = SHIPMENT_DATA_URL_TEMPLATE
 
         if self.shipment_path:
             shipment_path, commitish = self.shipment_path, "main"

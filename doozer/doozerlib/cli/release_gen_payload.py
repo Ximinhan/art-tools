@@ -566,6 +566,7 @@ class GenPayloadCli:
         issues = []
         for mismatched, sibling in self.payload_generator.find_mismatched_siblings(group_images):
             component = mismatched.get_image_meta().distgit_key
+            sibling_component = sibling.get_image_meta().distgit_key
 
             issue = AssemblyIssue(
                 f"{mismatched.get_nvr()} was built from a different upstream "
@@ -579,8 +580,14 @@ class GenPayloadCli:
 
             if assembly_inspector.does_permit(issue):
                 # If mismatched siblings are permitted, exclude them from the payload update
+                # We need to skip both the mismatched component and its sibling to ensure
+                # all siblings from the same repo are excluded when there are mismatches
                 self.logger.warning(f"Ignoring {mismatched.get_nvr()} mismatch due to configured permit")
-                self.mismatched_siblings.append(component)
+                if component not in self.mismatched_siblings:
+                    self.mismatched_siblings.append(component)
+                if sibling_component not in self.mismatched_siblings:
+                    self.mismatched_siblings.append(sibling_component)
+                    self.logger.warning(f"Also excluding sibling {sibling.get_nvr()} due to mismatch")
 
         self.assembly_issues.extend(issues)
         span.set_attribute("doozer.result.issues", list(map(lambda it: it.to_dict(), issues)))
@@ -685,10 +692,10 @@ class GenPayloadCli:
                 else:  # konflux
                     non_latest_rpms = await build_inspector.find_non_latest_rpms(self.package_rpm_finder)
 
-                for arch, non_latest_rpms in non_latest_rpms.items():
+                for arch, arch_non_latest_rpms in non_latest_rpms.items():
                     # This could indicate an issue with scan-sources or that an image is no longer successfully building
                     # It could also mean that images are pinning content, which may be expected, so allow permits.
-                    for installed_nevra, newest_nevra, repo in non_latest_rpms:
+                    for installed_nevra, newest_nevra, repo in arch_non_latest_rpms:
                         nevr, _ = installed_nevra.rsplit(".", maxsplit=1)
                         rpm_name = parse_nvr(nevr)['name']
                         is_exempt, pattern = image_meta.is_rpm_exempt(rpm_name)

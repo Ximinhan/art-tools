@@ -11,7 +11,9 @@ reviewers:
 - mbiarnes
 - lgarciaaco
 - rayfordj
+- fbladilo
 - adobes1
+- pruan-rht
 approvers:
 - sosiouxme
 - jupierce
@@ -25,6 +27,8 @@ approvers:
 - mbiarnes
 - lgarciaaco
 - rayfordj
+- fbladilo
 - adobes1
+- pruan-rht
 # this is to keep automation from complaining about ownership of base image builds
 component: Release

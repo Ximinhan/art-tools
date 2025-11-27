@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from collections import OrderedDict
@@ -6,6 +7,7 @@ from multiprocessing import Event
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 from artcommonlib import util as artlib_util
+from artcommonlib.konflux.konflux_build_record import ArtifactType, Engine, KonfluxBuildOutcome, KonfluxBuildRecord
 from artcommonlib.model import Missing, Model
 from artcommonlib.pushd import Dir
 from artcommonlib.rpm_utils import parse_nvr, to_nevra
@@ -245,20 +247,49 @@ class ImageMetadata(Metadata):
         return self.image_name.replace("/", "-")
 
     def pull_url(self):
-        # Don't trust what is the Dockerfile for version & release. This field may not even be present.
-        # Query brew to find the most recently built release for this component version.
-        _, version, release = self.get_latest_build_info(el_target=self.branch_el_target())
+        """
+        Get the pullspec for the latest build of this image.
 
-        # we need to pull images from proxy if 'brew_image_namespace' is enabled:
-        # https://source.redhat.com/groups/public/container-build-system/container_build_system_wiki/pulling_pre_quay_switch_over_osbs_built_container_images_using_the_osbs_registry_proxy
-        if self.runtime.group_config.urls.brew_image_namespace is not Missing:
-            name = self.runtime.group_config.urls.brew_image_namespace + '/' + self.config.name.replace('/', '-')
+        Returns the pullspec from Konflux if build_system is 'konflux',
+        otherwise returns the Brew pullspec.
+        """
+        if self.runtime.build_system == 'konflux':
+            # Bind Konflux DB if not already bound
+            if not hasattr(self.runtime, '_konflux_db_bound'):
+                self.runtime.konflux_db.bind(KonfluxBuildRecord)
+                self.runtime._konflux_db_bound = True
+
+            # Get the latest Konflux build synchronously
+            async def get_latest_konflux_build():
+                return await self.runtime.konflux_db.get_latest_build(
+                    name=self.distgit_key,
+                    group=self.runtime.group,
+                    assembly=self.runtime.assembly,
+                    artifact_type=ArtifactType.IMAGE,
+                    engine=Engine.KONFLUX,
+                    outcome=KonfluxBuildOutcome.SUCCESS,
+                )
+
+            build = asyncio.run(get_latest_konflux_build())
+            if not build:
+                raise IOError(f'No Konflux build found for {self.distgit_key} in group {self.runtime.group}')
+            return build.image_pullspec
         else:
-            name = self.config.name
+            # Brew build system (existing behavior)
+            # Don't trust what is the Dockerfile for version & release. This field may not even be present.
+            # Query brew to find the most recently built release for this component version.
+            _, version, release = self.get_latest_build_info(el_target=self.branch_el_target())
 
-        return "{host}/{name}:{version}-{release}".format(
-            host=self.runtime.group_config.urls.brew_image_host, name=name, version=version, release=release
-        )
+            # we need to pull images from proxy if 'brew_image_namespace' is enabled:
+            # https://source.redhat.com/groups/public/container-build-system/container_build_system_wiki/pulling_pre_quay_switch_over_osbs_built_container_images_using_the_osbs_registry_proxy
+            if self.runtime.group_config.urls.brew_image_namespace is not Missing:
+                name = self.runtime.group_config.urls.brew_image_namespace + '/' + self.config.name.replace('/', '-')
+            else:
+                name = self.config.name
+
+            return "{host}/{name}:{version}-{release}".format(
+                host=self.runtime.group_config.urls.brew_image_host, name=name, version=version, release=release
+            )
 
     def pull_image(self):
         pull_image(self.pull_url())
@@ -560,6 +591,7 @@ class ImageMetadata(Metadata):
     def calculate_config_digest(self, group_config, streams):
         ignore_keys = [
             "owners",
+            "okd",
             "scan_sources",
             "content.source.ci_alignment",
             "content.source.git",
@@ -667,18 +699,21 @@ class ImageMetadata(Metadata):
         if cachi2_config_override not in [Missing, None]:
             # If cachi2 override is defined in image metadata
             cachi2_enabled = cachi2_config_override
-            self.logger.info("cachi2 enabled from metadata config")
+            source = "metadata config"
+
         elif cachi2_group_override not in [Missing, None]:
             # If cachi2 override is defined in group metadata
             cachi2_enabled = cachi2_group_override
-            self.logger.info("cachi2 enabled from group config")
+            source = "group config"
+
         else:
             # Enable cachi2 based on cachito config
-            self.logger.info("cachi2 override not found. fallback to use cachito config")
             cachi2_enabled = artlib_util.is_cachito_enabled(
                 metadata=self, group_config=self.runtime.group_config, logger=self.logger
             )
+            source = "cachito config"
 
+        self.logger.info("cachi2 %s from %s", "enabled" if cachi2_enabled else "disabled", source)
         return cachi2_enabled
 
     def is_lockfile_generation_enabled(self) -> bool:
@@ -710,44 +745,23 @@ class ImageMetadata(Metadata):
             return False
 
         # Third check: lockfile-specific overrides
+        source = None
         lockfile_config_override = self.config.konflux.cachi2.lockfile.enabled
+
         if lockfile_config_override not in [Missing, None]:
             lockfile_enabled = bool(lockfile_config_override)
-            self.logger.info(f"Lockfile generation set from metadata config {lockfile_enabled}")
-        else:
-            lockfile_group_override = self.runtime.group_config.konflux.cachi2.lockfile.enabled
-            if lockfile_group_override not in [Missing, None]:
-                lockfile_enabled = bool(lockfile_group_override)
-                self.logger.info(f"Lockfile generation set from group config {lockfile_enabled}")
+            source = "metadata config"
+
+        elif (lockfile_group_override := self.runtime.group_config.konflux.cachi2.lockfile.enabled) not in [
+            Missing,
+            None,
+        ]:
+            lockfile_enabled = bool(lockfile_group_override)
+            source = "group config"
+
+        self.logger.info(f"Lockfile generation set from {source} {lockfile_enabled}")
 
         return lockfile_enabled
-
-    def is_lockfile_force_enabled(self) -> bool:
-        """
-        Determines whether lockfile force generation is enabled for the current image configuration.
-
-        The method checks configuration in the following order:
-        1. Image metadata configuration (`self.config.konflux.cachi2.lockfile.force`)
-        2. Group configuration (`self.runtime.group_config.konflux.cachi2.lockfile.force`)
-
-        If neither is set, force generation defaults to disabled.
-
-        Returns:
-            bool: True if lockfile force generation is enabled, False otherwise.
-        """
-        lockfile_force_config_override = self.config.konflux.cachi2.lockfile.force
-        if lockfile_force_config_override not in [Missing, None]:
-            lockfile_force = bool(lockfile_force_config_override)
-            self.logger.info(f"Lockfile force generation set from metadata config: {lockfile_force}")
-            return lockfile_force
-
-        lockfile_force_group_override = self.runtime.group_config.konflux.cachi2.lockfile.force
-        if lockfile_force_group_override not in [Missing, None]:
-            lockfile_force = bool(lockfile_force_group_override)
-            self.logger.info(f"Lockfile force generation set from group config: {lockfile_force}")
-            return lockfile_force
-
-        return False
 
     def is_lockfile_parent_inspect_enabled(self) -> bool:
         """
@@ -773,6 +787,33 @@ class ImageMetadata(Metadata):
             lockfile_inspect_parent = bool(lockfile_inspect_parent_group_override)
             self.logger.info(f"Lockfile parent inspection set from group config: {lockfile_inspect_parent}")
             return lockfile_inspect_parent
+
+        return True
+
+    def is_dnf_modules_enable_enabled(self) -> bool:
+        """
+        Determines whether DNF module enablement command injection is enabled.
+
+        Checks configuration in the following order:
+        1. Image metadata configuration (konflux.cachi2.lockfile.dnf_modules_enable)
+        2. Group configuration (runtime.group_config.konflux.cachi2.lockfile.dnf_modules_enable)
+
+        If neither is set, DNF modules enablement defaults to enabled (True).
+
+        Returns:
+            bool: True if DNF module enablement injection is enabled, False otherwise.
+        """
+        dnf_modules_enable_config_override = self.config.konflux.cachi2.lockfile.dnf_modules_enable
+        if dnf_modules_enable_config_override not in [Missing, None]:
+            dnf_modules_enable = bool(dnf_modules_enable_config_override)
+            self.logger.info(f"DNF modules enablement set from metadata config: {dnf_modules_enable}")
+            return dnf_modules_enable
+
+        dnf_modules_enable_group_override = self.runtime.group_config.konflux.cachi2.lockfile.dnf_modules_enable
+        if dnf_modules_enable_group_override not in [Missing, None]:
+            dnf_modules_enable = bool(dnf_modules_enable_group_override)
+            self.logger.info(f"DNF modules enablement set from group config: {dnf_modules_enable}")
+            return dnf_modules_enable
 
         return True
 
@@ -874,14 +915,46 @@ class ImageMetadata(Metadata):
         # Return union of both sources
         return rpms_from_build.union(rpms_from_config)
 
+    def get_lockfile_modules_to_install(self) -> set[str]:
+        """
+        Get module names for lockfile generation from configuration.
+
+        Follows the same pattern as get_lockfile_rpms_to_install() for consistency.
+        Configuration path: konflux.cachi2.lockfile.modules
+
+        Returns:
+            set[str]: Module names specified in lockfile configuration
+        """
+        modules_from_config = set()
+        lockfile_modules = self.config.konflux.cachi2.lockfile.get('modules', [])
+
+        if lockfile_modules not in [Missing, None]:
+            modules_from_config = set(lockfile_modules)
+            if modules_from_config:
+                self.logger.info(f'{self.distgit_key} adding {len(modules_from_config)} modules from lockfile config')
+
+        return modules_from_config
+
     def get_enabled_repos(self) -> set[str]:
         """
         Get enabled repositories for lockfile generation.
 
+        A repo is considered enabled only if it is BOTH:
+        1. Enabled in group.yml (Repo.enabled == True)
+        2. Listed in this image's enabled_repos config
+
         Returns:
             set[str]: Repository names enabled for this image
         """
-        return set(self.config.get("enabled_repos", []))
+        image_enabled_repos = set(self.config.get("enabled_repos", []))
+        if not image_enabled_repos:
+            return set()
+
+        # Get globally enabled repos from group config
+        globally_enabled = {r.name for r in self.runtime.repos.values() if r.enabled}
+
+        # Return intersection - repos must be enabled in BOTH places
+        return globally_enabled & image_enabled_repos
 
     def is_artifact_lockfile_enabled(self) -> bool:
         """

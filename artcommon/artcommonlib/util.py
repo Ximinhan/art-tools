@@ -13,7 +13,14 @@ from typing import Dict, Iterable, List, Optional, OrderedDict, Tuple, Union
 
 import aiohttp
 import requests
-from artcommonlib.constants import RELEASE_SCHEDULES
+import requests_gssapi
+from artcommonlib import logutil
+from artcommonlib.constants import (
+    KONFLUX_DEFAULT_NAMESPACE,
+    PRODUCT_KUBECONFIG_MAP,
+    PRODUCT_NAMESPACE_MAP,
+    RELEASE_SCHEDULES,
+)
 from artcommonlib.exectools import cmd_assert_async, cmd_gather_async, limit_concurrency
 from artcommonlib.model import ListModel, Missing
 from ruamel.yaml import YAML
@@ -21,6 +28,7 @@ from semver import VersionInfo
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 LOGGER = logging.getLogger(__name__)
+KONFLUX_LOGGER = logutil.get_logger(__name__)
 
 
 def get_utc_now_formatted_str(microseconds: bool = False):
@@ -184,11 +192,14 @@ def get_assembly_release_date(assembly, group):
 
     :raises ValueError: If the assembly release date is not found
     """
-    release_schedules = requests.get(
-        f'{RELEASE_SCHEDULES}/{group}.z/?fields=all_ga_tasks', headers={'Accept': 'application/json'}
-    )
+    s = requests.Session()
+    auth = requests_gssapi.HTTPSPNEGOAuth(mutual_authentication=requests_gssapi.OPTIONAL)
+    s.post('https://pp.engineering.redhat.com/oidc/authenticate', auth=auth)
+    response = s.get(f'{RELEASE_SCHEDULES}/{group}.z/?fields=all_ga_tasks', headers={'Accept': 'application/json'})
+    response.raise_for_status()
     try:
-        for release in release_schedules.json()['all_ga_tasks']:
+        data = response.json()
+        for release in data['all_ga_tasks']:
             if assembly in release['name']:
                 # convert date format for advisory usage, 2024-02-13 -> 2024-Feb-13
                 return datetime.strptime(release['date_start'], "%Y-%m-%d").strftime("%Y-%b-%d")
@@ -206,6 +217,8 @@ async def get_assembly_release_date_async(release_name: str):
     version = VersionInfo.parse(release_name)
     release_train = f'openshift-{version.major}.{version.minor}.z'
     async with aiohttp.ClientSession() as session:
+        auth = requests_gssapi.HTTPSPNEGOAuth(mutual_authentication=requests_gssapi.OPTIONAL)
+        await session.post('https://pp.engineering.redhat.com/oidc/authenticate', auth=auth)
         async with session.get(
             f'{RELEASE_SCHEDULES}/{release_train}/?fields=all_ga_tasks', headers={'Accept': 'application/json'}
         ) as response:
@@ -222,7 +235,10 @@ def is_release_next_week(group):
     """
     Check if there release of group need to release in the near week
     """
-    release_schedules = requests.get(
+    s = requests.Session()
+    auth = requests_gssapi.HTTPSPNEGOAuth(mutual_authentication=requests_gssapi.OPTIONAL)
+    s.post('https://pp.engineering.redhat.com/oidc/authenticate', auth=auth)
+    release_schedules = s.get(
         f'{RELEASE_SCHEDULES}/{group}.z/?fields=all_ga_tasks', headers={'Accept': 'application/json'}
     )
     for release in release_schedules.json()['all_ga_tasks']:
@@ -239,26 +255,57 @@ def get_inflight(assembly, group):
     inflight_release = None
     assembly_release_date = get_assembly_release_date(assembly, group)
     major, minor = get_ocp_version_from_group(group)
-    release_schedules = requests.get(
-        f'{RELEASE_SCHEDULES}/openshift-{major}.{minor - 1}.z/?fields=all_ga_tasks',
-        headers={'Accept': 'application/json'},
-    )
-    for release in release_schedules.json()['all_ga_tasks']:
-        is_future = is_future_release_date(release['date_start'])
-        if is_future:
-            days_diff = abs(
-                (
-                    datetime.strptime(assembly_release_date, "%Y-%b-%d")
-                    - datetime.strptime(release['date_start'], "%Y-%m-%d")
-                ).days
+
+    # Only look for previous group if minor > 0 to avoid negative minor versions (e.g., openshift-4.-1)
+    if minor > 0:
+        prev_group = f'openshift-{major}.{minor - 1}'
+        s = requests.Session()
+        auth = requests_gssapi.HTTPSPNEGOAuth(mutual_authentication=requests_gssapi.OPTIONAL)
+        s.post('https://pp.engineering.redhat.com/oidc/authenticate', auth=auth)
+        response = s.get(
+            f'{RELEASE_SCHEDULES}/{prev_group}.z/?fields=all_ga_tasks',
+            headers={'Accept': 'application/json'},
+        )
+        response.raise_for_status()
+        try:
+            data = response.json()
+            for release in data['all_ga_tasks']:
+                is_future = is_future_release_date(release['date_start'])
+                if is_future:
+                    days_diff = abs(
+                        (
+                            datetime.strptime(assembly_release_date, "%Y-%b-%d")
+                            - datetime.strptime(release['date_start'], "%Y-%m-%d")
+                        ).days
+                    )
+                    if days_diff <= 5:  # if next Y-1 release and assembly release in the same week
+                        match = re.search(r'\d+\.\d+\.\d+', release['name'])
+                        if match:
+                            inflight_release = match.group()
+                            break
+                        else:
+                            raise ValueError(f"Didn't find in_inflight release in {release['name']}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f'Failed to parse JSON for {prev_group}: {e}')
+        except ValueError as e:
+            if "time data" in str(e) or "does not match format" in str(e):
+                raise ValueError(
+                    f"Invalid date format when comparing assembly_release_date with release['date_start'] for {prev_group}: {e}"
+                )
+            else:
+                raise  # Re-raise other ValueErrors unchanged
+        except KeyError as e:
+            raise ValueError(f'Failed to parse release schedule data for {prev_group}: {e}')
+
+        if not inflight_release:
+            LOGGER.info(
+                f'Did not find a {prev_group} release that is releasing ~ in the same week as {assembly} {assembly_release_date}'
             )
-            if days_diff <= 5:  # if next Y-1 release and assembly release in the same week
-                match = re.search(r'\d+\.\d+\.\d+', release['name'])
-                if match:
-                    inflight_release = match.group()
-                    break
-                else:
-                    raise ValueError(f"Didn't find in_inflight release in {release['name']}")
+        else:
+            LOGGER.info(f'Found {inflight_release} as in-flight release for {assembly} {assembly_release_date}')
+    else:
+        LOGGER.info(f'No previous group available for {group} (minor version is 0)')
+
     return inflight_release
 
 
@@ -326,6 +373,24 @@ def isolate_major_minor_in_group(group_name: str) -> Tuple[Optional[int], Option
     if not match:
         return None, None
     return int(match[1]), int(match[2])
+
+
+def extract_group_from_nvr(nvr: str) -> Optional[str]:
+    """
+    Extract the group from an NVR by matching -vMAJOR.MINOR pattern.
+
+    Example NVR: "ose-azure-file-csi-driver-container-v4.13.0-202409181807.p0.g15e6f80.assembly.stream.el8"
+    Returns: "openshift-4.13"
+
+    :param nvr: Build NVR string
+    :return: Group string like "openshift-4.13" or None if pattern not found
+    """
+    # Match -vMAJOR.MINOR pattern (e.g., -v4.13, -v4.18)
+    match = re.search(r'-v(\d+)\.(\d+)\.', nvr)
+    if match:
+        major, minor = match.groups()
+        return f"openshift-{major}.{minor}"
+    return None
 
 
 async def run_limited_unordered(func, args: Iterable, limit: int) -> List:
@@ -508,7 +573,7 @@ async def fetch_slsa_attestation(
 
 @limit_concurrency(limit=32)
 @retry(reraise=True, stop=stop_after_attempt(3), wait=wait_fixed(5), retry=retry_if_exception_type(ChildProcessError))
-async def sync_to_quay(source_pullspec, destination_repo):
+async def sync_to_quay(source_pullspec, destination_repo, tags=None):
     LOGGER.info(f"Syncing image from {source_pullspec} to {destination_repo}")
     cmd = [
         'oc',
@@ -554,6 +619,29 @@ async def sync_to_quay(source_pullspec, destination_repo):
         )
         raise
 
+    # Mirror optional tags if provided
+    if tags:
+        for tag in tags:
+            LOGGER.info(f"Tagging image from {destination_repo}@sha256:{shasum} to {destination_repo}:{tag}")
+            cmd = [
+                'oc',
+                'image',
+                'mirror',
+                '--keep-manifest-list',
+                f"{destination_repo}@sha256:{shasum}",
+                f"{destination_repo}:{tag}",
+            ]
+            if konflux_registry_auth_file:
+                cmd += [f'--registry-config={konflux_registry_auth_file}']
+            try:
+                await asyncio.wait_for(cmd_assert_async(cmd, stdout=sys.stderr), timeout=1800)
+                LOGGER.info(f"Tagging from {destination_repo}@sha256:{shasum} to {destination_repo}:{tag} completed")
+            except TimeoutError:
+                LOGGER.warning(
+                    f"Timeout occurred while tagging image from {destination_repo}@sha256:{shasum} to {destination_repo}:{tag} after 30 minutes"
+                )
+                raise
+
 
 def validate_build_priority(build_priority):
     """
@@ -577,3 +665,104 @@ def validate_build_priority(build_priority):
         if "invalid literal" in str(e):
             raise ValueError(f"Build priority must be 'auto' or a number between 1-10, got: {build_priority}")
         raise
+
+
+def normalize_group_name_for_k8s(group_name: str) -> str:
+    """
+    Normalize a group name to comply with Kubernetes DNS label rules.
+
+    Kubernetes DNS label rules:
+    - Must be lowercase alphanumeric or '-'
+    - Must start and end with alphanumeric character
+    - Cannot be longer than 63 characters
+    - Cannot have consecutive '-'
+
+    Args:
+        group_name: The group name to normalize (e.g., "Test_Group-1.5")
+
+    Returns:
+        Normalized group name (e.g., "test-group-1-5")
+    """
+    if not group_name:
+        return ""
+
+    # Convert to lowercase
+    normalized = group_name.lower()
+
+    # Replace dots and any non-alphanumeric characters (except '-') with '-'
+    normalized = re.sub(r'[^a-z0-9\-]', '-', normalized)
+
+    # Collapse consecutive '-' into a single '-'
+    normalized = re.sub(r'-+', '-', normalized)
+
+    # Trim leading/trailing non-alphanumeric characters (including '-')
+    normalized = re.sub(r'^[^a-z0-9]+|[^a-z0-9]+$', '', normalized)
+
+    # Truncate to 63 characters if needed (leave room for timestamp suffix)
+    # Reserve space for timestamp format like "-20251031141128-1" (18 chars)
+    max_group_length = 63 - 18 - 1  # -1 for the connecting dash
+    if len(normalized) > max_group_length:
+        normalized = normalized[:max_group_length]
+        # Ensure we don't end with a dash after truncation
+        normalized = normalized.rstrip('-')
+
+    return normalized
+
+
+def resolve_konflux_kubeconfig_by_product(product: str, provided_kubeconfig: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the Konflux kubeconfig path based on product type.
+
+    Args:
+        product: The product type (e.g., "ocp", "oadp", "mta", "rhmtc", "logging")
+        provided_kubeconfig: Explicitly provided kubeconfig path (takes precedence)
+
+    Returns:
+        Resolved kubeconfig path or None to rely on oc login
+    """
+    if provided_kubeconfig:
+        return provided_kubeconfig
+
+    env_var = PRODUCT_KUBECONFIG_MAP.get(product)
+    if env_var:
+        kubeconfig = os.environ.get(env_var)
+        if kubeconfig:
+            KONFLUX_LOGGER.info(f"Using kubeconfig from {env_var} for product '{product}'")
+            return kubeconfig
+        KONFLUX_LOGGER.warning(f"Environment variable {env_var} is not set for product '{product}'")
+    else:
+        KONFLUX_LOGGER.warning(
+            f"No kubeconfig mapping found for product '{product}'. Available products: {list(PRODUCT_KUBECONFIG_MAP.keys())}"
+        )
+
+    available_env_vars = list(PRODUCT_KUBECONFIG_MAP.values())
+    KONFLUX_LOGGER.info(
+        f"No kubeconfig specified for product '{product}'. "
+        f"Available env vars: {', '.join(available_env_vars)}. Will rely on oc being logged in to the cluster."
+    )
+    return None
+
+
+def resolve_konflux_namespace_by_product(product: str, provided_namespace: Optional[str] = None) -> str:
+    """
+    Resolve the Konflux namespace based on product type.
+
+    Args:
+        product: The product type (e.g., "ocp", "oadp", "mta", "rhmtc", "logging")
+        provided_namespace: Explicitly provided namespace (takes precedence)
+
+    Returns:
+        Resolved namespace (guaranteed to return a valid namespace)
+    """
+    if provided_namespace:
+        return provided_namespace
+
+    namespace = PRODUCT_NAMESPACE_MAP.get(product)
+    if namespace:
+        KONFLUX_LOGGER.info(f"Using namespace '{namespace}' for product '{product}'")
+        return namespace
+
+    KONFLUX_LOGGER.warning(
+        f"No namespace mapping found for product '{product}'. Available products: {list(PRODUCT_NAMESPACE_MAP.keys())}. Using default: '{KONFLUX_DEFAULT_NAMESPACE}'"
+    )
+    return KONFLUX_DEFAULT_NAMESPACE

@@ -16,7 +16,7 @@ GIT_NO_PROMPTS = {
     "GIT_TERMINAL_PROMPT": "0",
 }
 
-ACTIVE_OCP_VERSIONS = ["4.12", "4.13", "4.14", "4.15", "4.16", "4.17", "4.18", "4.19", "4.20", "4.21"]
+ACTIVE_OCP_VERSIONS = ["4.12", "4.13", "4.14", "4.15", "4.16", "4.17", "4.18", "4.19", "4.20", "4.21", "4.22"]
 
 # Konflux DB related vars
 GOOGLE_CLOUD_PROJECT = 'openshift-art'
@@ -26,7 +26,7 @@ BUNDLES_TABLE_ID = 'bundles'
 FBCS_TABLE_ID = 'fbcs'
 TASKRUN_TABLE_ID = 'taskruns'
 
-SHIPMENT_DATA_URL_TEMPLATE = "https://gitlab.cee.redhat.com/hybrid-platforms/art/{}-shipment-data"
+SHIPMENT_DATA_URL_TEMPLATE = "https://gitlab.cee.redhat.com/hybrid-platforms/art/ocp-shipment-data"
 
 # Redis related vars
 REDIS_HOST = 'master.redis.gwprhd.use1.cache.amazonaws.com'
@@ -36,7 +36,44 @@ REDIS_PORT = '6379'
 OTEL_EXPORTER_OTLP_ENDPOINT = "http://otel-collector-psi-rhv.hosts.prod.psi.rdu2.redhat.com:4317"
 
 # Sync konflux builds to default (formerly Brew) imagestreams for versions in this list
-KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS = ["4.21", "4.20", "4.19", "4.18", "4.17", "4.16", "4.15", "4.14", "4.13", "4.12"]
+KONFLUX_IMAGESTREAM_OVERRIDE_VERSIONS = [
+    "4.22",
+    "4.21",
+    "4.20",
+    "4.19",
+    "4.18",
+    "4.17",
+    "4.16",
+    "4.15",
+    "4.14",
+    "4.13",
+    "4.12",
+]
 KONFLUX_ART_IMAGES_SHARE = "quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share"
 
 KONFLUX_DEFAULT_BUILD_PRIORITY = 5
+
+# Golang builder image metadata key
+GOLANG_BUILDER_IMAGE_NAME = 'openshift-golang-builder'
+# Golang rpm package name
+GOLANG_RPM_PACKAGE_NAME = 'golang'
+
+# Product-based mappings for Konflux tenant namespaces and kubeconfigs
+PRODUCT_NAMESPACE_MAP = {
+    "oadp": "art-oadp-tenant",
+    "mta": "art-mta-tenant",
+    "rhmtc": "art-mtc-tenant",
+    "logging": "art-logging-tenant",
+    "ocp": "ocp-art-tenant",
+}
+
+PRODUCT_KUBECONFIG_MAP = {
+    "oadp": "OADP_KONFLUX_SA_KUBECONFIG",
+    "mta": "MTA_KONFLUX_SA_KUBECONFIG",
+    "rhmtc": "MTC_KONFLUX_SA_KUBECONFIG",
+    "logging": "LOGGING_KONFLUX_SA_KUBECONFIG",
+    "ocp": "KONFLUX_SA_KUBECONFIG",
+}
+
+# Default namespace for Konflux operations
+KONFLUX_DEFAULT_NAMESPACE = "ocp-art-tenant"

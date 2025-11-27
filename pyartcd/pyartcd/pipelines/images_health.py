@@ -38,6 +38,7 @@ class ImagesHealthPipeline:
         data_path: str,
         data_gitref: str,
         image_list: str,
+        assembly: str,
     ):
         self.runtime = runtime
         self.versions = versions.split(',') if versions else OCP4_VERSIONS
@@ -47,6 +48,7 @@ class ImagesHealthPipeline:
         self.data_path = data_path
         self.data_gitref = data_gitref
         self.image_list = image_list.split(',') if image_list else []
+        self.assembly = assembly
         self.report = []
         self.slack_client = self.runtime.new_slack_client()
         self.scanned_versions = []
@@ -90,6 +92,9 @@ class ImagesHealthPipeline:
             cmd.append(f'--images={",".join(self.image_list)}')
         cmd.append('images:health')
 
+        if self.assembly:
+            cmd.append(f'--assembly={self.assembly}')
+
         _, out, err = await exectools.cmd_gather_async(cmd, stderr=None)
         report = json.loads(out.strip())
         self.runtime.logger.info('images:health output for openshift-%s:\n%s', version, out)
@@ -98,14 +103,23 @@ class ImagesHealthPipeline:
     async def notify_release_channel(self, version):
         self.slack_client.bind_channel(version)
 
-        concerns = [concern for concern in self.report if concern.get('group', '') == f'openshift-{version}']
+        concerns = [
+            concern
+            for concern in self.report
+            if concern.get('group', '') == f'openshift-{version}'
+            and concern['code'] != ConcernCode.LATEST_BUILD_SUCCEEDED.value
+        ]
+
+        version_tag = f'`openshift-{version}`'
+        if self.assembly != 'stream':
+            version_tag += f' (assembly `{self.assembly}`)'
 
         if not concerns:
-            await self.slack_client.say(f':white_check_mark: All images are healthy for openshift-{version}')
+            await self.slack_client.say(f':white_check_mark: All images are healthy for {version_tag}')
             return
 
         response = await self.slack_client.say(
-            f':alert: There are some issues to look into for `openshift-{version}`. {self.get_component_tag(concerns)}'
+            f':alert: There are some issues to look into for {version_tag}. {self.get_component_tag(concerns)}'
         )
         report = ''
         for concern in concerns:
@@ -121,8 +135,11 @@ class ImagesHealthPipeline:
 
         image_concerns = {}
         for concern in self.report:
-            if concern['code'] == ConcernCode.NEVER_BUILT.value:
-                # We don't report NEVER_BUILT concerns to forum-ocp-art
+            if (
+                concern['code'] == ConcernCode.NEVER_BUILT.value
+                or concern['code'] == ConcernCode.LATEST_BUILD_SUCCEEDED.value
+            ):
+                # We don't report NEVER_BUILT concerns to forum-ocp-art. Latest built succeeded is not a concern.
                 continue
             image_name = concern['image_name']
             image_concerns.setdefault(image_name, []).append(concern)
@@ -236,6 +253,11 @@ class ImagesHealthPipeline:
     required=False,
     help='Comma/space-separated list to include/exclude per --image-build-strategy (e.g. ironic,hypershift)',
 )
+@click.option(
+    '--assembly',
+    required=False,
+    help='(Optional) override the runtime assembly name',
+)
 @pass_runtime
 @click_coroutine
 async def images_health(
@@ -246,6 +268,7 @@ async def images_health(
     data_path: str,
     data_gitref: str,
     image_list: str,
+    assembly: str,
 ):
     await ImagesHealthPipeline(
         runtime,
@@ -255,4 +278,5 @@ async def images_health(
         data_path,
         data_gitref,
         image_list,
+        assembly,
     ).run()

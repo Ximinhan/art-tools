@@ -7,6 +7,7 @@ from enum import Enum
 import click
 from artcommonlib.konflux.konflux_build_record import KonfluxBuildOutcome, KonfluxBuildRecord
 from artcommonlib.model import Missing
+from artcommonlib.variants import BuildVariant
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 from doozerlib import Runtime
@@ -20,6 +21,7 @@ class ConcernCode(Enum):
     NEVER_BUILT = 'NEVER_BUILT'
     LATEST_ATTEMPT_FAILED = 'LATEST_ATTEMPT_FAILED'
     FAILING_AT_LEAST_FOR = 'FAILING_AT_LEAST_FOR'
+    LATEST_BUILD_SUCCEEDED = 'LATEST_BUILT_SUCCEEDED'
 
 
 class Concern:
@@ -32,6 +34,7 @@ class Concern:
         latest_attempt_task_url: str = None,
         latest_successful_task_url: str = None,
         latest_failed_nvr: str = None,
+        latest_built_nvr: str = None,
         latest_failed_build_record_id: str = None,
         latest_failed_build_time: datetime.datetime = None,
         group: str = None,
@@ -44,6 +47,7 @@ class Concern:
         self.latest_attempt_task_url = latest_attempt_task_url
         self.latest_successful_task_url = latest_successful_task_url
         self.latest_failed_nvr = latest_failed_nvr
+        self.latest_built_nvr = latest_built_nvr
         self.latest_failed_build_record_id = latest_failed_build_record_id
         self.latest_failed_build_time = latest_failed_build_time
         self.group = group
@@ -54,21 +58,40 @@ class Concern:
 
 
 class ImagesHealthPipeline:
-    def __init__(self, runtime: Runtime, limit: int):
+    def __init__(
+        self,
+        runtime: Runtime,
+        limit: int,
+        group: str = None,
+        assembly: str = None,
+        variant: BuildVariant = BuildVariant.OCP,
+    ):
         self.runtime = runtime
         self.limit = limit
         self.start_search = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(days=DELTA_DAYS)
         self.concerns = []
         self.logger = logging.getLogger(__name__)
         self.runtime.konflux_db.bind(KonfluxBuildRecord)
+        # Set group and assembly overrides
+        self.group = group or self.runtime.group_config.name  # default to runtime group
+        self.assembly = assembly or 'stream'  # default to 'stream' assembly
+        self.variant = variant
 
     async def run(self):
         # Gather concerns for all images we build with Konflux
-        tasks = [
-            self.get_concerns(image_meta)
-            for image_meta in self.runtime.image_metas()
-            if not image_meta.config.konflux.mode == 'disabled' and not image_meta.mode == 'disabled'
-        ]
+        tasks = []
+
+        # Filter out images that are disabled for this variant
+        for image_meta in self.runtime.image_metas():
+            if self.variant is BuildVariant.OKD:
+                if image_meta.config.okd is not Missing and image_meta.config.okd.mode == 'disabled':
+                    self.logger.info('Skipping OKD disabled image: %s', image_meta.distgit_key)
+                    continue
+            elif image_meta.config.konflux.mode == 'disabled' or image_meta.mode == 'disabled':
+                self.logger.info('Skipping disabled image: %s', image_meta.distgit_key)
+                continue
+            tasks.append(self.get_concerns(image_meta))
+
         await asyncio.gather(*tasks)
 
         # We should now have a dict of qualified_key => [concern, ...]
@@ -108,8 +131,14 @@ class ImagesHealthPipeline:
         latest_attempt_task_url = builds[0].build_pipeline_url
 
         if latest_success_idx == 0:
-            # The latest attempt was a success: nothing to do
-            return
+            # The latest attempt was a success
+            self.add_concern(
+                Concern(
+                    code=ConcernCode.LATEST_BUILD_SUCCEEDED.value,
+                    image_name=image_meta.distgit_key,
+                    latest_built_nvr=builds[0].nvr,
+                )
+            )
 
         elif latest_success_idx == -1:
             # No success record was found: add a concern
@@ -159,15 +188,17 @@ class ImagesHealthPipeline:
         """
         For 'stream' assembly only, query 'builds' table  for component 'name' from BigQuery
         """
+
+        self.logger.info('Querying builds for image: %s', image_meta.distgit_key)
         results = [
             build
             async for build in self.runtime.konflux_db.search_builds_by_fields(
                 start_search=self.start_search,
                 where={
                     'name': image_meta.distgit_key,
-                    'group': self.runtime.group_config.name,
+                    'group': self.group,
                     'engine': 'konflux',
-                    'assembly': 'stream',
+                    'assembly': self.assembly,
                 },
                 order_by='start_time',
                 limit=self.limit,
@@ -178,8 +209,18 @@ class ImagesHealthPipeline:
 
 @cli.command("images:health", short_help="Create a health report for this image group (requires DB read)")
 @click.option('--limit', default=LIMIT_BUILD_RESULTS, help='How far back in the database to search for builds')
+@click.option('--group', required=False, help='(Optional) override the group name from the config')
+@click.option('--assembly', required=False, help='(Optional) override the runtime assembly name')
+@click.option(
+    '--variant',
+    default=BuildVariant.OCP.value,
+    type=click.Choice([v.value for v in BuildVariant]),
+    help='Build variant.',
+)
 @click_coroutine
 @pass_runtime
-async def images_health(runtime, limit):
+async def images_health(runtime, limit, group, assembly, variant):
     runtime.initialize(clone_distgits=False, clone_source=False)
-    await ImagesHealthPipeline(runtime, limit).run()
+    await ImagesHealthPipeline(
+        runtime=runtime, limit=limit, group=group, assembly=assembly, variant=BuildVariant(variant)
+    ).run()

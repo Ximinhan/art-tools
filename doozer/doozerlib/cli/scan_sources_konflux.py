@@ -94,6 +94,7 @@ class ConfigScanSources:
         self.changing_rpm_names = set()
         self.rhcos_status = []
         self.registry_auth_file = os.getenv("KONFLUX_ART_IMAGES_AUTH_FILE")
+        self.current_task_bundles: Dict[str, str] = {}
 
     async def run(self):
         # Try to rebase into openshift-priv to reduce upstream merge -> downstream build time
@@ -113,14 +114,21 @@ class ConfigScanSources:
         # Find RPMs built by ART that need to be rebuilt
         await self.check_changing_rpms()
 
+        # Get current task bundle SHAs from GitHub
+        self.current_task_bundles = await self.get_current_task_bundle_shas()
+
         # Build an image dependency tree to scan across levels of inheritance. This should save us some time,
         # as when an image is found in need for a rebuild, we can also mark its children or operators without checking
         self.image_tree = self.generate_dependency_tree(self.runtime.image_tree)
         for level in sorted(self.image_tree.keys()):
             await self.scan_images(self.image_tree[level])
 
-        # Check RHCOS status if the kubeconfig is provided
-        if self.ci_kubeconfig:
+        # Check RHCOS status if the kubeconfig is provided and group is openshift-*
+        if (
+            self.ci_kubeconfig
+            and self.runtime.group.startswith("openshift-")
+            and self.runtime.group != 'openshift-4.21'
+        ):
             await self.detect_rhcos_status()
 
         # Print the output report
@@ -705,14 +713,16 @@ class ConfigScanSources:
             dep_rebase_time = isolate_timestamp_in_release(dependency_build_record.release)
             if not dep_rebase_time:  # no timestamp string in NVR?
                 self.logger.warning(
-                    'Could not determine dependency rebase time from release %s', dependency_build_record.release
+                    'Could not determine dependency %s rebase time from release %s',
+                    dep_key,
+                    dependency_build_record.release,
                 )
                 continue
 
             dep_rebase_time = datetime.strptime(dep_rebase_time, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
             if dep_rebase_time > rebase_time:
                 self.add_image_meta_change(
-                    image_meta, RebuildHint(RebuildHintCode.DEPENDENCY_NEWER, 'Dependency has a newer build')
+                    image_meta, RebuildHint(RebuildHintCode.DEPENDENCY_NEWER, f'Dependency {dep_key} has a newer build')
                 )
                 break
 
@@ -730,7 +740,16 @@ class ConfigScanSources:
             builder_image_url = self.runtime.resolve_brew_image_url(builder_image_name)
 
         # Find and map the builder image NVR
-        latest_builder_image_info = Model(await oc_image_info_for_arch_async__caching(builder_image_url))
+        # Use KONFLUX_OPERATOR_INDEX_AUTH_FILE for non-openshift groups (like OADP), otherwise use default
+        # Since OADP et. al. uses other streams like https://github.com/openshift-eng/ocp-build-data/blob/oadp-1.5/streams.yml#L13
+        builder_auth_file = (
+            (os.getenv("KONFLUX_OPERATOR_INDEX_AUTH_FILE") or self.registry_auth_file)
+            if not self.runtime.group.startswith("openshift-")
+            else self.registry_auth_file
+        )
+        latest_builder_image_info = Model(
+            await oc_image_info_for_arch_async__caching(builder_image_url, registry_config=builder_auth_file)
+        )
         builder_info_labels = latest_builder_image_info.config.config.Labels
         builder_nvr_list = [
             builder_info_labels['com.redhat.component'],
@@ -753,30 +772,13 @@ class ConfigScanSources:
         If it's not, query Brew API to get the Brew build result. Querying Brew API will eventually go away.
         """
 
-        # Look for the build record in Konflux DB. BigQuery is partitioned by start_time, so we need a reasonable
-        # time interval to look at. In most cases, we can infer the builder build date from its NVR, and use that
-        # as the search window lower boundary. In all other cases (e.g. nodejs builder, which has a NVR like
-        # nodejs-18-container-1-98), we can only use a default, broad search window. This is an expensive query,
-        # so an option might be to store this information in Redis
-        nvr_timestamp = isolate_timestamp_in_release(builder_build_nvr)
-        if nvr_timestamp:
-            start_search = datetime.strptime(nvr_timestamp, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-        else:
-            # Default search window: last 365 days
-            self.logger.warning('Could not extract timestamp from NVR %s', builder_build_nvr)
-            start_search = datetime.now(tz=timezone.utc) - timedelta(days=365)
-
-        build = await anext(
-            self.runtime.konflux_db.search_builds_by_fields(
-                start_search=start_search,
-                where={
-                    'nvr': builder_build_nvr,
-                    'group': self.runtime.group,
-                    'assembly': self.runtime.assembly,
-                },
-                limit=1,
-            ),
-            None,
+        # Look for the build record in Konflux DB using optimized NVR lookup.
+        # The cache-first approach with exponential windows handles time-based search automatically,
+        # eliminating the need to extract timestamps from NVRs or specify search windows.
+        build = await self.runtime.konflux_db.get_latest_build(
+            nvr=builder_build_nvr,
+            group=self.runtime.group,
+            assembly=self.runtime.assembly,
         )
         if build:
             return build.start_time
@@ -949,56 +951,26 @@ class ConfigScanSources:
 
         return task_bundles
 
-    async def _check_single_task_bundle(
-        self, image_meta: ImageMetadata, task_name: str, used_sha: str, current_sha: str
-    ) -> Optional[RebuildHint]:
+    async def check_task_bundle_age(self, task_name: str, used_sha: str, current_sha: str):
         """
-        Check if a single task bundle should trigger a rebuild based on its age and staggered rebuild logic.
-        Returns a RebuildHint if a rebuild should be triggered, None otherwise.
+        Check if a single task bundle is old enough to warrant a rebuild.
+        Returns a tuple with task info and age if old enough, None otherwise.
         """
         self.logger.info(
             f'Task bundle {task_name} version differs: used={used_sha[:12]}... vs current={current_sha[:12]}...'
         )
 
-        # Task bundle version differs, check if it's more than TASK_BUNDLE_AGE_THRESHOLD_DAYS days old and apply staggered rebuild logic
         task_age_days = await self.get_task_bundle_age_days(task_name, used_sha)
         if not task_age_days:
             return None
 
-        if task_age_days < TASK_BUNDLE_AGE_THRESHOLD_DAYS:
+        if task_age_days >= TASK_BUNDLE_AGE_THRESHOLD_DAYS:
+            return task_name, used_sha, current_sha, task_age_days
+        else:
             self.logger.info(
                 f'Task bundle {task_name} is only {task_age_days} days old (< {TASK_BUNDLE_AGE_THRESHOLD_DAYS} days), skipping rebuild'
             )
             return None
-
-        # Staggered rebuild logic: probability increases as age increases
-        #   - At 10 days: 1 in 21 chance (~5%)
-        #   - At 15 days: 1 in 16 chance (~6%)
-        #   - At 20 days: 1 in 11 chance (~9%)
-        #   - At 25 days: 1 in 6 chance (~17%)
-        #   - At 29 days: 1 in 2 chance (50%)
-        #   - At 30+ days: Always rebuild (100%)
-        self.logger.info(
-            f'Task bundle {task_name} is {task_age_days} days old (>= {TASK_BUNDLE_AGE_THRESHOLD_DAYS} days), applying staggered rebuild logic'
-        )
-        rebuild_probability_denominator = max(30 - task_age_days, 1)
-        should_rebuild = random.randint(1, rebuild_probability_denominator) == 1
-
-        if not should_rebuild:
-            self.logger.info(
-                f'Task bundle {task_name} is {task_age_days} days old but staggered rebuild '
-                f'logic decided not to rebuild (probability was 1/{rebuild_probability_denominator})'
-            )
-            return None
-
-        self.logger.info(
-            f'Triggering rebuild for {image_meta.distgit_key} due to outdated task bundle {task_name} ({task_age_days} days old)'
-        )
-        return RebuildHint(
-            RebuildHintCode.TASK_BUNDLE_OUTDATED,
-            f'Task bundle {task_name} is {task_age_days} days old (>={TASK_BUNDLE_AGE_THRESHOLD_DAYS} days) '
-            f'and newer version is available (staggered rebuild)',
-        )
 
     @skip_check_if_changing
     async def scan_task_bundle_changes(self, image_meta: ImageMetadata):
@@ -1032,15 +1004,14 @@ class ConfigScanSources:
         self.logger.info(f'Found {len(task_bundles)} task bundles: {list(task_bundles.keys())}')
 
         # Get current task bundle SHAs from GitHub
-        self.logger.info('Fetching current task bundle SHAs from GitHub template')
-        current_task_bundles = await self.get_current_task_bundle_shas()
+        current_task_bundles = self.current_task_bundles
         if not current_task_bundles:
-            self.logger.warning('Could not fetch current task bundle SHAs from GitHub')
+            self.logger.warning('Current task bundle SHAs not available, skipping task bundle check')
             return
 
         self.logger.info(f'Retrieved {len(current_task_bundles)} current task bundles from GitHub')
 
-        # Check each task bundle for outdated versions concurrently
+        # Check each task bundle for outdated versions
         self.logger.info(f'Comparing task bundle versions for {image_meta.distgit_key}')
 
         # Filter out task bundles that are up-to-date or not found in current template
@@ -1060,19 +1031,66 @@ class ConfigScanSources:
         if not outdated_task_bundles:
             return
 
-        # Process all outdated task bundles concurrently
-        rebuild_hints = await asyncio.gather(
+        # Check if any outdated task bundles are old enough and apply staggered rebuild logic once
+        # Execute all age checks in parallel
+        age_check_results = await asyncio.gather(
             *[
-                self._check_single_task_bundle(image_meta, task_name, used_sha, current_sha)
+                self.check_task_bundle_age(task_name, used_sha, current_sha)
                 for task_name, used_sha, current_sha in outdated_task_bundles
             ]
         )
 
-        # Check if any task bundle requires a rebuild
-        for rebuild_hint in rebuild_hints:
-            if rebuild_hint:
-                self.add_image_meta_change(image_meta, rebuild_hint)
-                return
+        # Filter out None results to get only old enough task bundles
+        old_outdated_tasks = [result for result in age_check_results if result is not None]
+
+        if not old_outdated_tasks:
+            return
+
+        # Apply staggered rebuild logic once for all old outdated tasks
+        # Use the oldest task for probability calculation
+        oldest_task = max(old_outdated_tasks, key=lambda x: x[3])
+        task_name, used_sha, current_sha, task_age_days = oldest_task
+
+        self.logger.info(
+            f'Found {len(old_outdated_tasks)} outdated task bundles >= {TASK_BUNDLE_AGE_THRESHOLD_DAYS} days old, '
+            f'applying staggered rebuild logic based on oldest task {task_name} ({task_age_days} days old)'
+        )
+
+        # Staggered rebuild logic: probability increases as age increases
+        #   - At 10 days: 1 in 21 chance (~5%)
+        #   - At 15 days: 1 in 16 chance (~6%)
+        #   - At 20 days: 1 in 11 chance (~9%)
+        #   - At 25 days: 1 in 6 chance (~17%)
+        #   - At 29 days: 1 in 2 chance (50%)
+        #   - At 30+ days: Always rebuild (100%)
+        rebuild_probability_denominator = max(30 - task_age_days, 1)
+        probability_percentage = (1.0 / rebuild_probability_denominator) * 100
+        random_number = random.randint(1, rebuild_probability_denominator)
+        should_rebuild = random_number == 1
+
+        self.logger.info(
+            f'Staggered rebuild probability: {probability_percentage:.1f}% (1/{rebuild_probability_denominator}), '
+            f'generated random number: {random_number}, rebuild decision: {should_rebuild}'
+        )
+
+        if not should_rebuild:
+            self.logger.info(
+                f'Staggered rebuild logic decided not to rebuild despite {len(old_outdated_tasks)} outdated task bundles '
+                f'(probability was {probability_percentage:.1f}% based on oldest task {task_name})'
+            )
+            return
+
+        # Trigger rebuild using the oldest task as the reason
+        self.logger.info(
+            f'Triggering rebuild for {image_meta.distgit_key} due to outdated task bundles '
+            f'(oldest: {task_name}, {task_age_days} days old)'
+        )
+        rebuild_hint = RebuildHint(
+            RebuildHintCode.TASK_BUNDLE_OUTDATED,
+            f'Task bundle {task_name} is {task_age_days} days old (>={TASK_BUNDLE_AGE_THRESHOLD_DAYS} days) '
+            f'and newer version is available (staggered rebuild)',
+        )
+        self.add_image_meta_change(image_meta, rebuild_hint)
 
     @retry(reraise=True, stop=stop_after_attempt(10), wait=wait_fixed(5))
     async def get_current_task_bundle_shas(self) -> Dict[str, str]:

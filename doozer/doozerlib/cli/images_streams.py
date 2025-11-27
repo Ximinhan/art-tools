@@ -394,14 +394,16 @@ def _get_upstreaming_entries(runtime, stream_names=None):
         # Some images also have their own upstream information. This allows them to
         # be mirrored out into upstream, optionally transformed, and made available as builder images for
         # other images without being in streams.yml.
+
         for image_meta in runtime.ordered_image_metas():
             if image_meta.config.content.source.ci_alignment.upstream_image is not Missing:
                 upstream_entry = Model(
                     dict_to_model=image_meta.config.content.source.ci_alignment.primitive()
                 )  # Make a copy
-                upstream_entry['image'] = (
-                    image_meta.pull_url()
-                )  # Make the image metadata entry match what would exist in streams.yml.
+
+                # Use pull_url() which handles both Brew and Konflux build systems
+                upstream_entry['image'] = image_meta.pull_url()
+
                 if upstream_entry.final_user is Missing:
                     upstream_entry.final_user = image_meta.config.final_stage_user
                 upstreaming_entries[image_meta.distgit_key] = upstream_entry
@@ -439,7 +441,7 @@ def images_streams_gen_buildconfigs(runtime, streams, output, as_user, apply, li
     CI to compile with the same golang version ART is using and use identical UBI8 images, etc. To accomplish
     this, streams.yml contains metadata which is extraneous to the product build, but critical to enable
     a high fidelity CI signal.
-    It may seem at first that all we would need to do was mirror the internal brew images we use
+    It may seem at first that all we would need to do was mirror the internal build images (Brew or Konflux)
     somewhere accessible by CI, but it is not that simple:
     1. When a CI build yum installs, it needs to pull RPMs from an RPM mirroring service that runs in
        CI. That mirroring service subsequently pulls and caches files ART syncs using reposync.
@@ -447,7 +449,7 @@ def images_streams_gen_buildconfigs(runtime, streams, output, as_user, apply, li
        images are configured in ci-operator config's 'build_root' and they are used to build
        and run test cases. Sometimes called 'CI release' image, these images contain tools that
        are not part of the typical golang builder (e.g. tito).
-    Both of these differences require us to 'transform' the image ART uses in brew into an image compatible
+    Both of these differences require us to 'transform' the ART build images into images compatible
     for use in CI. A challenge to this transformation is that they must be performed in the CI context
     as they depend on the services only available in ci (e.g. base-4-6-rhel8.ocp.svc is used to
     find the current yum repo configuration which should be used).
@@ -957,9 +959,6 @@ This ticket was created by ART pipline run [sync-ci-images|{jenkins_build_url}]
             'issuetype': {'name': 'Bug'},
             'labels': ['art:reconciliation', f'art:package:{image_meta.get_component_name()}'],
             'versions': [{'name': release_version}],  # Affects Version/s
-            'customfield_12319940': [
-                {'name': Model(runtime.gitdata.load_data(key='bug').data).target_release[-1]}
-            ],  # customfield_12319940 is Target Version in jira
             'components': [{'name': component}],
             'summary': summary,
             'description': description,
@@ -970,7 +969,24 @@ This ticket was created by ART pipline run [sync-ci-images|{jenkins_build_url}]
             issue = jira_client.create_issue(
                 fields,
             )
-            # check depend issues and set depend to a higher version issue if ture
+            try:
+                # retrieve the target version string (e.g., 'z' or '4.21.0')
+                target_version_segment = Model(runtime.gitdata.load_data(key='bug').data).target_release[-1]
+
+                # Build the update payload using the retrieved string
+                issue_update = {
+                    'customfield_12319940': [{'name': target_version_segment}],
+                }
+                runtime.logger.info(
+                    f"Attempting to update issue {issue.key} Target Version to: {target_version_segment}"
+                )
+                issue.update(fields=issue_update)
+                runtime.logger.info(f"Successfully updated Target Version for issue {issue.key}.")
+
+            except Exception as e:
+                runtime.logger.error(f"An error occurred while updating the Target Version on issue {issue.key}: {e}")
+
+            # check depend issues and set depend to a higher version issue if true
             look_for_summary = f'Update {major}.{minor + 1} {image_meta.name} image to be consistent with ART'
             depend_issues = search_issues(f"project={project} AND summary ~ '{look_for_summary}'")
             # jira title search is fuzzy, so we need to check if an issue is really the one we want
@@ -1031,6 +1047,12 @@ This ticket was created by ART pipline run [sync-ci-images|{jenkins_build_url}]
     help='Do not consider what is in master branch when determining what branch to target',
 )
 @click.option(
+    '--force-merge',
+    default=False,
+    is_flag=True,
+    help='DANGER! Use only with approval. Do not wait for standard CI PR merge. Call merge API directly.',
+)
+@click.option(
     '--ignore-missing-images', default=False, is_flag=True, help='Do not exit if an image is missing upstream.'
 )
 @click.option('--draft-prs', default=False, is_flag=True, help='Open PRs as draft PRs')
@@ -1054,6 +1076,7 @@ def images_streams_prs(
     bug,
     interstitial,
     ignore_ci_master,
+    force_merge,
     ignore_missing_images,
     draft_prs,
     moist_run,
@@ -1596,6 +1619,9 @@ If you have any questions about this pull request, please reach out to `@release
                     yellow_print(
                         f'A PR is already open requesting desired reconciliation with ART: {existing_pr.html_url}'
                     )
+                    if force_merge:
+                        existing_pr.merge()
+                        yellow_print(f'Force merge is enabled. Triggering merge for: {existing_pr.html_url}')
                 continue
 
             # Otherwise, we need to create a pull request

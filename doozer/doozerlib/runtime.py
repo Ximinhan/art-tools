@@ -24,6 +24,8 @@ from artcommonlib.assembly import (
     assembly_type,
 )
 from artcommonlib.config import BuildDataLoader
+from artcommonlib.config.plashet import PlashetConfig
+from artcommonlib.config.repo import ContentSet, Repo, RepoList, RepoSync
 from artcommonlib.konflux.konflux_build_record import KonfluxRecord
 from artcommonlib.model import Missing, Model
 from artcommonlib.pushd import Dir
@@ -145,11 +147,14 @@ class Runtime(GroupRuntime):
         for key, val in kwargs.items():
             self.__dict__[key] = val
 
+        self.network_mode_override = None
+
         if self.latest_parent_version:
             self.ignore_missing_base = True
 
         self._remove_tmp_working_dir = False
         self._group_config = None
+        self.product = None
 
         self.cwd = os.getcwd()
 
@@ -246,6 +251,65 @@ class Runtime(GroupRuntime):
         replace_vars = self.get_replace_vars(self.group_config)
         return self._build_data_loader.load_config("erratatool", default={}, replace_vars=replace_vars)
 
+    def get_plashet_config(self):
+        plashet_config_dict = self.group_config.get('plashet')
+        if not plashet_config_dict:
+            return None
+        return PlashetConfig.model_validate(plashet_config_dict)
+
+    def _get_repos_config(self) -> RepoList:
+        """
+        Get repository configuration from group_config.
+
+        Supports both new-style (all_repos) and old-style (repos) configurations:
+        - New-style: repos are defined in separate YAML files under repos/ directory
+          and loaded via !include in group.ext.yml as group_config['all_repos']
+        - Old-style: repos are defined directly in group.yml under the 'repos' key
+          and are converted to new-style RepoList format
+
+        :return: RepoList containing repo configurations
+        """
+        if 'all_repos' in self.group_config:
+            # New-style repo config: repos are defined in separate files and included via group.ext.yml
+            self._logger.info("Using new-style repo configurations from all_repos")
+            all_repos = self.group_config['all_repos']
+
+            # Parse using Pydantic models
+            repo_list = RepoList.model_validate(all_repos)
+            self._logger.info(f"Loaded {len(repo_list.root)} repos from all_repos")
+            return repo_list
+        else:
+            # Old-style repo config: repos are defined in group.yml
+            # Convert to new-style format using Pydantic models
+            self._logger.info("Using old-style repo configurations from group.yml, converting to new-style format")
+            old_repos = self.group_config.repos
+            new_repos = []
+
+            for repo_name, repo_data in old_repos.items():
+                # Parse content_set and reposync if present
+                content_set = None
+                if 'content_set' in repo_data:
+                    content_set = ContentSet.model_validate(repo_data['content_set'])
+
+                reposync = RepoSync()
+                if 'reposync' in repo_data:
+                    reposync = RepoSync.model_validate(repo_data['reposync'])
+
+                # Create Repo object using constructor
+                repo = Repo(
+                    name=repo_name,
+                    type='external',
+                    disabled=False,
+                    conf=repo_data.get('conf'),
+                    content_set=content_set,
+                    reposync=reposync,
+                )
+                new_repos.append(repo)
+
+            repo_list = RepoList.model_validate(new_repos)
+            self._logger.info(f"Converted {len(repo_list.root)} old-style repos to new-style format")
+            return repo_list
+
     def get_replace_vars(self, group_config: Model | None):
         replace_vars: dict = group_config.vars.primitive() if group_config and group_config.vars else {}
         # If assembly mode is enabled, `runtime_assembly` will become the assembly name.
@@ -268,7 +332,6 @@ class Runtime(GroupRuntime):
         if os.path.isfile(self.state_file):
             with io.open(self.state_file, 'r', encoding='utf-8') as f:
                 self.state = yaml.full_load(f)
-            self.state.update(state.TEMPLATE_BASE_STATE)
 
     def save_state(self):
         with io.open(self.state_file, 'w', encoding='utf-8') as f:
@@ -412,6 +475,7 @@ class Runtime(GroupRuntime):
                 f"Name in group.yml ({self.group_config.name}) does not match group name ({self.group}). Someone "
                 "may have copied this group without updating group.yml (make sure to check branch)"
             )
+        self.product = self.group_config.product or "ocp"
 
         self.hotfix = (
             False  # True indicates builds should be tagged with associated hotfix tag for the artifacts branch
@@ -434,13 +498,17 @@ class Runtime(GroupRuntime):
             return
 
         # Read in the streams definition for this group if one exists
-        streams_data = self._build_data_loader.load_config("streams", self.group, replace_vars=replace_vars)
+        streams_data = self._build_data_loader.load_config("streams", default={}, replace_vars=replace_vars)
         if streams_data:
             org_stream_model = Model(dict_to_model=streams_data)
             self.streams = assembly_streams_config(self.get_releases_config(), self.assembly, org_stream_model)
 
         strict_mode = True
-        if not self.assembly or self.assembly in ['stream', 'test', 'microshift']:
+        if (
+            self.assembly_type == AssemblyTypes.STREAM
+            or not self.assembly
+            or self.assembly in ['stream', 'test', 'microshift']
+        ):
             strict_mode = False
 
         self.assembly_basis_event = assembly_basis_event(
@@ -543,8 +611,13 @@ class Runtime(GroupRuntime):
                 # We should only really be building the latest release with unsigned RPMs, so default to True
                 self.gpgcheck = True
 
-            self.repos = Repos(self.group_config.repos, self.arches, self.gpgcheck)
-            self.freeze_automation = self.group_config.freeze_automation or FREEZE_AUTOMATION_NO
+            # Load repos configuration: new-style from all_repos or old-style from group.yml
+            repos_config = self._get_repos_config()
+            plashet_config = self.get_plashet_config()
+            self.repos = Repos(
+                repos_config, self.arches, self.gpgcheck, plashet_config=plashet_config, template_vars=replace_vars
+            )
+            self.freeze_automation = self.group_config.freeze_automation or FREEZE_AUTOMATION_NO  # type: ignore
 
             if validate_content_sets:
                 # as of 2023-06-09 authentication is required to validate content sets with rhsm-pulp
@@ -848,12 +921,15 @@ class Runtime(GroupRuntime):
         """
         :return: Returns a list of architectures that are enabled globally in group.yml, for konflux.
         """
-        # For now, cli override (LIMIT_ARCHES) and arches_override in group config are not supported
-        arches = list(self.group_config.konflux.arches)
 
-        if not arches:
-            # Fall back to default arches param, if konflux_arches is missing
-            return list(self.arches)
+        if self.arches:
+            # CLI override takes precedence
+            arches = list(self.arches)
+
+        else:
+            # Use konflux arches if defined
+            arches = list(self.group_config.konflux.arches)
+
         return arches
 
     def get_product_config(self) -> Model:
