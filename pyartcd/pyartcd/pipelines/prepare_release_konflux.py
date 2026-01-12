@@ -213,7 +213,7 @@ class PrepareReleaseKonfluxPipeline:
         await self.check_blockers()
         err = None
         try:
-            await self.prepare_et_advisories()
+            #await self.prepare_et_advisories()
             await self.prepare_shipment()
             await self.handle_jira_ticket()
         except Exception as ex:
