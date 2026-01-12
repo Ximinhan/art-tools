@@ -341,7 +341,21 @@ class PrepareReleasePipeline:
                 # Skip populating microshift advisory since that is done later after promote
                 if impetus == "microshift":
                     continue
-                await self.sweep_builds_async(impetus, advisory)
+                # For EC releases (preview/candidate), allow rpm find-builds to fail gracefully
+                # since there may not be RPM builds available for these releases
+                if impetus == "rpm" and assembly_type in (AssemblyTypes.PREVIEW, AssemblyTypes.CANDIDATE):
+                    try:
+                        await self.sweep_builds_async(impetus, advisory)
+                    except Exception as ex:
+                        _LOGGER.warning(
+                            "Failed to sweep rpm builds for %s assembly, continuing: %s", assembly_type.value, ex
+                        )
+                        await self._slack_client.say_in_thread(
+                            f":warning: find-builds for rpm advisory failed (expected for EC releases): {ex}",
+                            reaction="art-attention"
+                        )
+                else:
+                    await self.sweep_builds_async(impetus, advisory)
 
         # Verify attached operators - and gather builds if needed
         if any(x in advisories for x in ("metadata", "prerelease", "advance")):
