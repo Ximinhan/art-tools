@@ -396,7 +396,21 @@ class PrepareReleaseKonfluxPipeline:
             operate_cmd = ["find-builds", f"--kind={kind}", f"--attach={advisory_num}", "--clean"] + sweep_opts
             if self.dry_run:
                 operate_cmd += ["--dry-run"]
-            await self.run_cmd_with_retry(base_command, operate_cmd)
+            # For EC releases (preview/candidate), allow rpm find-builds to fail gracefully
+            # since there may not be RPM builds available for these releases
+            if impetus == "rpm" and self.assembly_type in (AssemblyTypes.PREVIEW, AssemblyTypes.CANDIDATE):
+                try:
+                    await self.run_cmd_with_retry(base_command, operate_cmd)
+                except Exception as ex:
+                    self.logger.warning(
+                        "Failed to sweep rpm builds for %s assembly, continuing: %s", self.assembly_type.value, ex
+                    )
+                    await self._slack_client.say_in_thread(
+                        f":warning: find-builds for rpm advisory failed (expected for EC releases): {ex}",
+                        reaction="art-attention"
+                    )
+            else:
+                await self.run_cmd_with_retry(base_command, operate_cmd)
 
         # Find bugs
         self.logger.info("Finding %s bugs...", impetus)
