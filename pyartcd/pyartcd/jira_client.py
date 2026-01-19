@@ -129,7 +129,7 @@ class JIRAClient:
     @staticmethod
     def render_jira_template(fields: Dict, template_vars: Dict):
         fields.copy()
-        _LOGGER.INFO(f"render_jiar_template with template_vars: {template_vars}")
+        _LOGGER.info(f"render_jiar_template with template_vars: {template_vars}")
         try:
             fields["summary"] = jinja2.Template(fields["summary"], autoescape=True).render(template_vars)
         except jinja2.TemplateSyntaxError as ex:
