@@ -129,13 +129,14 @@ class JIRAClient:
     @staticmethod
     def render_jira_template(fields: Dict, template_vars: Dict):
         fields.copy()
+        _LOGGER.INFO(f"render_jiar_template with template_vars: {template_vars}")
         try:
             fields["summary"] = jinja2.Template(fields["summary"], autoescape=True).render(template_vars)
         except jinja2.TemplateSyntaxError as ex:
             _LOGGER.warning("Failed to render JIRA template text: %s", ex)
         try:
             fields["description"] = (
-                jinja2.Template(fields["description"], autoescape=True).render(template_vars).strip()
+                jinja2.Template(fields["description"]).render(template_vars).strip()
             )
         except jinja2.TemplateSyntaxError as ex:
             _LOGGER.warning("Failed to render JIRA template text: %s", ex)
