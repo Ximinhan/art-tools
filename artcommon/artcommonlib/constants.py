@@ -29,6 +29,12 @@ TASKRUN_TABLE_ID = 'taskruns'
 
 SHIPMENT_DATA_URL_TEMPLATE = "https://gitlab.cee.redhat.com/hybrid-platforms/art/ocp-shipment-data"
 
+# Konflux Release Data GitLab URL for ReleasePlanAdmission files
+KONFLUX_RELEASE_DATA_RPA_BASE_URL = (
+    "https://gitlab.cee.redhat.com/releng/konflux-release-data/-/raw/main/"
+    "config/kflux-ocp-p01.7ayg.p1/product/ReleasePlanAdmission/ocp-art"
+)
+
 # Redis related vars
 REDIS_HOST = 'master.redis.gwprhd.use1.cache.amazonaws.com'
 REDIS_PORT = '6379'
