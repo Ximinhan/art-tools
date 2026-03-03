@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elliott-service
+  labels:
+    app: elliott-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elliott-service
+  template:
+    metadata:
+      labels:
+        app: elliott-service
+    spec:
+      containers:
+        - name: elliott-service
+          image: IMAGE_PLACEHOLDER
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          env:
+            - name: ELLIOTT_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: elliott-service-secrets
+                  key: api-token
+            - name: ELLIOTT_DATA_PATH
+              value: "https://github.com/openshift-eng/ocp-build-data"
+            - name: ELLIOTT_WORKING_DIR
+              value: "/tmp/elliott-work"
+            - name: ELLIOTT_DEFAULT_TIMEOUT
+              value: "120"
+            - name: KRB5_PRINCIPAL
+              valueFrom:
+                secretKeyRef:
+                  name: elliott-service-secrets
+                  key: krb5-principal
+                  optional: true
+          volumeMounts:
+            - name: keytab
+              mountPath: /etc/krb5/keytab
+              readOnly: true
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: keytab
+          secret:
+            secretName: elliott-service-keytab
+            optional: true

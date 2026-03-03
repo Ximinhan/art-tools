@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: elliott-service
+  labels:
+    app: elliott-service
+spec:
+  selector:
+    app: elliott-service
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP

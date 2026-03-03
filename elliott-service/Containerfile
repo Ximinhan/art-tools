@@ -1,0 +1,29 @@
+FROM registry.fedoraproject.org/fedora:43
+
+RUN curl -fLo /etc/pki/ca-trust/source/anchors/IT-Root-CAs.pem \
+      https://certs.corp.redhat.com/certs/Current-IT-Root-CAs.pem \
+    && update-ca-trust extract \
+    && curl -o /etc/yum.repos.d/rcm-tools-fedora.repo \
+      https://download.devel.redhat.com/rel-eng/RCMTOOLS/rcm-tools-fedora.repo
+
+RUN dnf install -y \
+      krb5-workstation git koji python3.11 python3.11-devel \
+      gcc krb5-devel brewkoji \
+    && dnf clean all \
+    && ln -sfn /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sfn /usr/bin/python3.11 /usr/bin/python
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
+
+WORKDIR /app
+COPY . .
+RUN uv sync --frozen
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8080
+USER 1001
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["uv", "run", "uvicorn", "elliott_service.main:app", "--host", "0.0.0.0", "--port", "8080"]
