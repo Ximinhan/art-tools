@@ -681,6 +681,10 @@ class FbcRebaseAndBuildCli:
         else:
             ocp_version = (runtime.group_config.vars.MAJOR, runtime.group_config.vars.MINOR)
 
+        if runtime.group_config.software_lifecycle.phase == "pre-release":
+            self._logger.info(f"The release is in pre-release phase, skip build fbc build")
+            return
+
         importer = KonfluxFbcImporter(
             base_dir=Path(runtime.working_dir, constants.WORKING_SUBDIR_KONFLUX_FBC_SOURCES),
             group=runtime.group,
